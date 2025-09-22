@@ -148,13 +148,10 @@ class DataFlow:
             # step 4: add to replay buffer
             await self.replay_buffer.add.remote(filtered_group_data_items)  # type: ignore[attr-defined]
         except Exception as e:
-            if group_samples is not None and len(group_samples) > 0:
-                self.logger.error(f"Worker task failed with exception: {e}. Returning meta for retry.", exc_info=True)
-                for sample in group_samples:
-                    sample.extra_info.retry_times += 1
-                return group_samples
-            else:
-                self.logger.warning(f"Worker task failed with exception: {e}. No samples to return.")
+            self.logger.error(f"Worker task failed with exception: {e}. Returning meta for retry.", exc_info=True)
+            for sample in group_samples:  # type: ignore[union-attr]
+                sample.extra_info.retry_times += 1
+            return group_samples
 
     async def concurrent_task_runner(self):
         """Orchestrates the concurrent execution of worker tasks to generate a

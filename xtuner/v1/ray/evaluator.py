@@ -116,6 +116,7 @@ class Evaluator:
         )
         self.dataloader = iter(self.dataset)
         self.env_controller = env_controller
+        self.failed_samples_count = 0
         self.return_list: List[RLDataFlowItem] = []
         if self.config.eval_sample_ratio > 0:
             self.eval_batch_size = int(len(self.dataset) * self.config.eval_sample_ratio)
@@ -190,12 +191,16 @@ class Evaluator:
                     try:
                         data = next(self.dataloader)
                     except StopIteration:
-                        break
+                        self.dataloader = iter(self.dataset)
+                        data = next(self.dataloader)
+                        self.logger.warning("Restarting the evaluation dataset.")
                     data_item = RLDataFlowItem(data=RLDatasetItem(**data))
                     task = create_task(self.eval_worker_task(data_item))
                     waiting_tasks.add(task)
 
-                assert len(waiting_tasks) > 0
+                if len(waiting_tasks) == 0:
+                    break
+
                 done_tasks, pending_tasks = await asyncio.wait(
                     waiting_tasks, timeout=0.1, return_when=asyncio.FIRST_COMPLETED
                 )
@@ -208,13 +213,16 @@ class Evaluator:
                             pending_tasks.add(retry_task)
                         else:
                             self.logger.error(f"Max retry reached for {result.uid.action_id}. Not retrying.")
+                            self.failed_samples_count += 1
 
                 waiting_tasks = pending_tasks
 
             pbar.n = len(self.return_list)
             pbar.refresh()
 
-        self.logger.info("Target batch size reached. Pausing rollout controller.")
+        self.logger.info(
+            f"Target batch size reached, but {self.failed_samples_count} samples failed and were skipped. Pausing rollout controller."
+        )
         ray.get(self.env_controller.pause.remote())
 
         if waiting_tasks:
@@ -239,9 +247,6 @@ class Evaluator:
         self.return_list = []
         self.dataloader = iter(self.dataset)
         self.sample_params = sample_params if sample_params else SampleParams()
-        # set greedy sample for evaluator
-        self.sample_params.temperature = 0.0
-        self.sample_params.top_k = 1
         ray.get(self.env_controller.restart.remote())  # type: ignore[attr-defined]
         await self.concurrent_eval_task_runner()
         scores = self.compute_metric(self.return_list)
