@@ -1,5 +1,6 @@
+import heapq
 import itertools
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -312,9 +313,10 @@ class ReplayBufferStorage:
 
     def __init__(self, worker_log_dir):
         """Initializes the data structures for storing replay data."""
-        self._interrupted_actions: deque[int] = deque()  # FIFO queue of paused action_id,
-        self._completed_actions: deque[int] = deque()  # FIFO queue of returned action_id,
-        self._expired_actions: deque[int] = deque()  # FIFO queue of paused action_id over version
+
+        self._completed_actions: List[Tuple[int, int]] = []  # FIFO queue of returned action_id,
+        self._interrupted_actions: List[Tuple[int, int]] = []  # (version, action_id)
+        self._expired_actions: List[Tuple[int, int]] = []  # (version, action_id)
 
         self._actions: Dict[int, ReplayMeta] = {}  # action_id: ReplayMeta
         self._root2actions: Dict[int, List[int]] = {}  # root_id: [action_id, action_id, ...], designed for grpo
@@ -359,18 +361,19 @@ class ReplayBufferStorage:
 
         # 2. 根据rollout状态加到finished, abort, abort_over_version队列中；Partial rollout is handled based on whether finish_reason is "abort".
         if replay_meta.state == ReplayState.INTERRUPTED and replay_meta.version < partial_rollout_step:
-            self._interrupted_actions.append(action_id)
+            heapq.heappush(self._interrupted_actions, (-replay_meta.version, action_id))
             self.logger.debug(
                 f"Add aborted sample with root_id: {root_id}, action_id: {action_id} to _interrupted_actions."
             )
         elif replay_meta.state == ReplayState.INTERRUPTED and replay_meta.version >= partial_rollout_step:
-            self._expired_actions.append(action_id)
+            heapq.heappush(self._expired_actions, (0, action_id))
+            replay_meta.version = 0
             replay_meta.state = ReplayState.EXPIRED
             self.logger.debug(
                 f"Action_id: {action_id} has exceeded partial_rollout_step {partial_rollout_step}. Add this sample with root_id: {root_id} to _expired_actions list."
             )
         elif replay_meta.state == ReplayState.COMPLETED:
-            self._completed_actions.append(action_id)
+            heapq.heappush(self._completed_actions, (-replay_meta.version, action_id))
             self.logger.debug(f"Add sample with root_id: {root_id}, action_id: {action_id} to finished_actions.")
         elif replay_meta.state == ReplayState.FAILED:
             assert False, "Currently, failed samples are not supported in the replay buffer."
@@ -423,11 +426,10 @@ class ReplayBufferStorage:
             self.logger.info(
                 f"Retrieving global_batch_size {global_batch_size} from replay buffer, len of self.returned: {len(self._completed_actions)}"
             )
-            target_finished_list = self._completed_actions[:global_batch_size]
-            remain_finished_list = self._completed_actions[global_batch_size:]
-            for action_id in target_finished_list:
+            for _ in range(global_batch_size):
+                _, action_id = heapq.heappop(self._completed_actions)
                 replay_meta = self._actions[action_id]
-                group_samples = mapping_replaymeta_to_dataitem(self._actions[action_id])
+                group_samples = mapping_replaymeta_to_dataitem(replay_meta)
                 multimodal_train_info = None
                 # TODO: 是否需要额外返回不重复的 multimodal_train_infos？
                 for data_item in group_samples:
@@ -437,7 +439,6 @@ class ReplayBufferStorage:
                 samples.append(group_samples)
                 if multimodal_train_info is not None:
                     multimodal_train_infos.append(multimodal_train_info)
-            self._completed_actions = remain_finished_list
             return samples, multimodal_train_infos
 
     def get_completed_samples(self):
@@ -582,6 +583,9 @@ class ReplayBuffer:
         self.call_sample_from_storage_times = 0
         self.call_sample_from_dataloader_times = 0
         self.logger = get_logger(log_dir=config.worker_log_dir, tag="ReplayBuffer")
+        self.sample_from_expired_count = 0
+        self.sample_from_interrupted_count = 0
+        self.sample_from_dataloader_count = 0
 
     def get_train_dataset_length(self):
         """Returns the length of the training dataloader."""
@@ -603,28 +607,32 @@ class ReplayBuffer:
 
     def refresh_completed_states_on_step(self, sample_from_expired_states):
         if sample_from_expired_states:
-            for action_id in self.storage._completed_actions:
+            while self.storage._completed_actions:
+                _, action_id = heapq.heappop(self.storage._completed_actions)
                 replay_meta = self.storage._actions[action_id]
                 replay_meta.state = ReplayState.INTERRUPTED
                 replay_meta.version += 1
-                self.storage._interrupted_actions.append(action_id)
-            self.storage._completed_actions = []
+                # 使用 heappush 和 (-version, action_id) 元组
+                heapq.heappush(self.storage._interrupted_actions, (-replay_meta.version, action_id))
         else:
-            update_completed_actions = []
-            for action_id in self.storage._completed_actions:
+            updated_completed = []
+            while self.storage._completed_actions:
+                neg_version, action_id = heapq.heappop(self.storage._completed_actions)
                 replay_meta = self.storage._actions[action_id]
                 if replay_meta.version >= self.partial_rollout_step:
-                    self.storage._expired_actions.append(action_id)
                     replay_meta.state = ReplayState.EXPIRED
+                    replay_meta.version = 0
+                    heapq.heappush(self.storage._expired_actions, (0, action_id))
                 else:
-                    update_completed_actions.append(action_id)
-            self.storage._completed_actions = update_completed_actions
+                    heapq.heappush(updated_completed, (neg_version, action_id))
+            self.storage._completed_actions = updated_completed
 
     def _sample_from_expired_storage(self) -> List[RLDataFlowItem]:
         # note: 预先假定从expired storage中采样一定是同步模式，且并发度不会大于global_batch_size且不会多采样
         assert self.storage.get_expired_samples() > 0
-        action_id = self.storage._expired_actions.popleft()
+        _, action_id = heapq.heappop(self.storage._expired_actions)
         replay_meta = self.storage._actions[action_id]
+        replay_meta.version = 0
         group_samples = mapping_replaymeta_to_dataitem(replay_meta)
 
         # update env for expired samples
@@ -641,7 +649,7 @@ class ReplayBuffer:
 
     def _sample_from_interrupted_storage(self) -> List[RLDataFlowItem]:
         assert self.storage.get_interrupted_samples() > 0
-        action_id = self.storage._interrupted_actions.popleft()
+        _, action_id = heapq.heappop(self.storage._interrupted_actions)
         replay_meta = self.storage._actions[action_id]
         group_samples = mapping_replaymeta_to_dataitem(replay_meta)
 
@@ -679,10 +687,13 @@ class ReplayBuffer:
             A list of sampled data items.
         """
         if sample_from_expired_storage:
+            self.sample_from_expired_count += 1
             return self._sample_from_expired_storage()
         elif enable_partial_rollout > 0 and self.storage.get_interrupted_samples() > 0:
+            self.sample_from_interrupted_count += 1
             return self._sample_from_interrupted_storage()
         else:
+            self.sample_from_dataloader_count += 1
             return self.sampler.sample(env, prompt_repeat_k, enable_partial_rollout)
 
     def get_samples(
@@ -697,6 +708,9 @@ class ReplayBuffer:
         Returns:
             A list of sample groups.
         """
+        self.sample_from_dataloader_count = 0
+        self.sample_from_interrupted_count = 0
+        self.sample_from_expired_count = 0
         return self.storage.get(global_batch_size, self.partial_rollout_step)
 
     def add(self, grouped_dataitem: List[RLDataFlowItem]):
@@ -717,7 +731,15 @@ class ReplayBuffer:
         self.storage.dump(file_path)
 
     def status(self):
-        return self.storage.status()
+        status = self.storage.status()
+        status.update(
+            {
+                "sample_from_dataloader_count": self.sample_from_dataloader_count,
+                "sample_from_interrupted_count": self.sample_from_interrupted_count,
+                "sample_from_expired_count": self.sample_from_expired_count,
+            }
+        )
+        return status
 
     def resume(self, file_path: str):
         """Resumes the replay buffer's storage from a file.
