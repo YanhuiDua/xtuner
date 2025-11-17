@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
-
+import random
 import ray
 from cyclopts import Parameter
 from pydantic import BaseModel, ConfigDict
@@ -423,6 +423,7 @@ class ReplayBufferStorage:
             self.logger.info(
                 f"Retrieving global_batch_size {global_batch_size} from replay buffer, len of self.returned: {len(self._completed_actions)}"
             )
+            random.shuffle(self._completed_actions)
             target_finished_list = self._completed_actions[:global_batch_size]
             remain_finished_list = self._completed_actions[global_batch_size:]
             for action_id in target_finished_list:
@@ -437,7 +438,8 @@ class ReplayBufferStorage:
                 samples.append(group_samples)
                 if multimodal_train_info is not None:
                     multimodal_train_infos.append(multimodal_train_info)
-            self._completed_actions = remain_finished_list
+            # self._completed_actions = remain_finished_list
+            self._completed_actions = []
             return samples, multimodal_train_infos
 
     def get_completed_samples(self):
