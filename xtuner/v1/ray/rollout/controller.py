@@ -325,7 +325,7 @@ class RolloutController:
             extra_info=extra_info,
         )
         try:
-            response = await asyncio.wait_for(response_ref, timeout=self.config.rollout_timeout)
+            response = await asyncio.wait_for(response_ref, timeout=self.config.rollout_timeout * 2)
             if response.extra_info and "url" in response.extra_info:
                 url = response.extra_info["url"]
                 if response.finish_reason == "failed":

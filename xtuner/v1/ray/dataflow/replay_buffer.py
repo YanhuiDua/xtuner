@@ -337,7 +337,7 @@ class ReplayBufferStorage:
                 belonging to the same group.
         """
         check_result, msg = check_dataflow_item(grouped_dataitem)
-        if not check_result:
+        if not check_result and len(grouped_dataitem) > 0:
             self.logger.warning(
                 f"Dataflow item check failed because {msg} for {grouped_dataitem[0].uid.action_id} response. Skipping adding to replay buffer."
             )
@@ -686,7 +686,7 @@ class ReplayBuffer:
         Returns:
             A list of sampled data items.
         """
-        if sample_from_expired_storage:
+        if sample_from_expired_storage and self.storage.get_expired_samples() > 0:
             self.sample_from_expired_count += 1
             return self._sample_from_expired_storage()
         elif enable_partial_rollout > 0 and self.storage.get_interrupted_samples() > 0:

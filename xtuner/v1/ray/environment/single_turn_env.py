@@ -94,7 +94,7 @@ class SingleTurnEnvironment(BaseEnvironment):
                 response_future.append(fut)
             try:
                 rollout_responses = await asyncio.wait_for(
-                    asyncio.gather(*response_future), timeout=self.rollout_timeout
+                    asyncio.gather(*response_future), timeout=self.rollout_timeout * 2
                 )
             except asyncio.TimeoutError:
                 self.logger.error("Get rollout controller response timeout and return the failed response.")

@@ -331,7 +331,7 @@ class RolloutWorker(SingleAcceleratorWorker):
         http_result = await self._create_request(
             endpoint_url,
             openai_prompts,
-            None,
+            input_ids,
             openai_tools,
             tool_choice,
             sample_params=sample_params,
