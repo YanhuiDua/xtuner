@@ -434,19 +434,20 @@ class RolloutWorker(SingleAcceleratorWorker):
             try:
                 extra_info = {}
                 finish_reason = response["meta_info"]["finish_reason"]["type"]
-                if finish_reason == "abort":
-                    return RLRolloutResponseItem(
-                        finish_reason="abort",
-                    )
+
                 if "output_token_logprobs" in response["meta_info"]:
-                    last_token_ids = [item[1] for item in response["meta_info"]["output_token_logprobs"]]
-                    last_logprobs = [item[0] for item in response["meta_info"]["output_token_logprobs"]]
-                    assert len(last_logprobs) == len(last_token_ids), (
-                        f"生成的token_ids和logprobs长度不匹配, token_ids长度 {len(last_token_ids)}，logprobs长度 {len(last_logprobs)}"
-                    )
-                    assert len(last_token_ids) > 0 and len(last_logprobs) > 0, (
-                        f"生成的token_ids或logprobs长度为0, token_ids长度 {len(last_token_ids)}，logprobs长度 {len(last_logprobs)}"
-                    )
+                    if response["meta_info"]["output_token_logprobs"] is not None:
+                        last_token_ids = [item[1] for item in response["meta_info"]["output_token_logprobs"]]
+                        last_logprobs = [item[0] for item in response["meta_info"]["output_token_logprobs"]]
+                        assert len(last_logprobs) == len(last_token_ids), (
+                            f"生成的token_ids和logprobs长度不匹配, token_ids长度 {len(last_token_ids)}，logprobs长度 {len(last_logprobs)}"
+                        )
+                        assert len(last_token_ids) > 0 and len(last_logprobs) > 0, (
+                            f"生成的token_ids或logprobs长度为0, token_ids长度 {len(last_token_ids)}，logprobs长度 {len(last_logprobs)}"
+                        )
+                    else:
+                        last_token_ids = []
+                        last_logprobs = []
                 else:
                     num_return_tokens = response["meta_info"].get("completion_tokens", 0)
                     last_token_ids = response["output_ids"][-num_return_tokens:] if num_return_tokens > 0 else []
@@ -470,7 +471,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                 rollout_response = RLRolloutResponseItem(
                     response=last_trajectory,
                     response_ids=last_token_ids if len(last_token_ids) > 0 else None,
-                    num_return_tokens=len(last_token_ids) if len(last_token_ids) > 0 else None,
+                    num_return_tokens=len(last_token_ids) if len(last_token_ids) > 0 else 0,
                     finish_reason=finish_reason,
                     logprobs=last_logprobs if len(last_logprobs) > 0 else None,
                     extra_info=extra_info,

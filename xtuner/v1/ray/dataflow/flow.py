@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict
 from tqdm.auto import tqdm
 from typing_extensions import Annotated
 
-from xtuner.v1.data_proto.rl_data import RLDataFlowItem, check_dataflow_item
+from xtuner.v1.data_proto.rl_data import RLDataFlowItem, check_dataflow_item, RLRolloutResponseItem, RLJudgerResponseItem
 from xtuner.v1.ray.environment import SingleTurnEnvironment
 from xtuner.v1.ray.rollout.controller import SampleParams
 from xtuner.v1.ray.utils import create_task
@@ -232,6 +232,10 @@ class DataFlow:
             self.logger.warning(
                 f"Dataflow item check failed because {msg} for {group_data_items[0].uid.action_id} response {group_data_items[0].env.rollout}. Returning meta for retry."
             )
+            # 在重试之前要把response清空，避免携带错误的信息
+            for item in group_data_items:
+                item.env.rollout = RLRolloutResponseItem()
+                item.env.judger = RLJudgerResponseItem()
             return group_data_items
         if any(item.env.rollout.finish_reason == "skipped" for item in group_data_items):
             self.logger.warning(

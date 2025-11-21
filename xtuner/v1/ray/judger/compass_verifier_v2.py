@@ -1,14 +1,13 @@
-import re
-import random
-import requests
-import aiohttp
 import asyncio
-from typing import Any, Callable, List, Optional
+import random
+from typing import List
 
+import aiohttp
+import requests
 from pydantic import BaseModel
 
-from xtuner.v1.ray.judger.native import NativeJudger
 from xtuner.v1.data_proto.rl_data import RLDataFlowItem, RLJudgerResponseItem
+
 
 verify_prompt = """
 Please as a grading expert, judge whether the final answers given by the candidates below are consistent with the standard answers, that is, whether the candidates answered correctly. 
