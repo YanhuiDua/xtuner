@@ -78,6 +78,10 @@ class SessionRouter:
             self._evict_lru_to_capacity()
             return worker[0]
 
+    def update_active_workers(self, worker_status: Dict[Any, bool]):
+        self._workers = list(worker_status.items())
+        self.logger.debug(f"SessionRouter update active workers: {self._workers}")
+        self._worker_cycler = cycle(self._workers)
 
 class RolloutController:
     """Controller for managing and coordinating multiple RolloutWorker
@@ -260,7 +264,12 @@ class RolloutController:
                 self.logger.info(
                     f"Rollout worker {self.worker_server_urls[idx]} is unhealthy. Removing it from active workers."
                 )
-                self.active_workers_to_status[self.active_rollout_workers[idx]] = False
+                inactive_workers = self.active_rollout_workers[idx]
+                if self.active_workers_to_status[inactive_workers] == True:
+                    self.active_workers_to_status[inactive_workers] = False
+                    self.router.update_active_workers(self.active_workers_to_status)
+                    ray.get(inactive_workers.offload.remote())  # type: ignore[attr-defined]
+                    ray.get(inactive_workers.shutdown.remote())  # type: ignore[attr-defined]
 
     def deactivate_worker_by_url(self, url):
         self.url_failed_counts[url] += 1
@@ -271,7 +280,11 @@ class RolloutController:
             return
         self.logger.error(f"Deactivating rollout worker {url} due to repeated failures.")
         inactive_workers = self.active_url_to_workers.get(url)
-        self.active_workers_to_status[inactive_workers] = False
+        if self.active_workers_to_status.get(inactive_workers) == True:
+            self.active_workers_to_status[inactive_workers] = False
+            self.router.update_active_workers(self.active_workers_to_status)
+            ray.get(inactive_workers.offload.remote())  # type: ignore[attr-defined]
+            ray.get(inactive_workers.shutdown.remote())  # type: ignore[attr-defined]
 
     async def rollout(
         self,
@@ -430,7 +443,8 @@ class RolloutController:
         for worker, status in self.active_workers_to_status.items():
             if status:
                 futures.append(getattr(worker, method_name).remote())
-
+            else:
+                self.logger.warning(f"Skipping {method_name} for inactive worker {worker}.")
         if not block:
             return futures
 
