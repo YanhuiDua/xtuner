@@ -26,6 +26,8 @@ class HttpRequestErrorType(IntEnum):
     UNKNOWN_ERROR = -1
     TIMEOUT_ERROR = 0
     REQUEST_ERROR = 1
+    CONNECT_ERROR = 2
+    CONNECT_TIMEOUT = 3
     # --- Standard HTTP Status Codes ---
     SUCCESS = 200
     BAD_REQUEST = 400
@@ -43,25 +45,25 @@ class HttpRequestErrorType(IntEnum):
     def from_exception(cls, e: Exception) -> "HttpRequestErrorType":
         """Factory method to determine the RequestErrorType from a given
         exception."""
+        if isinstance(e, httpx.ConnectTimeout):
+            return cls.CONNECT_TIMEOUT
+        if isinstance(e, httpx.ReadTimeout):
+            return cls.READ_TIMEOUT
         if isinstance(e, httpx.TimeoutException):
             return cls.TIMEOUT_ERROR
 
         if isinstance(e, httpx.HTTPStatusError):
-            # Try to match the status code to an existing enum member.
-            # If not found, it's an unknown HTTP error, but we can still categorize it.
-            # For simplicity here, we'll just return the known ones or fall back.
             try:
                 return cls(e.response.status_code)
             except ValueError:
-                # The status code is not a defined member of our enum.
-                # We can decide to return UNKNOWN_ERROR or handle it differently.
                 return cls.UNKNOWN_ERROR
-
-        if isinstance(e, httpx.RequestError):
-            # This check comes after its subclasses (TimeoutException, HTTPStatusError)
+            
+        if isinstance(e, httpx.ConnectError): # 连不上服务器，不再访问这个服务器
+            return cls.CONNECT_ERROR
+        if isinstance(e, httpx.ReadError) or isinstance(e, httpx.WriteError): # 会由于网络抖动，读/写失败
             return cls.REQUEST_ERROR
-
-        # For any other standard Python exception
+        if isinstance(e, httpx.RequestError):
+            return cls.REQUEST_ERROR
         return cls.UNKNOWN_ERROR
 
 
@@ -88,6 +90,8 @@ class HttpRequestResult:
                 HttpRequestErrorType.TIMEOUT_ERROR: "The request timed out.",
                 HttpRequestErrorType.REQUEST_ERROR: f"A network request error occurred occurred. TypeError: {type(self.exception)}",
                 HttpRequestErrorType.BAD_REQUEST: f"Bad Request (400): The server could not process the request {self.payload}",
+                HttpRequestErrorType.CONNECT_ERROR: f"Connection Error: Failed to connect to the server {self.url}.",
+                HttpRequestErrorType.CONNECT_TIMEOUT: f"Connection Timeout: The connection to the server {self.url} timed out.",
                 HttpRequestErrorType.UNAUTHORIZED: "Unauthorized (401): Authentication failed or is required.",
                 HttpRequestErrorType.FORBIDDEN: "Forbidden (403): Access is denied.",
                 HttpRequestErrorType.NOT_FOUND: "Not Found (404): The resource was not found.",
@@ -128,7 +132,7 @@ class HttpRequestResult:
 
     @property
     def is_server_error(self) -> bool:
-        return 500 <= self.error_type < 600
+        return 500 <= self.error_type < 600 or self.error_type == 2 or self.error_type == 3
 
 
 def set_rollout_response_status(http_result: HttpRequestResult, response: RLRolloutResponseItem, server_url=None):

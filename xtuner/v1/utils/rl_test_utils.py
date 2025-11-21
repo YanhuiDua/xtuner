@@ -10,7 +10,10 @@ from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field
 
 from xtuner.v1.ray.judger.native import NativeJudger
-from xtuner.v1.ray.rollout import LMDeployWorker
+try:
+    from xtuner.v1.ray.rollout import LMDeployWorker
+except ImportError:
+    LMDeployWorker = object  # type: ignore
 
 from .httpx_utils import HttpRequestErrorType, HttpRequestResult
 

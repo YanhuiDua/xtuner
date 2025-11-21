@@ -66,7 +66,8 @@ class RolloutWorker(SingleAcceleratorWorker):
         )
         http_concurrency = config.rollout_max_batch_size_per_instance * config.allow_over_concurrency_ratio
         limits = httpx.Limits(max_connections=http_concurrency, max_keepalive_connections=100)
-        self.client = httpx.AsyncClient(limits=limits, timeout=self.config.rollout_timeout)
+        timeout = httpx.Timeout(self.config.rollout_timeout, connect=600)
+        self.client = httpx.AsyncClient(limits=limits, timeout=timeout)
         self.paused = False
         self.server_task = None
         self.engine_bundle_idxs: list[int] = []
