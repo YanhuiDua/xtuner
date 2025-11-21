@@ -1,7 +1,8 @@
 import asyncio
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-import time
+
 import httpx
 import ray
 from cyclopts import Parameter
@@ -251,12 +252,14 @@ class DataFlow:
             return
 
         # step 3: filter
-        filtered_group_data_items = await self.replay_buffer.post_processor.remote(group_data_items)  # type: ignore[attr-defined]
+        if all(item.env.rollout.finish_reason != "abort" for item in group_data_items):
+            group_data_items = await self.replay_buffer.post_processor.remote(group_data_items)  # type: ignore[attr-defined]
 
         # step 4: add to replay buffer
-        if len(filtered_group_data_items) == 0:
+        if len(group_data_items) == 0:
             return
-        await self.replay_buffer.add.remote(filtered_group_data_items)  # type: ignore[attr-defined]
+
+        await self.replay_buffer.add.remote(group_data_items)  # type: ignore[attr-defined]
 
         self.logger.debug(f"Worker task completed successfully for {group_data_items[0].uid.action_id}.")
 
