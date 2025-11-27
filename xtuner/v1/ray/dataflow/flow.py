@@ -125,6 +125,7 @@ class DataFlow:
         self.filtered_sample_count = 0
         self.sample_from_expired_storage = False
         self.logger = get_logger(log_dir=self.config.worker_log_dir, tag="DataFlow")
+        self.filtered_samples = []
         self.target_batch_size = self.config.global_batch_size
         self.logger.info(f"DataFlowConfig:\n{self.config.model_dump_json(indent=2)}")
         rollout_info = ray.get(self.env_controller.get_rollout_info.remote())  # type: ignore[attr-defined]
@@ -163,6 +164,7 @@ class DataFlow:
         self.failed_samples_count = 0
         self.skipped_sample_count = 0
         self.filtered_sample_count = 0
+        self.filtered_samples = []
         self.logger.info(
             f"global_batch_size: {global_batch_size}, sample_params: {sample_params}, extra_params: {extra_params}"
         )
@@ -223,10 +225,12 @@ class DataFlow:
         group_state = determine_group_state(group_data_items)
         self.logger.debug(f"Determined replay state for {action_id}: {group_state}")
         if group_state == "completed":
+            pre_filter_samples = [item for item in group_data_items]
             group_data_items = await self.replay_buffer.post_processor.remote(group_data_items)  # type: ignore[attr-defined]
             if len(group_data_items) > 0:
                 await self.replay_buffer.add.remote(group_data_items)  # type: ignore[attr-defined]
             else:
+                self.filtered_samples.append(pre_filter_samples)
                 self.filtered_sample_count += 1
             self.logger.debug(f"Worker task completed successfully for {action_id}.")
         elif group_state == "interrupted":
@@ -377,8 +381,8 @@ class DataFlow:
             self.logger.info(f"Dump replay buffer from {dump_path}")
             await self.replay_buffer.dump.remote(dump_path)
 
-        return await self.replay_buffer.get_samples.remote(self.target_batch_size)  # type: ignore[attr-defined]
-
+        return await self.replay_buffer.get_samples.remote(self.target_batch_size), self.filtered_samples  # type: ignore[attr-defined]
+    
     def logging_replaybuffer_state(self, logging_msg: Optional[str] = None):
         status = self.get_replaybuffer_status()
         logging_msg = logging_msg if logging_msg else ""

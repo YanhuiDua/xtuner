@@ -399,15 +399,25 @@ class RLTrainer:
             # 1. Rollout
             with timer("generation", step_timer_dict):
                 ray.get(self._rollout_env_controller.check_active_workers.remote())
-                data_groups, multimodal_train_infos = ray.get(self._rollout_dataflow.run.remote())
+                result = ray.get(self._rollout_dataflow.run.remote())
+                if isinstance(result, tuple) and len(result) == 2:
+                    (data_groups, multimodal_train_infos), filtered_samples = result
+                else:
+                    data_groups, multimodal_train_infos = result
+                    filtered_samples = []
             # self._log_memory_usage(rollout_idx, stage="generation")
             memory_status_dict["generation"] = self._get_memory_stats()
             # 2. Offload rollout models and save trajectories
             with timer("offload_and_dump", step_timer_dict):
                 ray.get(self._rollout_env_controller.offload.remote())
                 trajectory_save_path = self.exp_dir / f"rollout_idx_{rollout_idx}_trajectory.jsonl"
-                self._save_trajectories(data_groups, trajectory_save_path)
+                trajectory_stats = self._save_trajectories(data_groups, trajectory_save_path)
                 self.logger.info(f"Rollout_idx {rollout_idx} finished, saved trajectories to {trajectory_save_path}")
+                if len(filtered_samples) > 0:
+                    filtered_save_path = self.exp_dir / f"rollout_idx_{rollout_idx}_filtered.jsonl"
+                    filter_stats = self._save_trajectories(filtered_samples, filtered_save_path)
+                    self.logger.info(f"Rollout_idx {rollout_idx} filtered {len(filtered_samples)} groups, saved to {filtered_save_path}")
+                    self._log_filter_info(rollout_idx, filter_stats)
             # self._log_memory_usage(rollout_idx, stage="offload_and_dump")
             memory_status_dict["offload_and_dump"] = self._get_memory_stats()
             # 3. Onload training models and prepare data
@@ -524,6 +534,29 @@ class RLTrainer:
                 log_lines.append(f"  - {key:<20}: {value:.4f}")
             else:
                 log_lines.append(f"  - {key:<20}: {value}")
+        self.logger.info("\n".join(log_lines))
+
+    def _log_filter_info(self, rollout_idx: int, filter_stats: dict):
+        """Formats and logs the filter statistics dictionary."""
+        log_lines = [f"Rollout {rollout_idx} filter data statistics:"]
+        
+        # 关键统计信息
+        log_lines.append(f"  - {'total_groups':<25}: {filter_stats.get('total_groups', 0)}")
+        log_lines.append(f"  - {'all_ones_groups':<25}: {filter_stats.get('all_ones_groups', 0)}")
+        log_lines.append(f"  - {'all_zeros_groups':<25}: {filter_stats.get('all_zeros_groups', 0)}")
+        log_lines.append(f"  - {'mixed_reward_groups':<25}: {filter_stats.get('mixed_reward_groups', 0)}")
+        
+        # Reward统计
+        log_lines.append(f"  - {'reward_mean':<25}: {filter_stats.get('reward_mean', 0):.4f}")
+        log_lines.append(f"  - {'reward_std':<25}: {filter_stats.get('reward_std', 0):.4f}")
+        log_lines.append(f"  - {'reward_max':<25}: {filter_stats.get('reward_max', 0):.4f}")
+        log_lines.append(f"  - {'reward_min':<25}: {filter_stats.get('reward_min', 0):.4f}")
+        
+        # Response长度统计
+        log_lines.append(f"  - {'response_len_mean':<25}: {filter_stats.get('response_len_mean', 0):.4f}")
+        log_lines.append(f"  - {'response_len_std':<25}: {filter_stats.get('response_len_std', 0):.4f}")
+        log_lines.append(f"  - {'total_len':<25}: {filter_stats.get('total_len', 0)}")
+        
         self.logger.info("\n".join(log_lines))
 
     def _log_memory_usage(self, rollout_idx: int, stage: str):
@@ -659,6 +692,11 @@ class RLTrainer:
         rollout_response_len_list = []
         version_dict = {i: 0 for i in range(self._dataflow_partial_rollout_step + 1)}
 
+        # 新增：为postprocessor统计group级别的信息
+        all_ones_group_count = 0  # 全1的group数量
+        all_zeros_group_count = 0  # 全0的group数量
+        valid_group_count = 0  # 有效的group数量
+
         # NOTE: Since we currently default to token-in token-out, the code for checking whether response_ids have Retokenization Drift is commented out.
         # If you need to debug, you can uncomment it.
         # mismatch_token_ids_count = 0
@@ -667,8 +705,12 @@ class RLTrainer:
             if not check_valid_dataflow_item(group):
                 self.logger.error(f"Skip one data group {group} due to rollout failed or empty response.")
                 continue
+
+            group_rewards = []
+
             for data in group:
                 rewards.append(data.env.judger.reward["score"])
+                group_rewards.append(data.env.judger.reward["score"])
                 if data.env.rollout.response_ids is not None:
                     if isinstance(data.env.rollout.response_ids, torch.Tensor):
                         response_ids = data.env.rollout.response_ids.flatten().tolist()
@@ -692,27 +734,38 @@ class RLTrainer:
                     version_dict[version] = 0
                 version_dict[version] += 1
 
+            # 检查当前group是否全1或全0
+            group_rewards = torch.tensor(group_rewards).float()
+            valid_group_count += 1
+            if all(r >= 1 for r in group_rewards):
+                all_ones_group_count += 1
+            elif all(r == 0 for r in group_rewards):
+                all_zeros_group_count += 1
+
         rewards = torch.tensor(rewards).float()
         rollout_response_lens = None
         if len(rollout_response_len_list) > 0:
             rollout_response_lens = torch.tensor(rollout_response_len_list).float()
 
+        stats_dict = {
+            "reward_mean": rewards.mean().item() if len(rewards) > 0 else 0.0,
+            "reward_std": rewards.std().item() if len(rewards) > 0 else 0.0,
+            "reward_max": rewards.max().item() if len(rewards) > 0 else 0.0,
+            "reward_min": rewards.min().item() if len(rewards) > 0 else 0.0,
+            "response_len_mean": rollout_response_lens.mean().item() if rollout_response_lens is not None else 0.0,
+            "response_len_std": rollout_response_lens.std().item() if rollout_response_lens is not None else 0.0,
+            "response_len_max": rollout_response_lens.max().item() if rollout_response_lens is not None else 0.0,
+            "response_len_min": rollout_response_lens.min().item() if rollout_response_lens is not None else 0.0,
+            "total_len": len(rewards),
+            "versions": version_dict,
+            "total_groups": valid_group_count,
+            "all_ones_groups": all_ones_group_count,
+            "all_zeros_groups": all_zeros_group_count,
+            "mixed_reward_groups": valid_group_count - all_ones_group_count - all_zeros_group_count,
+        }
         _count = 0
         with open(save_path, "w", encoding="utf-8") as f:
-            item = {
-                "reward_mean": rewards.mean().item(),
-                "reward_std": rewards.std().item(),
-                "reward_max": rewards.max().item(),
-                "reward_min": rewards.min().item(),
-                "response_len_mean": rollout_response_lens.mean().item(),
-                "response_len_std": rollout_response_lens.std().item(),
-                "response_len_max": rollout_response_lens.max().item(),
-                "response_len_min": rollout_response_lens.min().item(),
-                "total_len": len(rewards),
-                "versions": version_dict,
-                # "mismatch_token_ids_count": mismatch_token_ids_count,
-            }
-            json.dump(item, f, ensure_ascii=False, indent=2)
+            json.dump(stats_dict, f, ensure_ascii=False, indent=2)
             f.write("\n")
             for group in data_groups:
                 for data in group:
@@ -729,6 +782,8 @@ class RLTrainer:
                     f.write("\n")
                     _count += 1
 
+        return stats_dict
+    
     def _load_trajectories(self, save_path):
         data_groups = []
         with open(save_path) as f:
