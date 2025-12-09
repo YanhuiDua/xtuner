@@ -83,6 +83,7 @@ def mapping_dataitem_to_replaymeta(grouped_dataitem: List[RLDataFlowItem]) -> Re
     env_str = grouped_dataitem[0].uid.env
     root_id = grouped_dataitem[0].uid.root_id
     action_id = grouped_dataitem[0].uid.action_id
+    # !!! 注意：这里放的是第一个dataitem的data，因为一组数据的data是一样的 !!!
     data = grouped_dataitem[0].data
     # 现在是按组发送，那么一组里的dataitem的version是一样的，如果一组中的数据在某次rollout step中没有生成的数据，version也还是会+1
     group_version = grouped_dataitem[0].uid.version
@@ -397,8 +398,8 @@ class ReplayBufferStorage:
                 if hasattr(data_item.data, "multimodal_train_info"):
                     multimodal_train_info = data_item.data.multimodal_train_info
                     del data_item.data.multimodal_train_info
-                if "partial_rollout_input_ids" in data_item.data.extra_info:
-                    del data_item.data.extra_info["partial_rollout_input_ids"]
+                if "partial_rollout_input_ids" in data_item.env.rollout.extra_info:
+                    del data_item.env.rollout.extra_info["partial_rollout_input_ids"]
             samples.append(group_samples)
             multimodal_train_infos.append(multimodal_train_info)
 
@@ -570,9 +571,11 @@ class ReplayBufferStorage:
             else:
                 # 将异步的逻辑尽量放在replay buffer中处理，尽量不在env/rollout中进行处理
                 history_response_ids = list(itertools.chain.from_iterable(sample.env.rollout.versioned_response_ids))
-                sample.data.extra_info["partial_rollout_input_ids"] = sample.data.input_ids + history_response_ids
-                self.logger.debug(
-                    f"Partial rollout enabled, pass response_ids {len(history_response_ids)} to data extra info when sampling."
+                sample.env.rollout.extra_info["partial_rollout_input_ids"] = (
+                    sample.data.input_ids + history_response_ids
+                )
+                self.logger.info(
+                    f"partial rollout enabled, {sample_action_id} pass response_ids {len(history_response_ids)} to input_ids {len(sample.data.input_ids)} to data extra info when sampling."
                 )
             sample.uid.action_id = int(sample_action_id)
             sample.uid.version = replay_meta_version

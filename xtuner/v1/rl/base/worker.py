@@ -460,6 +460,15 @@ class TrainingWorker(SingleAcceleratorWorker):
                 logger_msg += f"\n rollout importance sampling metrics:\n{json.dumps(rollout_is_metrics, indent=4)}"
         self.logger.info(logger_msg)
 
+        sum_entropy = cast(torch.Tensor, sum_entropy)
+        dist.all_reduce(sum_entropy, op=dist.ReduceOp.SUM)
+        avg_entropy = sum_entropy / global_grad_tokens if global_grad_tokens > 0 else 0
+        if avg_entropy > 0.75:
+            for loss_ctx_input in loss_ctx_input_list:
+                loss_ctx_input.advantages = torch.where(
+                    loss_ctx_input.advantages > 0, loss_ctx_input.advantages * 2, loss_ctx_input.advantages
+                )
+
         if self._has_ref:
             # ref logprobs are inplaced updated in compute_actor_logprobs
             loss_ctx_input_list = self.compute_ref_logprobs(seq_ctx_list, loss_ctx_input_list)
@@ -519,6 +528,7 @@ class TrainingWorker(SingleAcceleratorWorker):
             )
             log_str = f"Rollout {rollout_idx} Step {i}: " + log_str
             self.logger.info(log_str)
+            all_log_infos.append(log_info)
         return all_log_infos
 
     def save_hf(self, hf_dir: str, save_dtype: torch.dtype = torch.bfloat16):

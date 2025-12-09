@@ -131,7 +131,7 @@ class LMDeployWorker(RolloutWorker):
             max_return_tokens = self.config.context_length - len(extra_info["partial_rollout_input_ids"])
             sample_params["max_tokens"] = max_return_tokens
             self.logger.info(
-                f"Set max_tokens to {max_return_tokens} based on partial_rollout_input_ids length {len(extra_info['partial_rollout_input_ids'])}, init input_len: {len(payload['input_ids'])}."
+                f"action_id {extra_info['action_id']} set max_tokens to {max_return_tokens} based on partial_rollout_input_ids length {len(extra_info['partial_rollout_input_ids'])}, init input_len: {len(payload['input_ids'])}."
             )
             payload["input_ids"] = extra_info["partial_rollout_input_ids"]
             assert len(payload["input_ids"]) <= self.config.context_length, (

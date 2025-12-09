@@ -93,6 +93,13 @@ class SingleTurnEnvironment(BaseEnvironment):
             for sample in group_data_items:
                 sample.data.extra_info["root_id"] = sample.uid.root_id
                 sample.data.extra_info["action_id"] = sample.uid.action_id
+                if "partial_rollout_input_ids" in sample.env.rollout.extra_info:
+                    self.logger.info(
+                        f"action_id {sample.uid.action_id} pass partial_rollout_input_ids with length {len(sample.env.rollout.extra_info['partial_rollout_input_ids'])} to rollout controller."
+                    )
+                    sample.data.extra_info["partial_rollout_input_ids"] = sample.env.rollout.extra_info[
+                        "partial_rollout_input_ids"
+                    ]
                 fut = self.rollout_controller.rollout.remote(
                     prompt=sample.data.messages,
                     input_ids=sample.data.input_ids,

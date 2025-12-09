@@ -464,8 +464,11 @@ class RLTrainer:
                 )
             )
 
-        tb_tis_metrics = {f"train_metrics/tis/{k}": v for k, v in log_infos[0][0].items()}
-        tb_mismatch_metrics = {f"train_metrics/mismatch/{k}": v for k, v in log_infos[0][1].items()}
+        tb_tis_metrics = {f"tis/{k}": v for k, v in log_infos[0][0].items()}
+        tb_mismatch_metrics = {f"mismatch/{k}": v for k, v in log_infos[0][1].items()}
+        tb_train_log_dict = log_infos[0][2]
+        for tb_key, tb_value in tb_train_log_dict.items():
+            self._writer.add_scalar(tag=f"train_metrics/{tb_key}", scalar_value=tb_value, global_step=rollout_idx)
         self._writer.add_scalars(tag_scalar_dict=tb_tis_metrics, global_step=rollout_idx)
         self._writer.add_scalars(tag_scalar_dict=tb_mismatch_metrics, global_step=rollout_idx)
         self._writer.add_scalar(tag="time/training", scalar_value=step_timer_dict["training"], global_step=rollout_idx)
@@ -715,7 +718,7 @@ class RLTrainer:
             }
             json.dump(item, f, ensure_ascii=False, indent=2)
             f.write("\n")
-            tb_item = {f"train_metrics/{k}": v for k, v in item.items() if isinstance(v, (int, float))}
+            tb_item = {f"response/{k}": v for k, v in item.items() if isinstance(v, (int, float))}
             self._writer.add_scalars(
                 tag_scalar_dict=tb_item,
                 global_step=self._cur_step,
@@ -730,6 +733,8 @@ class RLTrainer:
                         "prompt": data.data.extra_info["raw_prompt"],
                         "response": data.env.rollout.response,
                         "versioned_response": data.env.rollout.versioned_response,
+                        "response_ids": data.env.rollout.response_ids,
+                        "versioned_response_ids": data.env.rollout.versioned_response_ids,
                         "response_len": rollout_response_len_list[_count],
                         "versioned_response_len": data.env.rollout.versioned_num_return_tokens,
                         "label": data.data.reward_model["ground_truth"],

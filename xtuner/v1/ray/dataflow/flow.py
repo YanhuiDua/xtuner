@@ -333,14 +333,16 @@ class DataFlow:
                         #     (1 + staleness_threshold)
                         #     * (self.target_batch_size - self.finished_samples_count - len(waiting_tasks))
                         # )
-                        self.logger.info(
-                            f"Increment data concurrency to {init_increment_data_concurrency} tasks based on staleness_threshold: {staleness_threshold}, current waiting_tasks: {len(waiting_tasks)}, finished_samples_count: {self.finished_samples_count}"
-                        )
                         if init_increment_data_concurrency == 0:
-                            init_increment_data_concurrency = (
+                            increment_data_concurrency = (
                                 self.target_batch_size - self.finished_samples_count - len(waiting_tasks)
                             )
-                        for _ in range(init_increment_data_concurrency):
+                        else:
+                            increment_data_concurrency = init_increment_data_concurrency
+                        self.logger.info(
+                            f"Increment data concurrency to {increment_data_concurrency} tasks based on staleness_threshold: {staleness_threshold}, current waiting_tasks: {len(waiting_tasks)}, finished_samples_count: {self.finished_samples_count}"
+                        )
+                        for _ in range(increment_data_concurrency):
                             task = create_task(self.worker_task())
                             waiting_tasks.add(task)
                         self.logger.info(f"After increment, waiting_tasks: {len(waiting_tasks)}")
@@ -358,12 +360,14 @@ class DataFlow:
                     #     (1 + staleness_threshold)
                     #     * (self.target_batch_size - self.finished_samples_count - len(waiting_tasks))
                     # )
-                    self.logger.info(
-                        f"Length of waiting task is 0 and increment data concurrency to {init_increment_data_concurrency} tasks based on staleness_threshold: {staleness_threshold}, current waiting_tasks: {len(waiting_tasks)}, finished_samples_count: {self.finished_samples_count}"
-                    )
                     if init_increment_data_concurrency == 0:
-                        init_increment_data_concurrency = self.target_batch_size - self.finished_samples_count
-                    for _ in range(init_increment_data_concurrency):
+                        increment_data_concurrency = self.target_batch_size - self.finished_samples_count
+                    else:
+                        increment_data_concurrency = init_increment_data_concurrency
+                    self.logger.info(
+                        f"Length of waiting task is 0 and increment data concurrency to {increment_data_concurrency} tasks based on staleness_threshold: {staleness_threshold}, current waiting_tasks: {len(waiting_tasks)}, finished_samples_count: {self.finished_samples_count}"
+                    )
+                    for _ in range(increment_data_concurrency):
                         task = create_task(self.worker_task())
                         waiting_tasks.add(task)
                     self.logger.info(f"After increment, waiting_tasks: {len(waiting_tasks)}")
@@ -419,7 +423,7 @@ class DataFlow:
 
         task_completion_dict = self._log_task_completion_stats(task_completion_times, "Task Completion Time Stats:\n")
         for k, v in task_completion_dict.items():
-            self.tb_metrics[f"time/task_time_{k}"] = v
+            self.tb_metrics[f"task_time/{k}"] = v
 
     async def pause(self, timeout: float = 60.0):
         """Asynchronously sends abort requests to all rollout workers."""
