@@ -406,6 +406,7 @@ class ReplayBufferStorage:
         # 检查completed_samples中是否还有剩余的数据，并且检查其是否过期
         self.logger.info(f"Remaining completed samples in buffer: {self.completed_samples_count}")
         self._check_completed_samples_expired()
+        self._check_completed_samples_aborted()
         return samples, multimodal_train_infos
 
     def sample(self, sample_from_expired_states) -> List[RLDataFlowItem]:
@@ -618,6 +619,15 @@ class ReplayBufferStorage:
                 f"Moved {len(bucket)} completed samples with version {version} to expired samples due to exceeding tail_batch_candidate_steps."
             )
 
+    def _check_completed_samples_aborted(self):
+        if self.enable_partial_rollout:
+            return
+    
+        for version, bucket in self._completed_actions.items():
+            self._aborted_actions[0].extend(bucket)
+            self.logger.info(f"Moved {len(bucket)} completed samples with version {version} to aborted samples due to partial rollout disabled.")
+        self._completed_actions.clear()
+        
     def _clear_meta_for_actions(self, replay_meta: ReplayMeta):
         """Completely removes an action and all its associated data from the
         storage.

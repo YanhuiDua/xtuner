@@ -306,9 +306,6 @@ class DataFlow:
                 data_concurrency = math.ceil(
                     (1 + self.config.staleness_threshold) * (self.target_batch_size - self.finished_samples_count)
                 )
-                init_increment_data_concurrency = data_concurrency - (
-                    self.target_batch_size - self.finished_samples_count
-                )
                 staleness_threshold = self.config.staleness_threshold
                 self.logger.info(
                     f"Starting dataflow concurrent task runner with data_concurrency: {data_concurrency}, target_batch_size: {self.target_batch_size}, finished_samples_count: {self.finished_samples_count}, staleness_threshold: {staleness_threshold}"
@@ -327,51 +324,7 @@ class DataFlow:
                     self.logger.info(
                         f"waiting_tasks: {len(waiting_tasks)}, finished_samples_count: {self.finished_samples_count}"
                     )
-                    if len(waiting_tasks) < self.target_batch_size - self.finished_samples_count:
-                        # 当在执行的task的数量不足以满足需要的数量的时候，补充新的task, 补充的方式是超发当前需要数量的staleness_threshold比例的task
-                        # increment_data_concurrency = math.ceil(
-                        #     (1 + staleness_threshold)
-                        #     * (self.target_batch_size - self.finished_samples_count - len(waiting_tasks))
-                        # )
-                        if init_increment_data_concurrency == 0:
-                            increment_data_concurrency = (
-                                self.target_batch_size - self.finished_samples_count - len(waiting_tasks)
-                            )
-                        else:
-                            increment_data_concurrency = init_increment_data_concurrency
-                        self.logger.info(
-                            f"Increment data concurrency to {increment_data_concurrency} tasks based on staleness_threshold: {staleness_threshold}, current waiting_tasks: {len(waiting_tasks)}, finished_samples_count: {self.finished_samples_count}"
-                        )
-                        for _ in range(increment_data_concurrency):
-                            task = create_task(self.worker_task())
-                            waiting_tasks.add(task)
-                        self.logger.info(f"After increment, waiting_tasks: {len(waiting_tasks)}")
-
-                if len(waiting_tasks) == 0:
-                    if (
-                        self.failed_sample_count > self.target_batch_size
-                        or self.skipped_sample_count > self.target_batch_size
-                    ):
-                        self.logger.error(
-                            f"Too many failed or skipped samples, aborting dataflow. failed_sample_count: {self.failed_sample_count}, skipped_sample_count: {self.skipped_sample_count}, target_batch_size: {self.target_batch_size}"
-                        )
-                        break
-                    # increment_data_concurrency = math.ceil(
-                    #     (1 + staleness_threshold)
-                    #     * (self.target_batch_size - self.finished_samples_count - len(waiting_tasks))
-                    # )
-                    if init_increment_data_concurrency == 0:
-                        increment_data_concurrency = self.target_batch_size - self.finished_samples_count
-                    else:
-                        increment_data_concurrency = init_increment_data_concurrency
-                    self.logger.info(
-                        f"Length of waiting task is 0 and increment data concurrency to {increment_data_concurrency} tasks based on staleness_threshold: {staleness_threshold}, current waiting_tasks: {len(waiting_tasks)}, finished_samples_count: {self.finished_samples_count}"
-                    )
-                    for _ in range(increment_data_concurrency):
-                        task = create_task(self.worker_task())
-                        waiting_tasks.add(task)
-                    self.logger.info(f"After increment, waiting_tasks: {len(waiting_tasks)}")
-
+                    
                 done_tasks, pending_tasks = await asyncio.wait(
                     waiting_tasks, timeout=0.1, return_when=asyncio.FIRST_COMPLETED
                 )
@@ -382,6 +335,11 @@ class DataFlow:
 
                 self.finished_samples_count = ray.get(self.replay_buffer.get_completed_samples_count.remote())
                 waiting_tasks = pending_tasks
+
+                while len(waiting_tasks) + self.finished_samples_count < data_concurrency:
+                    task = create_task(self.worker_task())
+                    waiting_tasks.add(task)
+
 
             pbar.n = self.finished_samples_count
             pbar.refresh()
