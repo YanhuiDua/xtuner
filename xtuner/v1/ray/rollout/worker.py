@@ -24,6 +24,7 @@ from xtuner.v1.ray.config import RolloutConfig
 from xtuner.v1.utils import get_logger
 from xtuner.v1.utils.httpx_utils import HttpRequestErrorType, HttpRequestResult
 
+
 def get_eos_token(model_path: str) -> int | List[int]:
     from xtuner.v1.utils.logger import get_logger
 
@@ -97,7 +98,6 @@ class RolloutWorker(SingleAcceleratorWorker):
         self.logger.info(f"Using eos_token: {self.eos_token} for model at {self.config.model_path}")
         if isinstance(self.eos_token, int):
             self.eos_token = [self.eos_token]
-            
 
     def init_dist_port(self):
         """Initialize distributed communication ports.
@@ -354,8 +354,7 @@ class RolloutWorker(SingleAcceleratorWorker):
         while True:
             # 当拼接后的response_ids长度已经达到了max_tokens时，则不需要发送数据，直接返回
             if extra_info.get("partial_rollout_input_ids", None) is not None:
-                expected_max_tokens = self.config.context_length - len(extra_info["partial_rollout_input_ids"])
-                if expected_max_tokens <= 0:
+                if sample_params["max_tokens"] == 0:
                     self.logger.info(
                         f"Request {uid} reached max context length {self.config.context_length}, no need to rollout more."
                     )
@@ -368,7 +367,9 @@ class RolloutWorker(SingleAcceleratorWorker):
                         state=RolloutState.COMPLETED,
                     )
                 if extra_info["partial_rollout_input_ids"][-1] in self.eos_token:
-                    self.logger.info(f"Request {uid} already ends with eos token {extra_info['partial_rollout_input_ids'][-1]}, no need to rollout more.")
+                    self.logger.info(
+                        f"Request {uid} already ends with eos token {extra_info['partial_rollout_input_ids'][-1]} and len of response {len(extra_info['partial_rollout_input_ids'])}, input_ids: {len(input_ids)}, no need to rollout more"
+                    )
                     return RLRolloutResponseItem(
                         response=None,
                         response_ids=None,

@@ -1,7 +1,8 @@
 import asyncio
+import copy
 import os
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional
 
 import ray
 
@@ -9,10 +10,12 @@ from xtuner.v1.data_proto.rl_data import (
     RLDataFlowItem,
     RLJudgerResponseItem,
     RLRolloutResponseItem,
+    is_valid_for_training,
     update_dataflow_item,
     update_rollout_item,
 )
 from xtuner.v1.ray.environment.base_env import BaseEnvironment
+from xtuner.v1.ray.rollout.controller import SampleParams
 from xtuner.v1.utils import get_logger
 
 
@@ -67,8 +70,8 @@ class SingleTurnEnvironment(BaseEnvironment):
     async def generate(
         self,
         group_data_items: List[RLDataFlowItem],
-        sample_params=None,
-        extra_params=None,
+        sample_params: Optional[SampleParams] = None,
+        extra_params: Optional[Dict] = None,
     ) -> List[RLDataFlowItem]:
         """Generate responses for a batch of RLTextDataItem using the rollout
         controller.
@@ -93,17 +96,25 @@ class SingleTurnEnvironment(BaseEnvironment):
             for sample in group_data_items:
                 sample.data.extra_info["root_id"] = sample.uid.root_id
                 sample.data.extra_info["action_id"] = sample.uid.action_id
+                update_sample_params = sample_params
+
                 if "partial_rollout_input_ids" in sample.env.rollout.extra_info:
-                    self.logger.info(
-                        f"action_id {sample.uid.action_id} pass partial_rollout_input_ids with length {len(sample.env.rollout.extra_info['partial_rollout_input_ids'])} to rollout controller."
-                    )
                     sample.data.extra_info["partial_rollout_input_ids"] = sample.env.rollout.extra_info[
                         "partial_rollout_input_ids"
                     ]
+                    if sample_params is not None:
+                        update_sample_params = copy.deepcopy(sample_params)
+                        update_sample_params.max_tokens = sample_params.max_tokens - (
+                            len(sample.env.rollout.extra_info["partial_rollout_input_ids"])
+                            - len(sample.data.input_ids)
+                        )
+                    self.logger.info(
+                        f"action_id {sample.uid.action_id} pass partial_rollout_input_ids with length {len(sample.env.rollout.extra_info['partial_rollout_input_ids'])} and input_ids length {len(sample.data.input_ids)} to rollout controller and set max_tokens to {update_sample_params.max_tokens}"
+                    )
                 fut = self.rollout_controller.rollout.remote(
                     prompt=sample.data.messages,
                     input_ids=sample.data.input_ids,
-                    sample_params=sample_params,
+                    sample_params=update_sample_params,
                     extra_params=extra_params,
                     extra_info=sample.data.extra_info,
                 )
@@ -137,7 +148,7 @@ class SingleTurnEnvironment(BaseEnvironment):
             The format of the return value matches the format of the input `data`.
         """
         group_data_items = await self.generate(group_data_items, sample_params, extra_params)  # type: ignore[assignment]
-        continue_judger = all(item.env.rollout.state == "completed" for item in group_data_items)
+        continue_judger = is_valid_for_training(group_data_items)
         if self.judger_controller and continue_judger:
             try:
                 judger_responses: List[RLJudgerResponseItem] = await asyncio.wait_for(

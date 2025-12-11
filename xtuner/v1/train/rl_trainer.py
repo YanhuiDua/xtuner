@@ -442,9 +442,11 @@ class RLTrainer:
 
     def _train_step(self, rollout_idx: int, data_groups, multimodal_train_infos, step_timer_dict: dict):
         """Performs a single training step on the generated experience."""
-        with timer("onload_and_prepare_data", step_timer_dict):
+        with timer("onload", step_timer_dict):
             ray.get(self._train_controller.onload.remote(target="all"))
             self.logger.info("Training controller loaded")
+
+        with timer("prepare_data", step_timer_dict):
             data_batches, data_info = self._prepare_train_data(
                 data_groups, self._train_worker_cfg.pack_max_length, multimodal_train_infos
             )
@@ -452,8 +454,14 @@ class RLTrainer:
             self._log_data_info(rollout_idx, data_info)
 
         self._writer.add_scalar(
-            tag="time/onload_and_prepare_data",
-            scalar_value=step_timer_dict["onload_and_prepare_data"],
+            tag="time/onload",
+            scalar_value=step_timer_dict["onload"],
+            global_step=rollout_idx,
+        )
+
+        self._writer.add_scalar(
+            tag="time/prepare_data",
+            scalar_value=step_timer_dict["prepare_data"],
             global_step=rollout_idx,
         )
 
@@ -559,6 +567,7 @@ class RLTrainer:
     # TODO: advantage 是在 DataFlow 里算好，还是在 train controller 里算？
     # 因为可能有根据 advantage 来判断数据能否进 rl 训练的需求。暂时先放在这
     def _prepare_train_data(self, data_groups, pack_max_length, multimodal_train_infos=None):
+        time1 = time.perf_counter()
         rewards_list = []
         advantages_list = []
         prompt_len_list = []
@@ -572,6 +581,7 @@ class RLTrainer:
             )
             is_multimodal = True
 
+        time2 = time.perf_counter()
         for j, group in enumerate(data_groups):
             if not is_valid_for_training(group):
                 self.logger.error(f"Skip one data group {group} due to rollout failed or empty response.")
@@ -636,6 +646,7 @@ class RLTrainer:
                     seq_ctx.rollout_routed_experts = routed_experts  # n,layer,expert
 
                 data_batches.append(data_dict)
+        time3 = time.perf_counter()
         random.shuffle(data_batches)
 
         advantages_list = np.array(advantages_list)
@@ -655,6 +666,10 @@ class RLTrainer:
             "prompt_len/min": np.min(prompt_len_list),
             "prompt_len/max": np.max(prompt_len_list),
         }
+        time4 = time.perf_counter()
+        self.logger.info(
+            f"Prepare train data time: tokenize {time2 - time1:.2f}s, process {time3 - time2:.2f}s, shuffle {time4 - time3:.2f}s"
+        )
         return data_batches, info_dict
 
     def _save_trajectories(self, data_groups, save_path, is_eval: bool = False):
@@ -721,11 +736,11 @@ class RLTrainer:
             f.write("\n")
             if is_eval:
                 tb_item = {f"eval/{k}": v for k, v in item.items() if isinstance(v, (int, float))}
-                tb_version_dict = {f"eval/version_{k}": v for k, v in version_dict.items()}
+                tb_version_dict = {f"eval/version_{k}": float(v) for k, v in version_dict.items()}
             else:
                 tb_item = {f"response/{k}": v for k, v in item.items() if isinstance(v, (int, float))}
-                tb_version_dict = {f"response/version_{k}": v for k, v in version_dict.items()}
-                
+                tb_version_dict = {f"response/version_{k}": float(v) for k, v in version_dict.items()}
+
             self._writer.add_scalars(
                 tag_scalar_dict=tb_item,
                 global_step=self._cur_step,

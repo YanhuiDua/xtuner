@@ -568,7 +568,7 @@ class ReplayBufferStorage:
             if not self.enable_partial_rollout:
                 # 清除上次的response_ids等env数据
                 del sample.env
-                sample.env = RLEnvDataItem()  
+                sample.env = RLEnvDataItem()
                 sample.uid.version = 0
                 sample.uid.action_id = action_id
             else:
@@ -582,7 +582,6 @@ class ReplayBufferStorage:
                 )
                 sample.uid.version = replay_meta_version
                 sample.uid.action_id = int(sample_action_id)
-            
 
         self.logger.info(
             f"Sampling aborted action_id: {sample_action_id}, root_id: {group_samples[0].uid.root_id} from replay buffer, remain aborted samples: {self.aborted_samples_count}"

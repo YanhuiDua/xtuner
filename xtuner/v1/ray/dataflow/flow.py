@@ -474,7 +474,7 @@ class DataFlow:
     def _log_task_completion_stats(self, task_times: List[float], logger_msg: Optional[str] = None):
         if not task_times:
             self.logger.info("No task completion times to report.")
-            return
+            return {}
 
         import numpy as np
 

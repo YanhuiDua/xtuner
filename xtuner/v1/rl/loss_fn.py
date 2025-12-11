@@ -83,6 +83,7 @@ def pg_loss_fn(
     loss = (pg_losses * loss_weights.to(pg_losses.dtype)).sum()
     return loss
 
+
 @register_policy_loss("cispo")
 def pg_loss_fn(
     logprobs: torch.Tensor,
@@ -103,6 +104,7 @@ def pg_loss_fn(
     pg_losses = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high) * logprobs
     loss = (pg_losses * loss_weights.to(pg_losses.dtype)).sum()
     return loss
+
 
 def sft_loss_fn(
     logits: torch.Tensor,  # [1, seq_len, vocab_size]
