@@ -716,14 +716,22 @@ class RLTrainer:
                 "versions": version_dict,
                 # "mismatch_token_ids_count": mismatch_token_ids_count,
             }
+            self.logger.info(f"versions distribution: {version_dict}")
             json.dump(item, f, ensure_ascii=False, indent=2)
             f.write("\n")
             if is_eval:
                 tb_item = {f"eval/{k}": v for k, v in item.items() if isinstance(v, (int, float))}
+                tb_version_dict = {f"eval/version_{k}": v for k, v in version_dict.items()}
             else:
                 tb_item = {f"response/{k}": v for k, v in item.items() if isinstance(v, (int, float))}
+                tb_version_dict = {f"response/version_{k}": v for k, v in version_dict.items()}
+                
             self._writer.add_scalars(
                 tag_scalar_dict=tb_item,
+                global_step=self._cur_step,
+            )
+            self._writer.add_scalars(
+                tag_scalar_dict=tb_version_dict,
                 global_step=self._cur_step,
             )
             for group in data_groups:
@@ -736,8 +744,8 @@ class RLTrainer:
                         "prompt": data.data.extra_info["raw_prompt"],
                         "response": data.env.rollout.response,
                         "versioned_response": data.env.rollout.versioned_response,
-                        # "response_ids": data.env.rollout.response_ids,
-                        # "versioned_response_ids": data.env.rollout.versioned_response_ids,
+                        # "response_ids": str(data.env.rollout.response_ids),
+                        # "versioned_response_ids": str(data.env.rollout.versioned_response_ids),
                         "response_len": rollout_response_len_list[_count],
                         "versioned_response_len": data.env.rollout.versioned_num_return_tokens,
                         "label": data.data.reward_model["ground_truth"],

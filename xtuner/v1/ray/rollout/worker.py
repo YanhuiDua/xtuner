@@ -24,6 +24,21 @@ from xtuner.v1.ray.config import RolloutConfig
 from xtuner.v1.utils import get_logger
 from xtuner.v1.utils.httpx_utils import HttpRequestErrorType, HttpRequestResult
 
+def get_eos_token(model_path: str) -> int | List[int]:
+    from xtuner.v1.utils.logger import get_logger
+
+    logger = get_logger()
+    generation_config_path = os.path.join(model_path, "generation_config.json")
+    if not os.path.exists(generation_config_path):
+        logger.warning(
+            f"Config {generation_config_path} does not exist and thus cannot get eos_token. You must provide eos_token manually."
+        )
+        return []
+    with open(generation_config_path) as f:
+        generation_config = json.load(f)
+    eos_token_id = generation_config.get("eos_token_id")
+    return eos_token_id
+
 
 class RolloutWorker(SingleAcceleratorWorker):
     """Base class for a rollout worker that runs an inference server.
@@ -78,6 +93,11 @@ class RolloutWorker(SingleAcceleratorWorker):
         self.enable_return_routed_experts = self.config.enable_return_routed_experts
         if self.rank == 0:
             self.logger.info(f"RolloutConfig:\n{self.config.model_dump_json(indent=2)}")
+        self.eos_token = get_eos_token(self.config.model_path)
+        self.logger.info(f"Using eos_token: {self.eos_token} for model at {self.config.model_path}")
+        if isinstance(self.eos_token, int):
+            self.eos_token = [self.eos_token]
+            
 
     def init_dist_port(self):
         """Initialize distributed communication ports.
@@ -345,6 +365,16 @@ class RolloutWorker(SingleAcceleratorWorker):
                         logprobs=None,
                         num_return_tokens=0,
                         finish_reason="length",
+                        state=RolloutState.COMPLETED,
+                    )
+                if extra_info["partial_rollout_input_ids"][-1] in self.eos_token:
+                    self.logger.info(f"Request {uid} already ends with eos token {extra_info['partial_rollout_input_ids'][-1]}, no need to rollout more.")
+                    return RLRolloutResponseItem(
+                        response=None,
+                        response_ids=None,
+                        logprobs=None,
+                        num_return_tokens=0,
+                        finish_reason="stop",
                         state=RolloutState.COMPLETED,
                     )
 

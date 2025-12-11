@@ -324,7 +324,7 @@ class DataFlow:
                     self.logger.info(
                         f"waiting_tasks: {len(waiting_tasks)}, finished_samples_count: {self.finished_samples_count}"
                     )
-                    
+
                 done_tasks, pending_tasks = await asyncio.wait(
                     waiting_tasks, timeout=0.1, return_when=asyncio.FIRST_COMPLETED
                 )
@@ -339,7 +339,6 @@ class DataFlow:
                 while len(waiting_tasks) + self.finished_samples_count < data_concurrency:
                     task = create_task(self.worker_task())
                     waiting_tasks.add(task)
-
 
             pbar.n = self.finished_samples_count
             pbar.refresh()
