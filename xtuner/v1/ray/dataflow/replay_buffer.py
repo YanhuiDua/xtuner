@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
-
+import time
 import ray
 from cyclopts import Parameter
 from pydantic import BaseModel, ConfigDict
@@ -383,7 +383,9 @@ class ReplayBufferStorage:
         multimodal_train_infos = []
         target_batch_size = min(global_batch_size, self.completed_samples_count)
         self.logger.info(f"Retrieving {target_batch_size} completed samples from the replay buffer.")
+        task_time = []
         for _ in range(target_batch_size):
+            task_start_time = time.perf_counter()
             action_id = self._pop_highest_version_action(self._completed_actions)
             if action_id is None:
                 self.logger.warning("Get action_id None from completed_actions and skip this iteration.")
@@ -402,9 +404,10 @@ class ReplayBufferStorage:
                     del data_item.env.rollout.extra_info["partial_rollout_input_ids"]
             samples.append(group_samples)
             multimodal_train_infos.append(multimodal_train_info)
-
+            task_end_time = time.perf_counter()
+            task_time.append(task_end_time - task_start_time)
         # 检查completed_samples中是否还有剩余的数据，并且检查其是否过期
-        self.logger.info(f"Remaining completed samples in buffer: {self.completed_samples_count}")
+        self.logger.info(f"Remaining completed samples in buffer: {self.completed_samples_count}, task_time: {sum(task_time)}s, avg_time: {sum(task_time)/len(task_time)}s")
         self._check_completed_samples_expired()
         self._check_completed_samples_aborted()
         return samples, multimodal_train_infos
@@ -536,7 +539,7 @@ class ReplayBufferStorage:
             sample.env = RLEnvDataItem()  # 重置env数据
             sample.uid.action_id = action_id
             sample.uid.version = 0
-
+    
         self.logger.info(
             f"Sampling expired action_id: {action_id} from replay buffer, remain expired samples: {len(self._expired_actions)}"
         )

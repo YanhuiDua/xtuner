@@ -99,9 +99,8 @@ class SingleTurnEnvironment(BaseEnvironment):
                 update_sample_params = sample_params
 
                 if "partial_rollout_input_ids" in sample.env.rollout.extra_info:
-                    sample.data.extra_info["partial_rollout_input_ids"] = sample.env.rollout.extra_info[
-                        "partial_rollout_input_ids"
-                    ]
+                    rollout_extra_info = copy.deepcopy(sample.data.extra_info)
+                    rollout_extra_info["partial_rollout_input_ids"] = sample.env.rollout.extra_info["partial_rollout_input_ids"]
                     if sample_params is not None:
                         update_sample_params = copy.deepcopy(sample_params)
                         update_sample_params.max_tokens = sample_params.max_tokens - (
@@ -111,12 +110,15 @@ class SingleTurnEnvironment(BaseEnvironment):
                     self.logger.info(
                         f"action_id {sample.uid.action_id} pass partial_rollout_input_ids with length {len(sample.env.rollout.extra_info['partial_rollout_input_ids'])} and input_ids length {len(sample.data.input_ids)} to rollout controller and set max_tokens to {update_sample_params.max_tokens}"
                     )
+                else:
+                    rollout_extra_info = sample.data.extra_info
+
                 fut = self.rollout_controller.rollout.remote(
                     prompt=sample.data.messages,
                     input_ids=sample.data.input_ids,
                     sample_params=update_sample_params,
                     extra_params=extra_params,
-                    extra_info=sample.data.extra_info,
+                    extra_info=rollout_extra_info,
                 )
                 response_future.append(fut)
             try:
