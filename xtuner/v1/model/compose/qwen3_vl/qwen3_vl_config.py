@@ -8,6 +8,7 @@ from typing_extensions import Self
 from xtuner.v1.float8 import Float8Config
 from xtuner.v1.model.base import TransformerConfig, XTunerBaseModelConfig
 from xtuner.v1.model.dense.qwen3vl_text import Qwen3VLTextDense4BConfig, Qwen3VLTextDense8BConfig
+from xtuner.v1.model.moe.qwen3 import Qwen3MoE235BA22Config
 from xtuner.v1.model.moe.qwen3vl_text import Qwen3VLTextMoE30BA3Config, Qwen3VLTextMoE235BA22Config
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.utils import get_device, get_logger
@@ -26,7 +27,6 @@ class Qwen3VLVisionConfig(BaseModel):
     hidden_size: int = 1152
     num_attention_heads: int = 16
     intermediate_size: int = 4304
-    num_hidden_layers: int = 24
     hidden_act: str = "gelu_pytorch_tanh"
     patch_size: int = 16
     spatial_merge_size: int = 2
@@ -115,7 +115,7 @@ class Qwen3VLMoE30BA3Config(Qwen3VLBaseConfig):
 class Qwen3VLMoE235BA22Config(Qwen3VLBaseConfig):
     vision_config: Qwen3VLVisionConfig = Qwen3VLVisionConfig()
     projector_config: Qwen3VLProjectorConfig = Qwen3VLProjectorConfig(text_hidden_size=4096)
-    text_config: Qwen3VLTextMoE235BA22Config = Qwen3VLTextMoE235BA22Config(
+    text_config: Qwen3MoE235BA22Config = Qwen3VLTextMoE235BA22Config(
         max_position_embeddings=262144,
         rope_theta=5000000,
         rope_scaling_cfg=RopeScalingConfig(type="qwen3_vl", mrope_section=[24, 20, 20]),
