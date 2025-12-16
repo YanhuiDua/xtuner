@@ -107,7 +107,7 @@ class RawSingleTurnEnvironment(BaseEnvironment):
                             len(sample.env.rollout.extra_info["partial_rollout_input_ids"])
                             - len(sample.data.input_ids)
                         )
-                    self.logger.info(
+                    self.logger.debug(
                         f"action_id {sample.uid.action_id} pass partial_rollout_input_ids with length {len(sample.env.rollout.extra_info['partial_rollout_input_ids'])} and input_ids length {len(sample.data.input_ids)} to rollout controller and set max_tokens to {update_sample_params.max_tokens}"
                     )
                 else:

@@ -324,7 +324,7 @@ class RolloutWorker(SingleAcceleratorWorker):
     async def _safe_post_request(self, url, headers, payload) -> HttpRequestResult:
         try:
             if self.receive_abort_request.is_set():
-                self.logger.info(f"Request to {url} was cancelled before sending due to an abort signal.")
+                self.logger.debug(f"Request to {url} was cancelled before sending due to an abort signal.")
                 return HttpRequestResult(error_type=HttpRequestErrorType.REQUEST_ABORTED, url=url, payload=payload)
             req = self.client.build_request(
                 "POST",

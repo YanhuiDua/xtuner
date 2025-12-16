@@ -347,7 +347,7 @@ class ReplayBufferStorage:
             # TODO: 考虑到非共卡的情况，version是否更新需要根据是否update_weights来判断
             replay_meta.version += 1
             self._root2actions[root_id].append(action_id)
-            self.logger.info(
+            self.logger.debug(
                 f"Existing root_id: {root_id} with action_id {action_id} found. Incrementing version to {replay_meta.version}."
             )
         else:
