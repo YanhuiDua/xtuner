@@ -369,6 +369,7 @@ class RawDataFlow:
                 _, pending_tasks = await asyncio.wait(waiting_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED)
                 if len(pending_tasks) > 0:
                     await self.pause()
+                    await asyncio.sleep(1)
                     self.logger.info(
                         f"Waiting for {len(pending_tasks)} remaining worker tasks to complete after pausing env controller."
                     )

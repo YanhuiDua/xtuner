@@ -324,7 +324,7 @@ class RolloutWorker(SingleAcceleratorWorker):
     async def _safe_post_request(self, url, headers, payload) -> HttpRequestResult:
         try:
             if self.receive_abort_request.is_set():
-                self.logger.warning(f"Request to {url} was cancelled before sending due to an abort signal.")
+                self.logger.info(f"Request to {url} was cancelled before sending due to an abort signal.")
                 return HttpRequestResult(error_type=HttpRequestErrorType.REQUEST_ABORTED, url=url, payload=payload)
             req = self.client.build_request(
                 "POST",
@@ -346,7 +346,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                 return HttpRequestResult(response=r)
 
             if abort_wait_task in done:
-                self.logger.warning(
+                self.logger.debug(
                     f"Request to {url} was aborted. Waiting up to 5s for the request to gracefully finish."
                 )
                 try:
@@ -355,7 +355,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                     r.raise_for_status()
                     return HttpRequestResult(response=r)
                 except asyncio.TimeoutError:
-                    self.logger.warning(f"Request to {url} did not finish gracefully within 5s. Force cancelling.")
+                    self.logger.info(f"Request to {url} did not finish gracefully within 5s. Force cancelling.")
                     send_task.cancel()
                 except asyncio.CancelledError:
                     pass
