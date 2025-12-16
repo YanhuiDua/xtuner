@@ -186,6 +186,7 @@ class DataFlow:
         self.sample_from_expired_storage, self.finished_samples_count = ray.get(
             self.replay_buffer.get_prerun_state.remote(self.target_batch_size)
         )
+        ray.get(self.env_controller.restart.remote())  # type: ignore[attr-defined]
         self.skipped_sample_count = 0
         self.failed_sample_count = 0
         self.filtered_samples_count = 0
@@ -304,7 +305,7 @@ class DataFlow:
                 )
             else:
                 data_concurrency = math.ceil(
-                    (1 + self.config.staleness_threshold) * (self.target_batch_size - self.finished_samples_count) 
+                    (1 + self.config.staleness_threshold) * (self.target_batch_size - self.finished_samples_count)
                 )
                 staleness_threshold = self.config.staleness_threshold
                 self.logger.info(
@@ -336,7 +337,7 @@ class DataFlow:
                 self.finished_samples_count = ray.get(self.replay_buffer.get_completed_samples_count.remote())
                 waiting_tasks = pending_tasks
 
-                while len(waiting_tasks) + self.finished_samples_count < max(data_concurrency, self.target_batch_size): 
+                while len(waiting_tasks) + self.finished_samples_count < max(data_concurrency, self.target_batch_size):
                     task = create_task(self.worker_task())
                     waiting_tasks.add(task)
 
@@ -349,9 +350,8 @@ class DataFlow:
         if len(waiting_tasks) > 0:
             self.logger.info(f"Start pausing env controller for remaining worker tasks {len(waiting_tasks)}.")
             await self.pause()
-            cleanup_start_time = time.perf_counter()
             while len(waiting_tasks) > 0:
-                elapsed_time = time.perf_counter() - cleanup_start_time
+                # elapsed_time = time.perf_counter() - cleanup_start_time
                 # if elapsed_time > self.cleanup_task_time:
                 #     self.logger.warning(
                 #         f"Cleanup timeout of {self.cleanup_task_time}s reached. "
@@ -364,9 +364,12 @@ class DataFlow:
                 #     break  # Exit the cleanup loop
                 # NOTE: Keep sending pause requests because the inference engine only marks currently running requests as aborted.
                 # When a waiting request starts running, it still needs another pause request to be marked as aborted.
-                _, pending_tasks = await asyncio.wait(waiting_tasks, timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+                _, pending_tasks = await asyncio.wait(waiting_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED)
                 if len(pending_tasks) > 0:
                     await self.pause()
+                    self.logger.info(
+                        f"Waiting for {len(pending_tasks)} remaining worker tasks to complete after pausing env controller."
+                    )
                 waiting_tasks = pending_tasks
             self.logger.info("All worker tasks have completed after pausing env controller.")
 

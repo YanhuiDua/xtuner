@@ -305,7 +305,7 @@ def is_valid_for_training(group_data_items: List[RLDataFlowItem]) -> bool:
     is_skipped = any(item.env.rollout.state == RolloutState.SKIPPED for item in group_data_items)
     is_failed = any(item.env.rollout.state == RolloutState.FAILED for item in group_data_items)
     if is_skipped or is_failed or is_abort:
-        logger.warning(
+        logger.debug(
             f"Invalid dataflow group found during training, rollout state skipped: {is_skipped}, failed: {is_failed}, aborted: {is_abort}."
         )
         return False

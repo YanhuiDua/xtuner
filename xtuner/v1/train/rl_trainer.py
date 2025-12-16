@@ -7,7 +7,6 @@ from pathlib import Path
 from shutil import rmtree
 from typing import cast
 
-import numpy as np
 import ray
 import torch
 from mmengine import load
@@ -446,6 +445,7 @@ class RLTrainer:
 
         if not self._debug_rollout:
             with timer("rollout_offload", step_timer_dict):
+                ray.get(self._rollout_dataflow.pause.remote())
                 ray.get(self._rollout_env_controller.offload.remote())
 
             self._writer.add_scalar(
@@ -589,7 +589,6 @@ class RLTrainer:
         all_shifted_labels = []
         all_advantages = []
         all_rollout_logprobs = []
-        
 
         rewards_list = []
         advantages_list = []
@@ -659,7 +658,7 @@ class RLTrainer:
                 else:
                     rollout_logprobs = None
                     all_rollout_logprobs.append(None)
-                
+
                 if "router_experts" in group[i].env.rollout.extra_info:
                     routed_experts = group[i].env.rollout.extra_info["routed_experts"]  # n,layer*expert
                     all_routed_experts.append(routed_experts)  # n,layer,expert
@@ -682,13 +681,15 @@ class RLTrainer:
             }
             if all_routed_experts[i] is not None:
                 seq_ctx.rollout_routed_experts = all_routed_experts[i]
-            
+
             data_batches.append(data_dict)
 
         rewards_arr = torch.tensor(rewards_list).float() if rewards_list else torch.tensor([0.0]).float()
         advantages_arr = torch.tensor(advantages_list).float() if advantages_list else torch.tensor([0.0]).float()
         prompt_len_arr = torch.tensor(prompt_len_list).float() if prompt_len_list else torch.tensor([0.0]).float()
-        response_len_arr = torch.tensor(response_len_list).float() if response_len_list else torch.tensor([0.0]).float()
+        response_len_arr = (
+            torch.tensor(response_len_list).float() if response_len_list else torch.tensor([0.0]).float()
+        )
 
         info_dict = {
             "batch_size": len(rewards_list),

@@ -98,6 +98,8 @@ class RolloutWorker(SingleAcceleratorWorker):
         self.logger.info(f"Using eos_token: {self.eos_token} for model at {self.config.model_path}")
         if isinstance(self.eos_token, int):
             self.eos_token = [self.eos_token]
+        self.receive_abort_request = asyncio.Event()
+        self.abort_timeout = 5.0
 
     def init_dist_port(self):
         """Initialize distributed communication ports.
@@ -136,6 +138,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                 server URL.
         """
         self.dist_init_addr = dist_init_addr if dist_init_addr else self.dist_init_addr
+        self.receive_abort_request.clear()
         self.launch_server()
         return (self.rank, self.server_url)
 
@@ -312,15 +315,46 @@ class RolloutWorker(SingleAcceleratorWorker):
 
     async def _safe_post_request(self, url, headers, payload) -> HttpRequestResult:
         try:
+            if self.receive_abort_request.is_set():
+                self.logger.warning(f"Request to {url} was cancelled before sending due to an abort signal.")
+                return HttpRequestResult(error_type=HttpRequestErrorType.REQUEST_ABORTED, url=url, payload=payload)
             req = self.client.build_request(
                 "POST",
                 url,
                 headers=headers,
                 json=payload,
             )
-            r = await self.client.send(req)
-            r.raise_for_status()
-            return HttpRequestResult(response=r)
+            send_task = asyncio.create_task(self.client.send(req))
+            abort_wait_task = asyncio.create_task(self.receive_abort_request.wait())
+
+            done, pending = await asyncio.wait(
+                {send_task, abort_wait_task}, timeout=self.config.rollout_timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            if send_task in done:
+                abort_wait_task.cancel()
+                r = await send_task
+                r.raise_for_status()
+                return HttpRequestResult(response=r)
+
+            if abort_wait_task in done:
+                self.logger.warning(
+                    f"Request to {url} was aborted. Waiting up to 5s for the request to gracefully finish."
+                )
+                try:
+                    # Wait for send_task for a short period before force-cancelling
+                    r = await asyncio.wait_for(send_task, timeout=self.abort_timeout)
+                    r.raise_for_status()
+                    return HttpRequestResult(response=r)
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"Request to {url} did not finish gracefully within 5s. Force cancelling.")
+                    send_task.cancel()
+                except asyncio.CancelledError:
+                    pass
+                # Ensure the task is awaited to suppress warnings, even if cancelled
+                await asyncio.gather(send_task, return_exceptions=True)
+                return HttpRequestResult(error_type=HttpRequestErrorType.REQUEST_ABORTED, url=url, payload=payload)
+
         except Exception as e:
             error_type = HttpRequestErrorType.from_exception(e)
             result = HttpRequestResult(error_type=error_type, exception=e, url=url, payload=payload)
@@ -378,7 +412,6 @@ class RolloutWorker(SingleAcceleratorWorker):
                         finish_reason="stop",
                         state=RolloutState.COMPLETED,
                     )
-
             http_result = await self._create_request(
                 endpoint_url,
                 openai_prompts,
@@ -407,6 +440,8 @@ class RolloutWorker(SingleAcceleratorWorker):
                         return RLRolloutResponseItem(state=RolloutState.SKIPPED)
                 return response
 
+            if http_result.error_type == HttpRequestErrorType.REQUEST_ABORTED:
+                return RLRolloutResponseItem(finish_reason="abort", state=RolloutState.ABORTED)
             # Case 2: A fatal, non-retryable error occurred
             if http_result.is_unknown_error:
                 raise RuntimeError(
@@ -511,6 +546,9 @@ class RolloutWorker(SingleAcceleratorWorker):
             try:
                 extra_info = {}
                 finish_reason = response["meta_info"]["finish_reason"]["type"]
+                if finish_reason == "abort" and self.receive_abort_request.is_set() is False:
+                    self.receive_abort_request.set()
+                    self.logger.info(f"Setting receive_abort_request to True for rank {self.rank}")
                 if "output_token_logprobs" in response["meta_info"]:
                     if response["meta_info"]["output_token_logprobs"] is None:
                         last_token_ids = []
@@ -557,6 +595,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                         extra_info=extra_info,
                         state=RolloutState.ABORTED if finish_reason == "abort" else RolloutState.COMPLETED,
                     )
+                    # self.logger.info(f"Rollout response for request {uid}: finish_reason={finish_reason}, num_return_tokens={len(last_token_ids)}")
                 return rollout_response
             except KeyError as e:
                 error_msg = f"Missing expected key {e} in response {response} for {uid}"
@@ -633,12 +672,10 @@ class RolloutWorker(SingleAcceleratorWorker):
     def pause(self):
         """Pause the worker's generation process."""
         self.paused = True
-        self.pause_generation()
 
     def restart(self):
         """Resume the worker's generation process."""
-        self.paused = False
-        self.continue_generation()
+        self.receive_abort_request.clear()
 
     def check_health(self) -> bool:
         """Check the health of the worker's server.
