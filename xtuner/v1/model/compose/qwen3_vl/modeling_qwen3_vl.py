@@ -1,5 +1,5 @@
 import torch
-from xtuner.v1.model import BaseModel
+import types
 from .qwen3_vl_config import Qwen3VLBaseConfig
 from .modeling_vision import Qwen3VLVisionModel
 from .modeling_projector import Qwen3VLProjector
@@ -11,6 +11,7 @@ from torch.distributed.fsdp import (
     fully_shard,
     FSDPModule,
 )
+from typing import Callable
 import torch.distributed as dist
 import torch.distributed.nn.functional as distF
 from xtuner.v1.model.moe.moe import SequenceContext
@@ -19,19 +20,35 @@ from .modeling_vision import init_world_mesh
 from typing_extensions import override
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.model.moe.moe import MoEModelOutputs
+from xtuner.v1.model.moe.qwen3 import Qwen3MoE
 from xtuner.v1.model.moe.qwen3vl_text import Qwen3VLTextMoE
 from xtuner.v1.float8.float8_handler import Float8Handler
 from torch.distributed.device_mesh import DeviceMesh
 from xtuner.v1.data_proto.utils import split_for_sequence_parallel
+from xtuner.v1.model import BaseModel, TorchCompileOption, DEFAULT_FLOAT8_CFG
 
 logger = get_logger()
+
+
+QWEN3VL_COMPILE_CFG: dict[str, TorchCompileOption] = {
+    # "xtuner.v1.model.compose.qwen3_vl.modeling_projector.Qwen3VLProjector.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.model.compose.qwen3_vl.modeling_vision.Qwen3VLVisionLayer.forward": TorchCompileOption(fullgraph=True),
+    **DEFAULT_FLOAT8_CFG,
+}
+
+
+def to_hf_key_list_wrapper(fn: Callable[[str], list[str]], convertor: Callable[[str], str]):
+    def wrapper(self, *args, **kwargs):
+        return [convertor(i) for i in fn(*args, **kwargs)]
+
+    return wrapper
 
 
 class Qwen3VLForConditionalGeneration(BaseModel):
     config: Qwen3VLBaseConfig
 
     def __init__(self, config: Qwen3VLBaseConfig):
-        super().__init__()
+        super().__init__(config)  # type: ignore[arg-type]
         self.config = config
 
         self.vision_tower = Qwen3VLVisionModel(config.vision_config)
@@ -39,6 +56,15 @@ class Qwen3VLForConditionalGeneration(BaseModel):
         self.language_model = config.text_config.build()
 
         self._hf_path: Path | None = None
+
+        if isinstance(self.language_model, Qwen3MoE):
+            # TODO(YHC): This is a hack to make the language model compatible with HF
+            _hf_prefix = "model.language_model."
+            self.language_model.to_hf_key_list = types.MethodType(to_hf_key_list_wrapper(  # type: ignore
+                fn=self.language_model.to_hf_key_list,
+                convertor=lambda x: x.replace('model.', _hf_prefix)),
+                self.language_model)
+            self.language_model._init_load_spec()
 
         # Note: global load spec mapping for save_hf
         self.load_spec_mapping = {}
@@ -49,6 +75,7 @@ class Qwen3VLForConditionalGeneration(BaseModel):
         for key, value in self.language_model.load_spec_mapping.items():
             self.load_spec_mapping['language_model.' + key] = value
 
+        self._maybe_enable_compile(self.compile_cfg)
         self._freeze_modules()
 
     def _freeze_modules(self):
@@ -108,6 +135,11 @@ class Qwen3VLForConditionalGeneration(BaseModel):
 
         self._to_empty_meta()
         return self
+
+    @property
+    @override
+    def default_compile_cfg(self) -> dict[str, TorchCompileOption]:
+        return QWEN3VL_COMPILE_CFG
 
     def from_hf(self, hf_path: str | Path, strict=True):
         self._hf_path = Path(hf_path)
@@ -278,8 +310,18 @@ class Qwen3VLForConditionalGeneration(BaseModel):
         else:
             pixel_values_dump = torch.randn(4, 1536, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
             image_grid_thw = torch.tensor([[1, 2, 2]], device=inputs_embeds.device)
-            viusal_embeds, _ = self.get_visual_features(pixel_values_dump, image_grid_thw)
+            viusal_embeds, deepstack_visual_embeds = self.get_visual_features(pixel_values_dump, image_grid_thw)
             inputs_embeds = inputs_embeds + viusal_embeds.sum() * 0.0
+            for deepstack_visual_embed in deepstack_visual_embeds:
+                inputs_embeds = inputs_embeds + deepstack_visual_embed.sum() * 0.0
+
+            deepstack_visual_embeds = None
+            visual_pos_masks = None
+
+        if deepstack_visual_embeds is not None and len(deepstack_visual_embeds) == 0:
+            assert seq_ctx.position_ids is not None
+            assert seq_ctx.position_ids.ndim == 2, f"position_ids must be 2-dim when deepstack_visual_embeds is None," \
+                                                   f" but got {seq_ctx.position_ids.ndim}"
             deepstack_visual_embeds = None
             visual_pos_masks = None
 
