@@ -332,36 +332,39 @@ class RolloutWorker(SingleAcceleratorWorker):
                 headers=headers,
                 json=payload,
             )
-            send_task = asyncio.create_task(self.client.send(req))
-            abort_wait_task = asyncio.create_task(self.receive_abort_request.wait())
+            r = await self.client.send(req)
+            r.raise_for_status()
+            return HttpRequestResult(response=r)
+            # send_task = asyncio.create_task(self.client.send(req))
+            # abort_wait_task = asyncio.create_task(self.receive_abort_request.wait())
 
-            done, pending = await asyncio.wait(
-                {send_task, abort_wait_task}, timeout=self.config.rollout_timeout, return_when=asyncio.FIRST_COMPLETED
-            )
+            # done, pending = await asyncio.wait(
+            #     {send_task, abort_wait_task}, timeout=self.config.rollout_timeout, return_when=asyncio.FIRST_COMPLETED
+            # )
 
-            if send_task in done:
-                abort_wait_task.cancel()
-                r = await send_task
-                r.raise_for_status()
-                return HttpRequestResult(response=r)
+            # if send_task in done:
+            #     abort_wait_task.cancel()
+            #     r = await send_task
+            #     r.raise_for_status()
+            #     return HttpRequestResult(response=r)
 
-            if abort_wait_task in done:
-                self.logger.debug(
-                    f"Request to {url} was aborted. Waiting up to 5s for the request to gracefully finish."
-                )
-                try:
-                    # Wait for send_task for a short period before force-cancelling
-                    r = await asyncio.wait_for(send_task, timeout=self.abort_timeout)
-                    r.raise_for_status()
-                    return HttpRequestResult(response=r)
-                except asyncio.TimeoutError:
-                    self.logger.info(f"Request to {url} did not finish gracefully within 5s. Force cancelling.")
-                    send_task.cancel()
-                except asyncio.CancelledError:
-                    pass
-                # Ensure the task is awaited to suppress warnings, even if cancelled
-                await asyncio.gather(send_task, return_exceptions=True)
-                return HttpRequestResult(error_type=HttpRequestErrorType.REQUEST_ABORTED, url=url, payload=payload)
+            # if abort_wait_task in done:
+            #     self.logger.debug(
+            #         f"Request to {url} was aborted. Waiting up to 5s for the request to gracefully finish."
+            #     )
+            # try:
+            #     # Wait for send_task for a short period before force-cancelling
+            #     r = await asyncio.wait_for(send_task, timeout=self.abort_timeout)
+            #     r.raise_for_status()
+            #     return HttpRequestResult(response=r)
+            # except asyncio.TimeoutError:
+            #     self.logger.debug(f"Request to {url} did not finish gracefully within 5s. Force cancelling.")
+            #     send_task.cancel()
+            # except asyncio.CancelledError:
+            #     pass
+            # # Ensure the task is awaited to suppress warnings, even if cancelled
+            # await asyncio.gather(send_task, return_exceptions=True)
+            # return HttpRequestResult(error_type=HttpRequestErrorType.REQUEST_ABORTED, url=url, payload=payload)
 
         except Exception as e:
             error_type = HttpRequestErrorType.from_exception(e)

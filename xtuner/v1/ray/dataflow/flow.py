@@ -354,17 +354,17 @@ class RawDataFlow:
             await self.pause()
             cleanup_start_time = time.perf_counter()
             while len(waiting_tasks) > 0:
-                elapsed_time = time.perf_counter() - cleanup_start_time
-                if elapsed_time > self.cleanup_task_time:
-                    self.logger.warning(
-                        f"Cleanup timeout of {self.cleanup_task_time}s reached. "
-                        f"Forcefully cancelling {len(waiting_tasks)} remaining tasks."
-                    )
-                    for task in waiting_tasks:
-                        task.cancel()
-                    # Wait for cancellations to complete
-                    await asyncio.gather(*waiting_tasks, return_exceptions=True)
-                    break  # Exit the cleanup loop
+                # elapsed_time = time.perf_counter() - cleanup_start_time
+                # if elapsed_time > self.cleanup_task_time:
+                #     self.logger.warning(
+                #         f"Cleanup timeout of {self.cleanup_task_time}s reached. "
+                #         f"Forcefully cancelling {len(waiting_tasks)} remaining tasks."
+                #     )
+                #     for task in waiting_tasks:
+                #         task.cancel()
+                #     # Wait for cancellations to complete
+                #     await asyncio.gather(*waiting_tasks, return_exceptions=True)
+                #     break  # Exit the cleanup loop
                 # NOTE: Keep sending pause requests because the inference engine only marks currently running requests as aborted.
                 # When a waiting request starts running, it still needs another pause request to be marked as aborted.
                 _, pending_tasks = await asyncio.wait(waiting_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED)
@@ -507,6 +507,7 @@ class RawDataFlow:
         logger_msg += task_completions_report
         self.logger.info(logger_msg)
         return stats_dict
+
 
 DataFlow = ray.remote(RawDataFlow)
 DataFlowProxy = ActorProxy[RawDataFlow]
