@@ -1,10 +1,11 @@
 import asyncio
 from pathlib import Path
-from typing import Callable, List, Optional, Sized, Union
+from typing import Callable, List, Optional, Sized, TypeVar, Union
 
 import ray
 from cyclopts import Parameter
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+from ray.actor import ActorProxy
 from tqdm.auto import tqdm
 from typing_extensions import Annotated
 
@@ -15,6 +16,11 @@ from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfigList
 from xtuner.v1.ray.environment import BaseEnvironment
 from xtuner.v1.ray.utils import create_task
 from xtuner.v1.utils import get_logger
+from xtuner.v1.utils.type_helper import ray_method
+
+
+T = TypeVar("T")
+Ret = TypeVar("Ret")
 
 
 class EvaluatorConfig(BaseModel):
@@ -79,6 +85,7 @@ class EvaluatorConfig(BaseModel):
 
     tokenizer: Annotated[
         Union[PreTrainedTokenizer, PreTrainedTokenizerFast, str],
+        Field(exclude=True),
         Parameter(help="Tokenizer for text processing."),
     ]
     max_concurrent: Annotated[
@@ -97,6 +104,7 @@ class EvaluatorConfig(BaseModel):
     evaluate_step: Annotated[int, Parameter(help="Step interval for evaluation.")] = 1
     compute_metric_func: Annotated[
         Optional[Callable],
+        Field(exclude=True),
         Parameter(help="An optional function to filter or modify data groups after they are generated."),
     ] = None
     sample_params: Annotated[
@@ -106,8 +114,7 @@ class EvaluatorConfig(BaseModel):
     worker_log_dir: Annotated[Path, Parameter(help="Directory to save worker logs.")] = Path.cwd() / "work_dir"
 
 
-@ray.remote
-class Evaluator:
+class RawEvaluator:
     """A Ray actor for evaluating a model's performance on a given dataset.
 
     The Evaluator generates responses using an environment controller or rollout controller, then it use default or
@@ -239,8 +246,10 @@ class Evaluator:
         if waiting_tasks:
             await asyncio.wait_for(asyncio.gather(*waiting_tasks, return_exceptions=True), timeout=10)
 
-        self.logger.info(ray.get(self.env_controller.get_rollout_stats.remote()))  # type: ignore[attr-defined]
+        rollout_stats = await self.env_controller.get_rollout_stats.remote()  # type: ignore[attr-defined]
+        self.logger.info(rollout_stats)
 
+    @ray_method
     async def run(self, return_samples=False):
         """Run the full evaluation process.
 
@@ -258,7 +267,7 @@ class Evaluator:
                 the generated samples.
         """
         self.return_list = []
-        ray.get(self.env_controller.restart.remote())  # type: ignore[attr-defined]
+        await self.env_controller.restart.remote()  # type: ignore[attr-defined]
         await self.concurrent_eval_task_runner()
         if len(self.return_list) == 0:
             self.logger.warning("No valid samples were generated during evaluation.")
@@ -269,3 +278,7 @@ class Evaluator:
         if return_samples:
             return scores, self.eval_samples
         return scores
+
+
+Evaluator = ray.remote(RawEvaluator)
+EvaluatorProxy = ActorProxy[RawEvaluator]

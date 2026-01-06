@@ -10,6 +10,7 @@ from abc import abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import httpx
+import numpy as np
 import ray
 import requests  # type: ignore[import-untyped]
 import torch
@@ -23,6 +24,22 @@ from xtuner.v1.ray.base import AutoAcceleratorWorkers, SingleAcceleratorWorker
 from xtuner.v1.ray.config import RolloutConfig
 from xtuner.v1.utils import get_logger
 from xtuner.v1.utils.httpx_utils import HttpRequestErrorType, HttpRequestResult
+
+
+def get_eos_token(model_path: str) -> int | List[int]:
+    from xtuner.v1.utils.logger import get_logger
+
+    logger = get_logger()
+    generation_config_path = os.path.join(model_path, "generation_config.json")
+    if not os.path.exists(generation_config_path):
+        logger.warning(
+            f"Config {generation_config_path} does not exist and thus cannot get eos_token. You must provide eos_token manually."
+        )
+        return []
+    with open(generation_config_path) as f:
+        generation_config = json.load(f)
+    eos_token_id = generation_config.get("eos_token_id")
+    return eos_token_id
 
 
 class RolloutWorker(SingleAcceleratorWorker):
@@ -61,6 +78,7 @@ class RolloutWorker(SingleAcceleratorWorker):
         self.accelerator = accelerator
         self.server_func: Callable
         self.endpoints: dict[str, str] = dict()
+        self.engine_rank_mesh_array: list[list[int]]
         # http_concurrency is calculated based on the max batch size per engine and the total number of engines
         assert config.rollout_max_batch_size_per_instance, (
             "rollout_max_batch_size_per_instance must be set in RolloutConfig"
@@ -78,6 +96,11 @@ class RolloutWorker(SingleAcceleratorWorker):
         self.enable_return_routed_experts = self.config.enable_return_routed_experts
         if self.rank == 0:
             self.logger.info(f"RolloutConfig:\n{self.config.model_dump_json(indent=2)}")
+        eos_token = get_eos_token(self.config.model_path)
+        self.logger.info(f"Using eos_token: {eos_token} for model at {self.config.model_path}")
+        self.eos_token: List[int] = [eos_token] if isinstance(eos_token, int) else eos_token
+        self.receive_abort_request = asyncio.Event()
+        self.abort_timeout = 5.0
 
     def init_dist_port(self):
         """Initialize distributed communication ports.
@@ -94,8 +117,12 @@ class RolloutWorker(SingleAcceleratorWorker):
             placement_group_capture_child_tasks=True,
             placement_group_bundle_index=self.engine_bundle_idxs[0],
         )
+        local_rank = int(ray.get_runtime_context().get_accelerator_ids()[self.accelerator][0])
+        start_port = self.config.dist_port_base + local_rank * 1024
         self.host, self.ports = ray.get(
-            find_master_addr_and_port.options(scheduling_strategy=scheduling_strategy).remote(3)
+            find_master_addr_and_port.options(scheduling_strategy=scheduling_strategy).remote(
+                nums=3, start_port=start_port, max_tries=1024
+            )
         )
         self.dist_port = self.ports[0]
         self.server_port = self.ports[1]
@@ -116,8 +143,12 @@ class RolloutWorker(SingleAcceleratorWorker):
                 server URL.
         """
         self.dist_init_addr = dist_init_addr if dist_init_addr else self.dist_init_addr
+        self.receive_abort_request.clear()
         self.launch_server()
         return (self.rank, self.server_url)
+
+    def set_engine_rank_mesh_array(self, engine_rank_mesh_array: list[list[int]]):
+        self.engine_rank_mesh_array = engine_rank_mesh_array
 
     def set_engine_bundle_idxs(self, engine_bundle_idxs: list[int]):
         """Set the bundle indices for the inference engine.
@@ -292,6 +323,9 @@ class RolloutWorker(SingleAcceleratorWorker):
 
     async def _safe_post_request(self, url, headers, payload) -> HttpRequestResult:
         try:
+            if self.receive_abort_request.is_set():
+                self.logger.debug(f"Request to {url} was cancelled before sending due to an abort signal.")
+                return HttpRequestResult(error_type=HttpRequestErrorType.REQUEST_ABORTED, url=url, payload=payload)
             req = self.client.build_request(
                 "POST",
                 url,
@@ -301,6 +335,7 @@ class RolloutWorker(SingleAcceleratorWorker):
             r = await self.client.send(req)
             r.raise_for_status()
             return HttpRequestResult(response=r)
+
         except Exception as e:
             error_type = HttpRequestErrorType.from_exception(e)
             result = HttpRequestResult(error_type=error_type, exception=e, url=url, payload=payload)
@@ -318,6 +353,8 @@ class RolloutWorker(SingleAcceleratorWorker):
         extra_info: dict,
     ) -> RLRolloutResponseItem:
         uid = extra_info.get("action_id", str(uuid.uuid4()))
+        action_id = extra_info.get("action_id", str(uuid.uuid4()))
+        root_id = extra_info.get("action_id", str(uuid.uuid4()))
         response = None
         cur_retry_times = 0
 
@@ -334,8 +371,7 @@ class RolloutWorker(SingleAcceleratorWorker):
         while True:
             # 当拼接后的response_ids长度已经达到了max_tokens时，则不需要发送数据，直接返回
             if extra_info.get("partial_rollout_input_ids", None) is not None:
-                expected_max_tokens = self.config.context_length - len(extra_info["partial_rollout_input_ids"])
-                if expected_max_tokens <= 0:
+                if sample_params["max_tokens"] == 0:
                     self.logger.info(
                         f"Request {uid} reached max context length {self.config.context_length}, no need to rollout more."
                     )
@@ -345,6 +381,18 @@ class RolloutWorker(SingleAcceleratorWorker):
                         logprobs=None,
                         num_return_tokens=0,
                         finish_reason="length",
+                        state=RolloutState.COMPLETED,
+                    )
+                if extra_info["partial_rollout_input_ids"][-1] in self.eos_token:
+                    self.logger.info(
+                        f"Request {uid} already ends with eos token {extra_info['partial_rollout_input_ids'][-1]}, no need to rollout more"
+                    )
+                    return RLRolloutResponseItem(
+                        response=None,
+                        response_ids=None,
+                        logprobs=None,
+                        num_return_tokens=0,
+                        finish_reason="stop",
                         state=RolloutState.COMPLETED,
                     )
 
@@ -361,7 +409,7 @@ class RolloutWorker(SingleAcceleratorWorker):
             # Case 1: Request was successful
             if http_result.response is not None:  # 推理完成：completed状态：finish_reason为abort/stop/length, 退出
                 response = await self._handle_non_stream_response(
-                    uid, sample_params, extra_params, http_result.response
+                    root_id, action_id, sample_params, extra_params, http_result.response, extra_info
                 )
                 if response.state == RolloutState.SKIPPED:
                     # retry
@@ -376,13 +424,17 @@ class RolloutWorker(SingleAcceleratorWorker):
                         return RLRolloutResponseItem(state=RolloutState.SKIPPED)
                 return response
 
-            # Case 2: A fatal, non-retryable error occurred
-            if http_result.is_unknown_error:
+            # Case2: Return aborted error if receive abort signal
+            if http_result.error_type == HttpRequestErrorType.REQUEST_ABORTED:
+                return RLRolloutResponseItem(finish_reason="abort", state=RolloutState.ABORTED)
+
+            # Case 3: A fatal, non-retryable error occurred
+            elif http_result.is_unknown_error:
                 raise RuntimeError(
                     f"Unexpected error during rollout request {uid} to {http_result.url}: {http_result.exception}"
                 )
 
-            # Case 3: A retryable error occurred, and we still have retries left
+            # Case 4: A retryable error occurred, and we still have retries left
             elif http_result.is_retryable and cur_retry_times < self.config.max_retry_per_sample:
                 cur_retry_times += 1
                 self.logger.warning(
@@ -473,13 +525,19 @@ class RolloutWorker(SingleAcceleratorWorker):
         )
         return rollout_response
 
-    async def _handle_non_stream_response(self, uid, sample_params, extra_params, response) -> RLRolloutResponseItem:
+    async def _handle_non_stream_response(
+        self, root_id, action_id, sample_params, extra_params, response, input_extra_info
+    ) -> RLRolloutResponseItem:
         response = response.json()
+        uid = action_id
         if "return_token_ids" in extra_params and extra_params["return_token_ids"]:
             last_logprobs: list[float] = []
             try:
                 extra_info = {}
                 finish_reason = response["meta_info"]["finish_reason"]["type"]
+                if finish_reason == "abort" and self.receive_abort_request.is_set() is False:
+                    self.receive_abort_request.set()
+                    self.logger.info(f"Setting receive_abort_request to True for rank {self.rank}")
                 if "output_token_logprobs" in response["meta_info"]:
                     if response["meta_info"]["output_token_logprobs"] is None:
                         last_token_ids = []
@@ -499,16 +557,47 @@ class RolloutWorker(SingleAcceleratorWorker):
                         "enable_return_routed_experts is True, but routed_experts is not in meta_info"
                     )
                     routed_experts = response["meta_info"]["routed_experts"]  # token[layer[expert]]
-                    if isinstance(routed_experts, str):
-                        import base64
+                    # 处理当前专家
+                    if routed_experts is not None:
+                        if isinstance(routed_experts, str):
+                            import base64
 
-                        data = base64.b64decode(routed_experts)
-                        routed_experts = ray.cloudpickle.loads(data)
+                            data = base64.b64decode(routed_experts)
+                            routed_experts = ray.cloudpickle.loads(data)
+                        else:
+                            routed_experts = torch.tensor(routed_experts)  # n,layer,expert
+                            routed_experts = ray.put(routed_experts)
+
+                        # 处理历史专家
+                        if "routed_experts" in input_extra_info and input_extra_info["routed_experts"] is not None:
+                            exist_routed_experts = await input_extra_info["routed_experts"]  # n, layer, expert
+                            cur_routed_experts = await routed_experts  # [n, layer, expert]
+                            ray._private.internal_api.free(routed_experts)
+                            ray._private.internal_api.free(input_extra_info["routed_experts"])
+                            del input_extra_info["routed_experts"]
+                            assert (exist_routed_experts.shape[0] - 1) > 0 and exist_routed_experts.shape[
+                                0
+                            ] - 1 <= cur_routed_experts.shape[0], (
+                                f"Existing routed_experts shape: {exist_routed_experts.shape}, current routed_experts shape: {cur_routed_experts.shape}"
+                            )
+                            init_cur_roued_experts = cur_routed_experts.shape[0]
+                            cur_routed_experts = cur_routed_experts[exist_routed_experts.shape[0] :, :, :]
+                            concat_routed_experts = np.concatenate((exist_routed_experts, cur_routed_experts), axis=0)
+                            prompt_tokens = response["meta_info"].get("prompt_tokens", 0)
+                            response_tokens = response["meta_info"].get("completion_tokens", 0)
+                            self.logger.debug(
+                                f"[{root_id}/{action_id}] Partial Rollout Stats: "
+                                f"Tokens(prompt={prompt_tokens}, response={response_tokens}, total={prompt_tokens + response_tokens}) | "
+                                f"Experts(exist={exist_routed_experts.shape}, init_cur={init_cur_roued_experts}, cur={cur_routed_experts.shape}, concat={concat_routed_experts.shape})"
+                            )
+                            extra_info["routed_experts"] = ray.put(concat_routed_experts)
+                        else:
+                            extra_info["routed_experts"] = routed_experts
+
                     else:
-                        routed_experts = torch.tensor(routed_experts)  # n,layer,expert
-                        routed_experts = ray.put(routed_experts)
-                    extra_info = {"routed_experts": routed_experts}
-
+                        assert finish_reason == "abort", (
+                            f"routed_experts is None, but finish_reason is {finish_reason}, expected abort. response: {response}"
+                        )
                 # NOTE: When set return_token_ids = True, the response must contain valid token_ids/logprobs.
                 # If not, we consider it as an invalid response and retry it.
                 # NOTE: !!! When finish_reason is abort, some queries may not return token_ids or logprobs. !!!
@@ -525,6 +614,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                         extra_info=extra_info,
                         state=RolloutState.ABORTED if finish_reason == "abort" else RolloutState.COMPLETED,
                     )
+                    # self.logger.info(f"Rollout response for request {uid}: finish_reason={finish_reason}, num_return_tokens={len(last_token_ids)}")
                 return rollout_response
             except KeyError as e:
                 error_msg = f"Missing expected key {e} in response {response} for {uid}"
@@ -601,12 +691,10 @@ class RolloutWorker(SingleAcceleratorWorker):
     def pause(self):
         """Pause the worker's generation process."""
         self.paused = True
-        self.pause_generation()
 
     def restart(self):
         """Resume the worker's generation process."""
-        self.paused = False
-        self.continue_generation()
+        self.receive_abort_request.clear()
 
     def check_health(self) -> bool:
         """Check the health of the worker's server.
