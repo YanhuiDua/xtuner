@@ -19,7 +19,7 @@ from xtuner.v1.ops import AttnOpOutputs, attn_impl_mapping, flash_attn_varlen_fu
 from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
 from xtuner.v1.utils import XTUNER_DETERMINISTIC, get_device, get_logger
 
-from ..linear.linear import build_linear
+from ..linear import build_linear
 from ..rms_norm import RMSNorm
 from .attn_outputs import AttnOutputs
 from .kv_cache import fill_paged_kv_cache
@@ -44,9 +44,10 @@ class MHAConfig(BaseModel):
     attn_impl: Literal["flash_attention", "flex_attention", "eager_attention"] = "flash_attention"
 
     def model_post_init(self, _):
-        if not is_installed("flash-attn") and self.attn_impl == "flash_attention" and get_device() == "cuda":
-            logger.warning("flash-attn is not installed, using `flex_attention` instead.")
-            self.attn_impl = "flex_attention"
+        if self.attn_impl == "flash_attention" and get_device() == "cuda":
+            if not (is_installed("flash-attn") or is_installed("flash-attn-3")):
+                logger.warning("flash-attn is not installed, using `flex_attention` instead.")
+                self.attn_impl = "flex_attention"
         return self
 
     def build(

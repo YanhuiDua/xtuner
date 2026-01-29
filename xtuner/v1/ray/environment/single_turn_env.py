@@ -1,23 +1,25 @@
 import asyncio
+import copy
 import os
 from pathlib import Path
-from typing import List
+from typing import List, cast
 
 import ray
+from ray.actor import ActorClass, ActorProxy
 
 from xtuner.v1.data_proto.rl_data import (
     RLDataFlowItem,
     RLJudgerResponseItem,
     RLRolloutResponseItem,
+    is_valid_for_training,
     update_dataflow_item,
     update_rollout_item,
 )
 from xtuner.v1.ray.environment.base_env import BaseEnvironment
-from xtuner.v1.utils import get_logger
+from xtuner.v1.utils import get_logger, ray_method
 
 
-@ray.remote(max_concurrency=int(os.environ.get("RAY_MAX_CONCURRENCY", 1000)))
-class SingleTurnEnvironment(BaseEnvironment):
+class RawSingleTurnEnvironment(BaseEnvironment):
     """A single-turn environment for handling generation and evaluation tasks.
 
     This class extends `BaseEnvironment` to provide a concrete implementation for
@@ -64,11 +66,8 @@ class SingleTurnEnvironment(BaseEnvironment):
         # to account for potential queuing delays and other overheads.
         self.timeout_multiplier = 2.0
 
-    async def generate(
-        self,
-        group_data_items: List[RLDataFlowItem],
-        sample_params=None,
-        extra_params=None,
+    async def generate(  # type: ignore[override]
+        self, group_data_items: List[RLDataFlowItem], sample_params=None, extra_params=None
     ) -> List[RLDataFlowItem]:
         """Generate responses for a batch of RLTextDataItem using the rollout
         controller.
@@ -93,12 +92,35 @@ class SingleTurnEnvironment(BaseEnvironment):
             for sample in group_data_items:
                 sample.data.extra_info["root_id"] = sample.uid.root_id
                 sample.data.extra_info["action_id"] = sample.uid.action_id
+                update_sample_params = sample_params
+
+                if "partial_rollout_input_ids" in sample.env.rollout.extra_info:
+                    input_ids_length = len(sample.data.input_ids) if sample.data.input_ids is not None else 0
+                    current_partial_length = len(sample.env.rollout.extra_info["partial_rollout_input_ids"])
+                    rollout_extra_info = copy.deepcopy(sample.data.extra_info)
+                    rollout_extra_info["partial_rollout_input_ids"] = sample.env.rollout.extra_info[
+                        "partial_rollout_input_ids"
+                    ]
+                    assert sample_params is not None, "sample_params should not be None when using partial rollout."
+                    update_sample_params = copy.deepcopy(sample_params)
+                    update_sample_params.max_tokens = sample_params.max_tokens - (
+                        current_partial_length - input_ids_length
+                    )
+                    self.logger.debug(
+                        f"root_id: {sample.uid.root_id}, action_id {sample.uid.action_id} pass current_partial_length {current_partial_length}, input_ids_length {input_ids_length} to rollout and set max_tokens to {update_sample_params.max_tokens}"
+                    )
+                else:
+                    rollout_extra_info = sample.data.extra_info
+
+                if "routed_experts" in sample.env.rollout.extra_info:
+                    rollout_extra_info["routed_experts"] = sample.env.rollout.extra_info["routed_experts"]
+
                 fut = self.rollout_controller.rollout.remote(
                     prompt=sample.data.messages,
                     input_ids=sample.data.input_ids,
-                    sample_params=sample_params,
+                    sample_params=update_sample_params,
                     extra_params=extra_params,
-                    extra_info=sample.data.extra_info,
+                    extra_info=rollout_extra_info,
                 )
                 response_future.append(fut)
             try:
@@ -111,7 +133,8 @@ class SingleTurnEnvironment(BaseEnvironment):
             group_data_items = update_rollout_item(group_data_items, rollout_responses)
         return group_data_items
 
-    async def run(
+    @ray_method
+    async def run(  # type: ignore[override]
         self, group_data_items: List[RLDataFlowItem], sample_params=None, extra_params=None
     ) -> List[RLDataFlowItem]:
         """Runs a full generation and judger cycle.
@@ -130,7 +153,7 @@ class SingleTurnEnvironment(BaseEnvironment):
             The format of the return value matches the format of the input `data`.
         """
         group_data_items = await self.generate(group_data_items, sample_params, extra_params)  # type: ignore[assignment]
-        continue_judger = all(item.env.rollout.state == "completed" for item in group_data_items)
+        continue_judger = is_valid_for_training(group_data_items)
         if self.judger_controller and continue_judger:
             try:
                 judger_responses: List[RLJudgerResponseItem] = await asyncio.wait_for(
@@ -147,3 +170,10 @@ class SingleTurnEnvironment(BaseEnvironment):
                 ]
             group_data_items = update_dataflow_item(group_data_items, "env.judger", judger_responses)
         return group_data_items
+
+
+SingleTurnEnvironment = cast(
+    ActorClass[RawSingleTurnEnvironment],
+    ray.remote(max_concurrency=int(os.environ.get("RAY_MAX_CONCURRENCY", 1000)))(RawSingleTurnEnvironment),
+)
+SingleTurnEnvironmentProxy = ActorProxy[RawSingleTurnEnvironment]

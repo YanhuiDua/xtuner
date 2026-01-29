@@ -133,7 +133,7 @@ class InternS1VLTokenizeFunction(BaseMLLMTokenizeFunction[InternS1DataItem]):
         self.system_message = system_message
 
         # Note: 比较重要，防止改了参数但是没有重新 cache
-        self._hash_str = (
+        _hash_str = (
             f"{self.downsample_ratio}_{self.num_image_token}_{self.system_message}_{self.use_thumbnail}"
             f"_{self.dynamic_image_size}_{self.max_num_frames}_{self.min_num_frames}"
             f"_{self.min_dynamic_patch}_{self.max_dynamic_patch}_{max_length}"
@@ -159,7 +159,15 @@ class InternS1VLTokenizeFunction(BaseMLLMTokenizeFunction[InternS1DataItem]):
         self.eos_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eos_token)
 
         # 必须要最后调用
-        super().__init__(tokenizer, self.chat_template, max_length, tokenizer_hash, hash, data_name=self.data_name)
+        super().__init__(
+            tokenizer,
+            self.chat_template,
+            max_length,
+            tokenizer_hash,
+            hash,
+            hash_str=_hash_str,
+            data_name=self.data_name,
+        )
 
     def _get_transform(self):
         transform = build_transform(
@@ -168,7 +176,7 @@ class InternS1VLTokenizeFunction(BaseMLLMTokenizeFunction[InternS1DataItem]):
         return transform
 
     def pure_text_get_item(self, data_item: dict) -> InternS1DataItem:
-        messages = ChatMessages(messages=data_item["messages"])
+        messages = ChatMessages(messages=data_item["messages"], tools=data_item.get("tools"))
 
         is_pretrain = False
         if len(messages.messages) == 1 and messages.messages[0].role == "pretrain":
@@ -215,7 +223,7 @@ class InternS1VLTokenizeFunction(BaseMLLMTokenizeFunction[InternS1DataItem]):
 
         num_image_tokens = [self.num_image_token * num_tile for num_tile in num_tiles]
 
-        messages = ChatMessages(messages=data_item["messages"])
+        messages = ChatMessages(messages=data_item["messages"], tools=data_item.get("tools"))
 
         try:
             replace_image_token(messages, self.chat_template, num_image_tokens)
@@ -285,7 +293,7 @@ class InternS1VLTokenizeFunction(BaseMLLMTokenizeFunction[InternS1DataItem]):
 
         # Preprocess the conversations and generate the return dictionary
         num_image_tokens = [self.num_image_token * num_tile for num_tile in num_tiles]
-        messages = ChatMessages(messages=data_item["messages"])
+        messages = ChatMessages(messages=data_item["messages"], tools=data_item.get("tools"))
         replace_image_token(messages, self.chat_template, num_image_tokens)
         tokenized = messages.tokenize(self.tokenizer, self.chat_template)
         input_ids = tokenized["input_ids"]
@@ -337,7 +345,7 @@ class InternS1VLTokenizeFunction(BaseMLLMTokenizeFunction[InternS1DataItem]):
             num_image_tokens_list.append(num_image_tokens)
         total_image_tokens = sum([sum(num_image_tokens) for num_image_tokens in num_image_tokens_list])
 
-        messages = ChatMessages(messages=data_item["messages"])
+        messages = ChatMessages(messages=data_item["messages"], tools=data_item.get("tools"))
 
         try:
             replace_video_token(messages, self.chat_template, num_image_tokens_list)
@@ -412,7 +420,7 @@ class InternS1VLTokenizeFunction(BaseMLLMTokenizeFunction[InternS1DataItem]):
             num_imgs_list.append(len(image_list))
 
         total_image_tokens = sum([sum(num_image_tokens) for num_image_tokens in num_image_tokens_list])
-        messages = ChatMessages(messages=data_item["messages"])
+        messages = ChatMessages(messages=data_item["messages"], tools=data_item.get("tools"))
         replace_video_token(messages, self.chat_template, num_image_tokens_list)
         tokenized = messages.tokenize(self.tokenizer, self.chat_template)
         input_ids = tokenized["input_ids"]

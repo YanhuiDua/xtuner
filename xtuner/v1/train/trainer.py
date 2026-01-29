@@ -31,11 +31,12 @@ from xtuner.v1.config import FSDPConfig, LRConfig, OptimConfig
 from xtuner.v1.data_proto.sequence_context import SequenceContext
 from xtuner.v1.datasets.config import BaseDataloaderConfig, DataloaderConfig, DatasetConfigList
 from xtuner.v1.engine import LossLog, OtherLog, TrainEngine
-from xtuner.v1.engine.vision_compose_train_engine import VisionComposeConfigProtocol, VisionComposeTrainEngine
+from xtuner.v1.engine.vision_compose_train_engine import VisionComposeTrainEngine
 from xtuner.v1.loss import CELossConfig
 from xtuner.v1.loss.ce_loss import CELossContextInputItem
-from xtuner.v1.model.base import ModelItem, TransformerConfig
-from xtuner.v1.model.utils import ModelForwardExtraLogInfo
+from xtuner.v1.model.base import ModelItem, TransformerConfig, XTunerBaseModelConfig
+from xtuner.v1.model.compose.base import BaseComposeConfig
+from xtuner.v1.model.moe.moe import MoEConfig
 from xtuner.v1.patch import patch_default_save_plan
 from xtuner.v1.profiler import profiling_memory, profiling_time
 from xtuner.v1.profiler.prober import ProberList
@@ -58,7 +59,6 @@ from xtuner.v1.utils.internal_metrics import (
     InternalMetricsRecorder,
     flatten_internal_metrics_for_logs,
 )
-from xtuner.v1.utils.misc import monkey_patch_hf_modules_cache
 
 from .toy_tokenizer import UTF8ByteTokenizer
 
@@ -83,6 +83,20 @@ class ExpHistory(TypedDict):
     git_info: GitInfo
     end: NotRequired[int]
     comment: NotRequired[str]
+
+
+class PerformanceStatistics(TypedDict):
+    local_step_consumed_tokens: int
+    local_step_consumed_img_tokens: int | None
+    step_consumed_tokens: int
+    total_consumed_tokens: int
+    total_consumed_tokens_per_rank: float
+    tgs: float
+    e2e_tgs: float
+    exp_tgs: float
+    eta_seconds: float
+    eta_hms: str
+    e2e_train_time: float
 
 
 class ExpInfo(BaseModel):
@@ -302,7 +316,7 @@ class TrainerConfig(BaseModel):
         arbitrary_types_allowed=True,
         protected_namespaces=(),
     )
-    model_cfg: TransformerConfig | VisionComposeConfigProtocol
+    model_cfg: TransformerConfig | BaseComposeConfig
     load_from: str | Path | None = None
     tokenizer_path: str | Path | None = None
     dataset_cfg: Annotated[DatasetConfigList | None, Parameter(show_default=False)] = (
@@ -360,14 +374,12 @@ class TrainerConfig(BaseModel):
     @field_validator("grad_norm_dtype", mode="before")
     @classmethod
     def deserialize_dtype(cls, value: str) -> torch.dtype:
-        if "bfloat16" in value:
-            return torch.bfloat16
-        elif "float32" in value:
+        if "float32" in value:
             return torch.float32
         elif "float64" in value:
             return torch.float64
         else:
-            raise ValueError()
+            raise ValueError(f"grad_norm_dtype {value} is not supported, must be 'float32' or 'float64'")
 
 
 class Trainer:
@@ -411,7 +423,7 @@ class Trainer:
         backend (str): Backend for distributed training.
     """
 
-    config: TrainerConfig | None
+    _config: TrainerConfig | None
     _META_PATH = ".xtuner"
     _PROFILE_TIME_PATH = "profiling_time"
     _PROFILE_MEMORY_PATH = "profiling_memory"
@@ -429,7 +441,7 @@ class Trainer:
         self,
         *,
         load_from: str | Path | None = None,  # Huggingface model path or saved trainer_path
-        model_cfg: TransformerConfig | VisionComposeConfigProtocol,
+        model_cfg: TransformerConfig | BaseComposeConfig,
         optim_cfg: OptimConfig,
         fsdp_cfg: FSDPConfig | None = FSDPConfig(),
         dataset_cfg: DatasetConfigList | None = None,  # TODO: Removed in version 1.1.0
@@ -491,13 +503,19 @@ class Trainer:
         self._profile_time = profile_time
         self._profile_memory = profile_memory
         self._load_from = Path(load_from) if isinstance(load_from, str) else load_from
-        self._load_from_hf = load_from is not None and is_hf_model_path(load_from)
+
+        is_hf_path, error_info = is_hf_model_path(load_from) if load_from is not None else False, None
+        self._load_from_hf = is_hf_path
         self._can_save_hf = model_cfg.hf_config is not None or self._load_from_hf
 
         if not self._can_save_hf:
-            assert hf_interval is None and hf_max_keep is None, (
-                "`hf_interval` and `hf_max_keep` should be None when `load_from` is not a Huggingface model path, "
+            assert_info = (
+                f"`hf_interval`: {hf_interval} and `hf_max_keep`: {hf_max_keep} "
+                f"should be None when `load_from` is not a Huggingface model path, "
             )
+            if is_hf_path is False and error_info is not None:
+                assert_info += f", HF path load error Info: {error_info}"
+            assert hf_interval is None and hf_max_keep is None, assert_info
 
         self._checkpoint_interval = checkpoint_interval
         self._checkpoint_maxkeep = checkpoint_maxkeep
@@ -514,9 +532,9 @@ class Trainer:
         self._debug = debug
         self._seed = seed
 
-        self._reduced_consumed_tokens = 0
+        self._total_consumed_tokens = 0
         self._exp_consumed_tokens = 0
-        self._reduced_consumed_samples = 0
+        self._total_consumed_samples = 0
 
         self._train_time = 0
         self._train_time_offset = 0
@@ -564,7 +582,7 @@ class Trainer:
             global_batch_size = self.data_mesh["dp"].size()
         self._global_batch_size = global_batch_size
 
-        self._resolve_config_conflicts(self.tokenizer, model_cfg, dataloader_cfg)
+        self._resolve_config_conflicts(self.tokenizer, model_cfg, dataloader_cfg, fsdp_cfg)
 
         if dataset_cfg is not None:  # TODO: Removed in version 1.1.0
             logger.warning("`dataset_cfg` is deprecated, please use `dataloader_cfg.dataset_config_list` instead")
@@ -682,7 +700,8 @@ class Trainer:
             trainer_cfg=config,
             internal_metrics_cfg=config.internal_metrics_cfg,
         )
-        self.config = config
+        self._config = config
+        self._print_training_config()
         return self
 
     def fit(self):
@@ -694,44 +713,13 @@ class Trainer:
         train_begin = time.time()
         time_before_get_data = time.time()
         for data_batch in self._data_iter():
+            consumed_samples = len(data_batch)
+            time_before_train_step = time.time()
+
             ProberList.set_step(self._cur_step + 1)
             DEVICE_MODULE.reset_peak_memory_stats()
 
-            time_before_train_step = time.time()
-            data_time = time_before_train_step - time_before_get_data
-
-            seq_ctx_list: list[SequenceContext] = []
-            loss_ctx_input_list: list[CELossContextInputItem] = []
-            for data in data_batch:
-                seq_ctx = data["seq_ctx"].to(DEVICE)
-                loss_ctx_input = CELossContextInputItem(shifted_labels=data["shifted_labels"]).to(DEVICE)
-                if self.sp_mesh.size() > 1:
-                    seq_ctx = seq_ctx.split(sequence_parallel_mesh=self.sp_mesh)
-                    loss_ctx_input = loss_ctx_input.sp_split(self.sp_mesh)
-                seq_ctx_list.append(seq_ctx)
-                loss_ctx_input_list.append(loss_ctx_input)
-
-            del data_batch
-
-            LossContext = self.loss_cfg.loss_ctx_cls
-            batches_loss_kwargs = LossContext.build_batches_loss_kwargs(
-                loss_ctx_input_list,
-                self.loss_cfg,
-                cu_seq_lens_list=[seq_ctx.cu_seq_lens_q for seq_ctx in seq_ctx_list],
-                sp_mesh=self.sp_mesh,
-            )
-            engine_input = []
-            for seq_ctx, loss_kwargs in zip(seq_ctx_list, batches_loss_kwargs):
-                loss_ctx = LossContext(
-                    loss_cfg=self.loss_cfg,
-                    loss_kwargs=loss_kwargs,
-                )
-                engine_input.append(
-                    ModelItem(
-                        seq_ctx=seq_ctx,
-                        loss_ctx=loss_ctx,
-                    )
-                )
+            engine_input = self._prepare_model_input(data_batch)
 
             with self._maybe_profiling():
                 loss_log, other_log = self._engine.train_step(engine_input)
@@ -749,44 +737,37 @@ class Trainer:
 
             grad_norm = self._engine.clip_grad_norm(do_clip=self._do_clip, dtype=self._grad_norm_dtype)
             self._engine.step_optimizer(grad_norm)
+
             time_after_train_step = time.time()
             ProberList.after_step()
+
+            data_time = time_before_train_step - time_before_get_data
             step_time = time_after_train_step - time_before_train_step
-            step_consumed_tokens = other_log["consumed_tokens"]
-
-            extra_info = other_log.get("extra_info", {})
-            if isinstance(extra_info, ModelForwardExtraLogInfo):
-                extra_info_dict = extra_info.get()
-            else:
-                extra_info_updated = ModelForwardExtraLogInfo(extra_info)
-                extra_info_dict = extra_info_updated.get()
-            loss_log.update(extra_info_dict)
-
-            if "maxvio" in other_log:
-                loss_log["maxvio"] = other_log["maxvio"]
-            loss_log["efficient_attn_ratio"] = other_log["efficient_attn_ratio"]
 
             internal_metrics = self._maybe_pop_model_internal_metrics(engine_input)
 
             self._cur_step += 1
-
-            reduced_step_consumed_tokens = self._reduce_number_across_rank(step_consumed_tokens)
-            self._reduced_consumed_tokens += reduced_step_consumed_tokens
-
-            self._exp_consumed_tokens += step_consumed_tokens
+            reduced_step_consumed_tokens = self._reduce_number_across_rank(other_log["step_consumed_tokens"])
+            self._total_consumed_tokens += reduced_step_consumed_tokens
+            self._exp_consumed_tokens += reduced_step_consumed_tokens
+            self._total_consumed_samples += self._reduce_number_across_rank(consumed_samples)
             self._train_time = time_after_train_step - train_begin
+
+            # Compute training metrics
+            training_metrics = self._compute_performance_metrics(
+                local_step_consumed_tokens=other_log["step_consumed_tokens"],
+                local_step_consumed_img_tokens=other_log.get("step_consumed_img_tokens"),
+                step_consumed_tokens=reduced_step_consumed_tokens,
+                step_time=step_time,
+            )
 
             # TODO: This log should be move before lr_scheduler.step, but for CI BC, keep it temporarily
             self._log_step(
                 loss_log=loss_log,
-                step_consumed_tokens=step_consumed_tokens,
-                exp_consumed_tokens=self._exp_consumed_tokens,
-                reduced_consumed_tokens=self._reduced_consumed_tokens,
+                training_metrics=training_metrics,
+                grad_norm=grad_norm.item(),
                 data_time=data_time,
                 step_time=step_time,
-                train_time=self._train_time,
-                train_time_offset=self._train_time_offset,
-                grad_norm=grad_norm.item(),
                 internal_metrics=internal_metrics,
             )
 
@@ -808,7 +789,44 @@ class Trainer:
             self._metrics_recorder.close()
         self.logger.info(f"Training finished in {time.time() - train_begin:.2f} seconds")
 
-    def _reduce_number_across_rank(self, rank_number: int) -> int:
+    def _prepare_model_input(self, data_batch) -> list[ModelItem]:
+        seq_ctx_list: list[SequenceContext] = []
+        loss_ctx_input_list: list[CELossContextInputItem] = []
+
+        for data in data_batch:
+            seq_ctx = data["seq_ctx"].to(DEVICE)
+            loss_ctx_input = CELossContextInputItem(shifted_labels=data["shifted_labels"]).to(DEVICE)
+            if self.sp_mesh.size() > 1:
+                seq_ctx = seq_ctx.split(sequence_parallel_mesh=self.sp_mesh)
+                loss_ctx_input = loss_ctx_input.sp_split(self.sp_mesh)
+            seq_ctx_list.append(seq_ctx)
+            loss_ctx_input_list.append(loss_ctx_input)
+
+        # TODO: Consider moving data_batch deletion to the caller for better memory management.
+        del data_batch
+
+        LossContext = self.loss_cfg.loss_ctx_cls
+        batches_loss_kwargs = LossContext.build_batches_loss_kwargs(
+            loss_ctx_input_list,
+            self.loss_cfg,
+            cu_seq_lens_list=[seq_ctx.cu_seq_lens_q for seq_ctx in seq_ctx_list],
+            sp_mesh=self.sp_mesh,
+        )
+        engine_input = []
+        for seq_ctx, loss_kwargs in zip(seq_ctx_list, batches_loss_kwargs):
+            loss_ctx = LossContext(
+                loss_cfg=self.loss_cfg,
+                loss_kwargs=loss_kwargs,
+            )
+            engine_input.append(
+                ModelItem(
+                    seq_ctx=seq_ctx,
+                    loss_ctx=loss_ctx,
+                )
+            )
+        return engine_input
+
+    def _reduce_number_across_rank(self, rank_number: int | float) -> int:
         _gathered_list = [None for _ in range(self.world_size)]
         dist.all_gather_object(_gathered_list, rank_number)
         reduced_number = sum(_gathered_list)  # type: ignore[arg-type]
@@ -929,12 +947,18 @@ class Trainer:
         """
         return self._cur_epoch
 
+    @property
+    def config(self) -> TrainerConfig | None:
+        return self._config
+
     def _init_logger(self, log_dir: Path):
         # Logging system maybe need better design
+        log_level = os.environ.get("XTUNER_LOG_LEVEL", "INFO").upper()
         logger = get_logger()
         logger.remove()
         logger.add(log_dir / f"rank{get_rank()}.log", format=log_format(), backtrace=True, catch=True)
-        logger.add(sys.stderr, format=log_format(rank=get_rank()))
+        # Set log level to hide debug output
+        logger.add(sys.stderr, format=log_format(rank=get_rank()), level=log_level)
         return logger, log_dir
 
     def _init_tracker(self, exp_tracker: Literal["tensorboard", "jsonl"], log_dir: Path):
@@ -979,7 +1003,7 @@ class Trainer:
     def build_engine(
         self,
         model_path: Path | None,
-        model_config: TransformerConfig | VisionComposeConfigProtocol,
+        model_config: TransformerConfig | BaseComposeConfig,
         optim_config: OptimConfig,
         fsdp_config: FSDPConfig,
         load_checkpoint_path: str | Path | None,
@@ -990,7 +1014,7 @@ class Trainer:
 
         Args:
             model_path (Path | None): Path to the model checkpoint or None for new initialization.
-            model_config (TransformerConfig | VisionComposeConfigProtocol): Model configuration.
+            model_config (TransformerConfig | BaseComposeConfig): Model configuration.
             optim_config (OptimConfig): Optimizer configuration.
             fsdp_config (FSDPConfig): FSDP configuration for distributed training.
             resume_cfg (ResumeConfig | None): Resume configuration for continuing training.
@@ -1000,7 +1024,7 @@ class Trainer:
         Returns:
             TrainEngine: Initialized training engine.
         """
-        if isinstance(model_config, VisionComposeConfigProtocol):
+        if isinstance(model_config, BaseComposeConfig):
             engine = VisionComposeTrainEngine(
                 optim_cfg=optim_config,
                 fsdp_cfg=fsdp_config,
@@ -1021,6 +1045,9 @@ class Trainer:
 
         if model_path is not None:
             engine.model.set_hf(model_path)
+
+        if engine.model.compile_cfg is not None and self.rank == 0:
+            logger.info(f"The `compile_cfg` of model is {json.dumps(engine.model.compile_cfg, indent=4)}")
         return engine
 
     def build_lr_scheduler(self, lr_cfg: LRConfig, scheduler_step: int) -> torch.optim.lr_scheduler.LRScheduler:
@@ -1137,8 +1164,8 @@ class Trainer:
                         {
                             "cur_step": self.cur_step,
                             "cur_epoch": self._cur_epoch,
-                            "reduced_consumed_samples": self._reduced_consumed_samples,
-                            "reduced_consumed_tokens": self._reduced_consumed_tokens,
+                            "total_consumed_samples": self._total_consumed_samples,
+                            "total_consumed_tokens": self._total_consumed_tokens,
                             "train_time_offset": self._train_time + self._train_time_offset,
                         }
                     )
@@ -1150,8 +1177,8 @@ class Trainer:
         ckp_list.append(str(checkpoint_path))
         current_exp.cur_step = self.cur_step
         current_exp.cur_epoch = self._cur_epoch
-        current_exp.consumed_samples = int(self._reduced_consumed_samples)
-        current_exp.consumed_tokens = int(self._reduced_consumed_tokens)
+        current_exp.consumed_samples = int(self._total_consumed_samples)
+        current_exp.consumed_tokens = int(self._total_consumed_tokens)
         current_exp.history[-1]["end"] = self.cur_step
 
         # Delete checkpoints and update meta's checkpoint_list
@@ -1188,7 +1215,7 @@ class Trainer:
 
     def _save_dataloader(self, dataloader_path: Path | str):
         if self.rank == 0:
-            dataloader_state = self._dataloader.get_state_dict(self._reduced_consumed_samples)
+            dataloader_state = self._dataloader.get_state_dict(self._total_consumed_samples)
             torch.save(dataloader_state, dataloader_path)
 
     @property
@@ -1243,7 +1270,6 @@ class Trainer:
                 data_iter = iter(self._dataloader)
                 data = next(data_iter)
 
-            self._reduced_consumed_samples += self._reduce_number_across_rank(len(data))
             yield data
 
     def _get_checkpoint_path(self, epoch: int, step: int, is_snapshot: bool = False) -> Path:
@@ -1309,6 +1335,13 @@ class Trainer:
         if not dist.is_initialized():
             init_process_group(backend=backend)
         torch.accelerator.set_device_index(int(os.environ["LOCAL_RANK"]))
+        # In some cases, the datasets can perform massive numpy loading before the first communication.
+        # After build dataset, massive numpy loading causing a lot of anonymous mmap allocation.
+        # THP(transparent huge page) kernel thread would continuously scan and merge these anonymous mmap to huge page.
+        # At the same time, if we perform communication for the first time, backend (e.g., NCCL) may register
+        # and lock address that might have been changed by THP, which causes a crash. So we should warmup first.
+        warmup_tensor = torch.ones(4, 4, device=torch.accelerator.current_accelerator())
+        dist.all_reduce(warmup_tensor)
 
     def _init_xtuner_meta(self, work_dir: Path, auto_resume: bool) -> XTunerMeta:
         if not work_dir.exists():
@@ -1411,34 +1444,71 @@ class Trainer:
         else:
             yield
 
-    def _log_step(
+    def _compute_performance_metrics(
         self,
-        loss_log: dict,
+        local_step_consumed_tokens: int,
+        local_step_consumed_img_tokens: int | None,
         step_consumed_tokens: int,
-        exp_consumed_tokens: int,
-        reduced_consumed_tokens: int,
-        data_time: float,
         step_time: float,
-        train_time: float,
-        train_time_offset: float,
-        grad_norm: float,
-        internal_metrics: InternalMetrics | None = None,
-    ):
-        """Log the training step information."""
-        e2e_train_time = train_time + train_time_offset
-        tgs = step_consumed_tokens / step_time
-        rank_consumed_tokens = reduced_consumed_tokens / self.world_size
-        e2e_tgs = rank_consumed_tokens / e2e_train_time
-        exp_tgs = exp_consumed_tokens / train_time
-        lr = self._lr_scheduler.get_last_lr()[0]
+    ) -> PerformanceStatistics:
+        """Compute training metrics including tokens and throughput statistics.
+
+        Args:
+            local_step_consumed_tokens (int): Tokens consumed in current step on current rank.
+            local_step_consumed_img_tokens (int | None): Image tokens consumed in current step on current rank.
+            step_consumed_tokens (int): Total tokens consumed in current step across all ranks.
+            step_time (float): Time spent on current training step in seconds.
+
+        Returns:
+            TrainingMetrics: Dictionary containing computed training metrics.
+        """
+        e2e_train_time = self._train_time + self._train_time_offset
+        total_consumed_tokens_per_rank = self._total_consumed_tokens / self.world_size
+
+        tgs = local_step_consumed_tokens / step_time
+        e2e_tgs = total_consumed_tokens_per_rank / e2e_train_time
+        exp_tgs = self._exp_consumed_tokens / self.world_size / self._train_time
 
         remaining_steps = self.total_step - self.cur_step
-        avg_tokens_per_step = rank_consumed_tokens / self.cur_step
+        avg_tokens_per_step = total_consumed_tokens_per_rank / self.cur_step
         remaining_tokens = remaining_steps * avg_tokens_per_step
-        eta_seconds = remaining_tokens / (tgs + 1e-12)
+        eta_seconds = remaining_tokens / max(tgs, 1)
         eta_hms = str(timedelta(seconds=int(eta_seconds)))
 
-        est_global_batch_tokens = self.data_mesh["dp"].size() * step_consumed_tokens
+        return PerformanceStatistics(
+            local_step_consumed_tokens=local_step_consumed_tokens,
+            local_step_consumed_img_tokens=local_step_consumed_img_tokens,
+            step_consumed_tokens=step_consumed_tokens,
+            total_consumed_tokens=self._total_consumed_tokens,
+            total_consumed_tokens_per_rank=total_consumed_tokens_per_rank,
+            tgs=tgs,
+            e2e_tgs=e2e_tgs,
+            exp_tgs=exp_tgs,
+            eta_seconds=eta_seconds,
+            eta_hms=eta_hms,
+            e2e_train_time=e2e_train_time,
+        )
+
+    def _log_step(
+        self,
+        loss_log: LossLog,
+        training_metrics: PerformanceStatistics,
+        grad_norm: float,
+        data_time: float,
+        step_time: float,
+        internal_metrics: InternalMetrics | None = None,
+    ):
+        """Log the training step information.
+
+        Args:
+            loss_log (LossLog): Loss values for the current step.
+            training_metrics (TrainingMetrics): Computed training metrics including tokens and throughput.
+            grad_norm (float): Gradient norm value.
+            data_time (float): Time spent loading data in seconds.
+            step_time (float): Time spent on training step in seconds.
+            internal_metrics (InternalMetrics | None): Internal metrics from the model.
+        """
+        lr = self._lr_scheduler.get_last_lr()[0]
 
         loss_log_list = [f"{k}: {v:.8f}" for k, v in loss_log.items()]
         loss_log_str = ", ".join(loss_log_list)
@@ -1450,34 +1520,39 @@ class Trainer:
         if internal_metrics:
             flattened_internal_metrics = flatten_internal_metrics_for_logs(internal_metrics)
 
+        if training_metrics["local_step_consumed_img_tokens"] is not None:
+            img_tokens_str = f"img_tokens: {training_metrics['local_step_consumed_img_tokens']} "
+        else:
+            img_tokens_str = ""
+
         self.logger.info(
             f"Epoch {self._cur_epoch} Step {self.cur_step}/{self.total_step} "
             f"data_time: {data_time:.4f} lr: {lr:.6e} time: {step_time:.4f} "
-            f"text_tokens: {step_consumed_tokens} "
-            f"reduced_consumed_tokens: {reduced_consumed_tokens} "
+            f"text_tokens: {training_metrics['local_step_consumed_tokens']} {img_tokens_str}"
+            f"step_consumed_tokens: {training_metrics['step_consumed_tokens']} "
+            f"total_consumed_tokens: {training_metrics['total_consumed_tokens']} "
             f"{loss_log_str} "
             f"grad_norm: {grad_norm:.8f} "
             f"max_memory: {max_memory / (1024**3):.2f} GB "
             f"reserved_memory: {reserved_memory / (1024**3):.2f} GB "
-            f"tgs: {tgs:.1f} "
-            f"exp_tgs: {exp_tgs: .1f} "
-            f"e2e_tgs: {e2e_tgs:.1f} "
-            f"est_global_batch_tokens: {est_global_batch_tokens} "
-            f"eta: {eta_hms} "
+            f"tgs: {training_metrics['tgs']:.1f} "
+            f"exp_tgs: {training_metrics['exp_tgs']:.1f} "
+            f"e2e_tgs: {training_metrics['e2e_tgs']:.1f} "
+            f"eta: {training_metrics['eta_hms']} "
         )
 
         log_scalars = {
             "lr": lr,
             "time/data_time": round(data_time, 4),
             "time/step_time": round(step_time, 4),
-            "time/train_time": round(train_time, 4),
-            "time/eta_seconds": round(eta_seconds, 1),
-            "runtime_info/text_tokens": step_consumed_tokens,
-            "runtime_info/est_global_batch_tokens": est_global_batch_tokens,
-            "runtime_info/reduced_consumed_tokens": reduced_consumed_tokens,
-            "runtime_info/tgs": tgs,
-            "runtime_info/exp_tgs": exp_tgs,
-            "runtime_info/e2e_tgs": e2e_tgs,
+            "time/train_time": round(self._train_time, 4),
+            "time/eta_seconds": round(training_metrics["eta_seconds"], 1),
+            "runtime_info/text_tokens": training_metrics["local_step_consumed_tokens"],
+            "runtime_info/step_consumed_tokens": training_metrics["step_consumed_tokens"],
+            "runtime_info/total_consumed_tokens": training_metrics["total_consumed_tokens"],
+            "runtime_info/tgs": training_metrics["tgs"],
+            "runtime_info/exp_tgs": training_metrics["exp_tgs"],
+            "runtime_info/e2e_tgs": training_metrics["e2e_tgs"],
             "memory/max_memory_GB": round(max_memory / (1024**3), 3),
             "memory/reserved_memory_GB": round(reserved_memory / (1024**3), 3),
             "grad_norm": grad_norm,
@@ -1578,8 +1653,9 @@ class Trainer:
     def _resolve_config_conflicts(
         self,
         tokenizer: PreTrainedTokenizer,
-        model_cfg: TransformerConfig | VisionComposeConfigProtocol,
+        model_cfg: TransformerConfig | BaseComposeConfig,
         dataloader_cfg: DataloaderConfig,
+        fsdp_cfg: FSDPConfig,
     ):
         if hasattr(tokenizer, "pad_token_id"):
             pad_token_id = tokenizer.pad_token_id
@@ -1599,7 +1675,7 @@ class Trainer:
         # Model's pad_token_id only affects the embedding module which acts specially for pad token.
         # Model's pad_token_id may be different from tokenizer's pad_token_id.
         # Note: Qwen3 Model's pad_token_id is None, which is different from Qwen tokenizer's pad_token_id.
-        # if isinstance(model_cfg, VisionComposeConfigProtocol):
+        # if isinstance(model_cfg, BaseComposeConfig):
         #     if model_cfg.text_config.pad_token_id != pad_token_id:
         #         logger.warning(
         #             f"Model pad_token_id {model_cfg.text_config.pad_token_id} is different from tokenizer "
@@ -1622,6 +1698,38 @@ class Trainer:
                 f"pad_token_id {pad_token_id}. Using tokenizer pad_token_id {pad_token_id}."
             )
             dataloader_cfg.pad_token_id = pad_token_id
+
+        if self._sp_size > 1:
+            if dataloader_cfg.pack_to_max_length is False:
+                logger.warning(
+                    "pack_to_max_length must be True when using sequence parallel. Setting pack_to_max_length to True."
+                )
+                dataloader_cfg.pack_to_max_length = True
+
+        # Resolve parallel config conlicts between model and fsdp configs
+        self._resolve_deprecate_compile_cfg(model_cfg=model_cfg, fsdp_cfg=fsdp_cfg)  # TODO: Remove in version 1.1.0
+
+        match model_cfg, fsdp_cfg:
+            case (MoEConfig(ep_size=1), FSDPConfig(ep_size=1)):
+                ...
+            case (MoEConfig(ep_size=1), _):
+                model_cfg.ep_size = fsdp_cfg.ep_size
+                logger.warning(f"Found model ep_size 1, using fsdp ep_size {fsdp_cfg.ep_size}.")
+            case (MoEConfig(), FSDPConfig(ep_size=1)):
+                fsdp_cfg.ep_size = model_cfg.ep_size
+                logger.warning(f"Found fsdp ep_size 1, using fsdp ep_size {fsdp_cfg.ep_size}.")
+
+        match dataloader_cfg, model_cfg:
+            case DataloaderConfig(pack_to_max_length=False), XTunerBaseModelConfig(compile_cfg=value) if (
+                value is not False and value != {}
+            ):
+                raise RuntimeError(
+                    "`model_cfg.compile_cfg` and `fsdp_cfg.torch_compile` must be `False` if "
+                    "`dataloader_cfg.pack_to_max_length` is `False`., but got:\n"
+                    f"dataloader_cfg.pack_to_max_length: {dataloader_cfg.pack_to_max_length}\n"
+                    f"model_cfg.compile_cfg: {model_cfg.compile_cfg}\n"
+                    f"fsdp_cfg.torch_compile: {fsdp_cfg.torch_compile}"  # TODO: removed in version 1.1.0 (FSDPConfig.torch_compile is deprecated)
+                )
 
     def _resolve_deprecated_resume_cfg(self, resume_cfg: ResumeConfig, auto_resume: bool) -> bool:
         if resume_cfg.auto_resume:
@@ -1679,13 +1787,13 @@ class Trainer:
         self._cur_epoch = train_state["cur_epoch"]
 
         if load_checkpoint_cfg.load_dataset:
-            self._reduced_consumed_tokens = train_state.get("reduced_consumed_tokens", 0)  # default 0 for BC
+            self._total_consumed_tokens = train_state.get("total_consumed_tokens", 0)  # default 0 for BC
             self._train_time_offset = train_state["train_time_offset"]
-            # _reduced_consumed_samples 会影响 save dcp时 dataloader.get_state_dict的状态。
-            # 1) 如果加载 dataset，应该恢复_reduced_consumed_samples为checkpoint中的值。
-            # 2) 如果不加载 dataset，应该保持_reduced_consumed_samples为初始值0，否则如果加载上旧dataloader的reduced_consumed_samples
-            #    会导致存储新dataloader时 reduced_consumed_samples 是不正确的值。
-            self._reduced_consumed_samples = train_state.get("reduced_consumed_samples", 0)  # default 0 for BC
+            # _total_consumed_samples 会影响 save dcp时 dataloader.get_state_dict的状态。
+            # 1) 如果加载 dataset，应该恢复_total_consumed_samples为checkpoint中的值。
+            # 2) 如果不加载 dataset，应该保持_total_consumed_samples为初始值0，否则如果加载上旧dataloader的total_consumed_samples
+            #    会导致存储新dataloader时 total_consumed_samples 是不正确的值。
+            self._total_consumed_samples = train_state.get("total_consumed_samples", 0)  # default 0 for BC
 
             dataloader_path = resume_from / self._SAVE_DATALOADER_DIR
             self._resume_dataloader(dataloader_path)
@@ -1718,7 +1826,6 @@ class Trainer:
     def _setup_env(self):
         if os.getenv("XTUNER_GC_ENABLE", "0") == "0":
             gc.disable()
-        monkey_patch_hf_modules_cache()
         os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
         log_str = "\n============XTuner Training Environment============\n"
@@ -1736,9 +1843,19 @@ class Trainer:
             "XTUNER_USE_CUTLASS_GROUP_GEMM": os.getenv("XTUNER_USE_CUTLASS_GROUP_GEMM"),
             "GROUPED_GEMM_USE_CUTLASS": os.getenv("GROUPED_GEMM_USE_CUTLASS"),
             "XTUNER_USE_NATIVE_RMSNORM": os.getenv("XTUNER_USE_NATIVE_RMSNORM"),
+            "XTUNER_SM_MARGIN": os.getenv("XTUNER_SM_MARGIN"),
         }
 
         for k, v in env.items():
             log_str += f"{k}: {v}\n"
         log_str += "=================================================="
         logger.info(log_str)
+
+    def _print_training_config(self):
+        if self._config is not None and self.rank == 0:
+            config_str = self._config.model_dump_json(indent=2)
+            logger.info(f"Training config: {config_str}")
+
+    def _resolve_deprecate_compile_cfg(self, model_cfg: TransformerConfig | BaseComposeConfig, fsdp_cfg: FSDPConfig):
+        if not fsdp_cfg.torch_compile:
+            model_cfg.compile_cfg = False

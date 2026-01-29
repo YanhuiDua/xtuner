@@ -44,7 +44,7 @@ threading_lock = threading.Lock()
 
 class LossLog(TypedDict):
     __pydantic_config__ = ConfigDict(arbitrary_types_allowed=True)  # type: ignore[misc]
-    total_loss: float
+    local_loss: float
     reduced_llm_loss: float
     reduced_balancing_loss: NotRequired[float]
     reduced_z_loss: NotRequired[float]
@@ -53,7 +53,8 @@ class LossLog(TypedDict):
 class OtherLog(TypedDict):
     __pydantic_config__ = ConfigDict(arbitrary_types_allowed=True)  # type: ignore[misc]
     maxvio: NotRequired[float]
-    consumed_tokens: float
+    step_consumed_tokens: int
+    step_consumed_img_tokens: NotRequired[int]
     extra_info: ModelForwardExtraLogInfo
     efficient_attn_ratio: float
 
@@ -217,14 +218,18 @@ class TrainEngine:
         intra_layer_micro_batch = self.intra_layer_micro_batch
         return data_batches_len // intra_layer_micro_batch
 
+    # this method can be called outside, e.g., at the beginning of compute_actor_logprobs or compute_ref_logprobs during rl training
+    def maybe_precompute_float8_dynamic_scale_for_fsdp(self):
+        if self.float8_handler is not None and self.float8_handler.enabled:
+            self.float8_handler.precompute_float8_dynamic_scale_for_fsdp(self.model)
+
     def train_step(self, data_batches: list[ModelItem]) -> tuple[LossLog, OtherLog]:
         """Perform a training step with the given data batches and mesh.
 
         Args:
             data_batches (List[Dict]): The input data batches for the training step.
         """
-        if self.float8_handler is not None and self.float8_handler.enabled:
-            self.float8_handler.precompute_float8_dynamic_scale_for_fsdp(self.model)
+        self.maybe_precompute_float8_dynamic_scale_for_fsdp()
 
         loss_log: LossLog = {}  # type: ignore[typeddict-item]
         other_log: OtherLog = {}  # type: ignore[typeddict-item]
@@ -252,7 +257,7 @@ class TrainEngine:
         step_llm_loss = torch.tensor(0.0, device=DEVICE)
         step_balancing_loss: torch.Tensor | None = None
         step_z_loss: torch.Tensor | None = None
-        step_consumed_tokens = torch.tensor(0.0, device=DEVICE)
+        step_consumed_tokens = torch.tensor(0, device=DEVICE)
 
         if self._count == 0:
             logger.info(f"grad_accumulation_steps: {iters_per_step}")
@@ -276,8 +281,8 @@ class TrainEngine:
                 step_consumed_tokens += seq_ctx.mask.sum()
 
                 num_tokens = seq_ctx.cu_seq_lens_k[1:] - seq_ctx.cu_seq_lens_k[:-1]
-                efficient_forward_tokens += (num_tokens**2).sum()
-                total_forward_tokens += (num_tokens.sum()) ** 2
+                efficient_forward_tokens += (num_tokens.long() ** 2).sum()
+                total_forward_tokens += (num_tokens.long().sum()) ** 2
 
             if self.intra_layer_micro_batch == 1:
                 output = self.model(seq_ctx=seq_ctx_list[0], loss_ctx=loss_ctx_list[0])
@@ -336,7 +341,7 @@ class TrainEngine:
         reduced_llm_loss = step_llm_loss
         dist.all_reduce(reduced_llm_loss.div_(dist.get_world_size()))
 
-        loss_log["total_loss"] = step_loss.item()
+        loss_log["local_loss"] = step_loss.item()
         loss_log["reduced_llm_loss"] = reduced_llm_loss.item()
         if step_balancing_loss is not None:
             reduced_balancing_loss = step_balancing_loss
@@ -346,9 +351,20 @@ class TrainEngine:
             reduced_z_loss = step_z_loss
             dist.all_reduce(reduced_z_loss.div_(dist.get_world_size()))
             loss_log["reduced_z_loss"] = reduced_z_loss.item()
-        other_log["consumed_tokens"] = step_consumed_tokens.item()
+        other_log["step_consumed_tokens"] = int(step_consumed_tokens.item())
         other_log["extra_info"] = train_engine_extra_info
         other_log["efficient_attn_ratio"] = (efficient_forward_tokens / total_forward_tokens).item()
+
+        extra_info = other_log.get("extra_info", {})  # type: ignore
+
+        # TODO: @duanyanhui `extra_info` should be redesigned.
+        if not isinstance(extra_info, ModelForwardExtraLogInfo):
+            extra_info = ModelForwardExtraLogInfo(extra_info)
+        loss_log.update(extra_info.get())
+
+        if "maxvio" in other_log:
+            loss_log["maxvio"] = other_log["maxvio"]  # type: ignore
+        loss_log["efficient_attn_ratio"] = other_log["efficient_attn_ratio"]  # type: ignore
         return loss_log, other_log
 
     def from_hf(self, hf_path: str | Path, strict: bool = False):

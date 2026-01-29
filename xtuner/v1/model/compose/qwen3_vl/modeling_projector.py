@@ -13,8 +13,7 @@ from torch.distributed.fsdp import (
     fully_shard,
 )
 from .modeling_vision import init_world_mesh
-from xtuner.v1.utils import get_device, get_torch_device_module, init_params
-from functools import partial
+from xtuner.v1.utils import get_device, get_torch_device_module, default_init_weights
 
 
 DEVICE = get_device()
@@ -41,35 +40,35 @@ class Qwen3VLVisionPatchMerger(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        init_params(self.norm.weight, nn.init.ones_)
-        init_params(self.norm.bias, nn.init.zeros_)
-        init_params(self.linear_fc1.bias, nn.init.zeros_)
-        init_params(self.linear_fc1.weight, partial(nn.init.normal_, mean=0.0, std=0.02))
-        init_params(self.linear_fc2.bias, nn.init.zeros_)
-        init_params(self.linear_fc2.weight, partial(nn.init.normal_, mean=0.0, std=0.02))
+        initialized_params = default_init_weights(self)
+        if missing := {name for name, _ in self.named_parameters()} - initialized_params:
+            raise RuntimeError(f"{missing} is not initialized")
 
 
 class Qwen3VLProjector(BaseModel):
     config: Qwen3VLProjectorConfig
 
     def __init__(self, config: Qwen3VLProjectorConfig) -> None:
-        super().__init__()
+        super().__init__(config)  # type: ignore[arg-type]
         self.merger = Qwen3VLVisionPatchMerger(config, use_postshuffle_norm=False)
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
-        self.deepstack_merger_list = nn.ModuleList(
-            [
-                Qwen3VLVisionPatchMerger(
-                    config=config,
-                    use_postshuffle_norm=True,
-                )
-                for _ in range(len(config.deepstack_visual_indexes))
-            ]
-        )
 
+        self.deepstack_merger_list: nn.ModuleList | list
+        if len(config.deepstack_visual_indexes) == 0:
+            self.deepstack_merger_list = []
+        else:
+            self.deepstack_merger_list = nn.ModuleList(
+                [
+                    Qwen3VLVisionPatchMerger(
+                        config=config,
+                        use_postshuffle_norm=True,
+                    )
+                    for _ in range(len(config.deepstack_visual_indexes))
+                ]
+            )
         self._hf_prefix = "model.visual."
         self._init_load_spec()
 
-    @maybe_compile(fullgraph=True)
     def forward(self, hidden_states: torch.Tensor, deepstack_feature_lists: list[torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.merger(hidden_states)
         deepstack_projected_features = []
@@ -94,8 +93,6 @@ class Qwen3VLProjector(BaseModel):
         )
         self.fsdp_mesh = init_world_mesh()
         assert self.fsdp_mesh is not None
-
-        self._maybe_compile_layers()
 
         if fsdp_config.requires_grad:
             for module in self.modules():
