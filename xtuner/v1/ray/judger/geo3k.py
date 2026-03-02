@@ -1,6 +1,8 @@
 import re
 from typing import Callable
 
+from pydantic import BaseModel, ConfigDict
+
 
 try:
     from mathruler.grader import extract_boxed_content, grade_answer
@@ -8,7 +10,7 @@ except Exception:
     extract_boxed_content = None
     grade_answer = None
 
-from .native import NativeJudgerConfig
+from .native import NativeJudgerConfig, RouterJudgerConfig
 
 
 def format_reward(predict_str: str) -> float:
@@ -35,9 +37,24 @@ def compute_reward(response, label, extra_info) -> dict:
     return {"score": score, "acc": acc}
 
 
-class GEO3KJudgerConfig(NativeJudgerConfig):
-    """Configuration for the GEO3K judger."""
+class _GEO3KJudgerDefaults(BaseModel):
+    """Shared defaults for GEO3K native and router judger configs."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     judger_name: str = "hiyouga/geometry3k"
     extra_info: dict = {"format_score": 0.1, "use_boxed": True}
     reward_handler: Callable = compute_reward
+
+
+class GEO3KNativeJudgerConfig(_GEO3KJudgerDefaults, NativeJudgerConfig):
+    """Configuration for the GEO3K native judger."""
+
+
+class GEO3KRouterJudgerConfig(_GEO3KJudgerDefaults, RouterJudgerConfig):
+    """Configuration for the GEO3K router judger."""
+
+    num_ray_actors: int = 1
+    num_cpus_per_actor: int = 1
+    cpu_memory_per_actor: int = 1024**3
+

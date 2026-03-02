@@ -1,7 +1,9 @@
 import re
 from typing import Callable
 
-from .native import NativeJudgerConfig
+from pydantic import BaseModel, ConfigDict
+
+from .native import NativeJudgerConfig, RouterJudgerConfig
 
 
 _SOLUTION_CLIP_CHARS = 300
@@ -77,9 +79,23 @@ def compute_reward(response, label, extra_info):
             return {"score": extra_info["format_score"]}
 
 
-class GSM8KJudgerConfig(NativeJudgerConfig):
-    """Configuration for the GSM8K judger."""
+class _GSM8KJudgerDefaults(BaseModel):
+    """Shared defaults for GSM8K native and router judger configs."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     judger_name: str = "openai/gsm8k"
     extra_info: dict = {"score": 1, "format_score": 0}
     reward_handler: Callable = compute_reward
+
+
+class GSM8KJudgerConfig(_GSM8KJudgerDefaults, NativeJudgerConfig):
+    """Configuration for the GSM8K native judger."""
+
+
+class GSM8KRouterJudgerConfig(_GSM8KJudgerDefaults, RouterJudgerConfig):
+    """Configuration for the GSM8K router judger."""
+
+    num_ray_actors: int = 1
+    num_cpus_per_actor: int = 1
+    cpu_memory_per_actor: int = 1024**3
