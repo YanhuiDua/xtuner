@@ -28,13 +28,13 @@ fsdp_cfg = FSDPConfig(
 dataset_config = [
     {
         "dataset": DatasetConfig(name="alpaca", anno_path=ALPACA_PATH, sample_ratio=1.0),
-        "tokenize_fn": FTDPTokenizeFnConfig(max_length=16386),
+        "tokenize_fn": FTDPTokenizeFnConfig(max_length=16384),
     },
 ]
 
 dataloader_config = DataloaderConfig(pack_max_length=16384)
 
-loss_cfg = CELossConfig()
+loss_cfg = CELossConfig(mode="chunk", chunk_size=1024)
 
 
 trainer = TrainerConfig(
@@ -51,6 +51,7 @@ trainer = TrainerConfig(
     total_epoch=1,
     work_dir=f"{os.environ['WORK_DIR']}",
     seed=0,
+    dist_backend="npu:hccl",
     checkpoint_interval=10,
     checkpoint_maxkeep=2,
 )

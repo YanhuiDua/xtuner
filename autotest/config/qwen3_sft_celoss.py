@@ -16,11 +16,11 @@ QWEN3_MOE_PATH = os.environ["QWEN3_MOE_PATH"]
 ALPACA_PATH = os.environ["ALPACA_PATH"]
 
 
-moe_cfg = Qwen3MoE30BA3Config(ep_size=8)
+moe_cfg = Qwen3MoE30BA3Config()
 optim_cfg = AdamWConfig(lr=6e-05)
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
 fsdp_cfg = FSDPConfig(
-    torch_compile=True,
+    torch_compile=False,
     cpu_offload=False,
     ep_size=moe_cfg.ep_size,
 )
@@ -28,14 +28,13 @@ fsdp_cfg = FSDPConfig(
 dataset_config = [
     {
         "dataset": DatasetConfig(name="alpaca", anno_path=ALPACA_PATH, sample_ratio=1.0),
-        "tokenize_fn": FTDPTokenizeFnConfig(max_length=16386),
+        "tokenize_fn": FTDPTokenizeFnConfig(max_length=16384),
     },
 ]
 
 dataloader_config = DataloaderConfig(pack_max_length=16384)
 
-loss_cfg = CELossConfig()
-
+loss_cfg = CELossConfig(mode="chunk", chunk_size=1024)
 
 trainer = TrainerConfig(
     load_from=QWEN3_MOE_PATH,
@@ -51,6 +50,4 @@ trainer = TrainerConfig(
     total_epoch=1,
     work_dir=f"{os.environ['WORK_DIR']}",
     seed=0,
-    checkpoint_interval=10,
-    checkpoint_maxkeep=2,
 )

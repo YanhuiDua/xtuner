@@ -9,7 +9,7 @@ from xtuner.v1.datasets import FTDPTokenizeFnConfig
 from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
 from xtuner.v1.loss.ce_loss import CELossConfig
 from xtuner.v1.model.moe.qwen3 import Qwen3MoE30BA3Config
-from xtuner.v1.train import TrainerConfig
+from xtuner.v1.train import ResumeConfig, TrainerConfig
 
 
 QWEN3_MOE_PATH = os.environ["QWEN3_MOE_PATH"]
@@ -34,7 +34,7 @@ dataset_config = [
 
 dataloader_config = DataloaderConfig(pack_max_length=16384)
 
-loss_cfg = CELossConfig()
+loss_cfg = CELossConfig(mode="chunk", chunk_size=1024)
 
 
 trainer = TrainerConfig(
@@ -51,6 +51,8 @@ trainer = TrainerConfig(
     total_epoch=1,
     work_dir=f"{os.environ['WORK_DIR']}",
     seed=0,
+    dist_backend="npu:hccl",
     checkpoint_interval=10,
     checkpoint_maxkeep=2,
+    resume_cfg=ResumeConfig(auto_resume=True),
 )
