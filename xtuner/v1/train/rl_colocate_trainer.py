@@ -46,7 +46,8 @@ from xtuner.v1.rl.base.producer import ProduceStrategyConfig, SyncProduceStrateg
 from xtuner.v1.rl.base.replay_buffer import ReplayBuffer
 from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
 from xtuner.v1.datasets.rl_tokenize_fn import RLTextTokenizeFnConfig
-from xtuner.v1.ray.judger.gsm8k import GSM8KJudgerConfig, NativeJudgerConfig
+from xtuner.v1.ray.judger.gsm8k import GSM8KRouterJudgerConfig
+from xtuner.v1.ray.judger.native import RouterJudgerConfig
 from xtuner.v1.rl.base.agent_loop import SingleTurnAgentLoopConfig
 from xtuner.v1.rl.base.sampler import SamplerConfig
 from xtuner.v1.rl.evaluator import EvaluatorConfig
@@ -150,7 +151,7 @@ class RLColocateTrainer:
         resources: AcceleratorResourcesConfig,
         train_worker_cfg: WorkerConfig,
         rollout_config: RolloutConfig,
-        judger_config: NativeJudgerConfig,
+        judger_config: RouterJudgerConfig,
 
         # Sampler config
         # sampler_config: SamplerConfig,
@@ -239,7 +240,7 @@ class RLColocateTrainer:
         self.rollout_controller = self.init_rollout_controller(rollout_config, self._pg)
 
         # build judger
-        judger = judger_config.build_router()  # TODO: use build instead of build_router
+        judger = judger_config.build()
 
         # build agent_loop
         # agent_loop  = agent_loop_config.build(rollout_controller=self.rollout_controller, judger=judger)
@@ -749,7 +750,7 @@ if __name__ == "__main__":
     )
 
     # judger config
-    judger_config = GSM8KJudgerConfig(judger_name="openai/gsm8k")
+    judger_config = GSM8KRouterJudgerConfig(judger_name="openai/gsm8k")
 
     # worker config
     lr_cfg = LRConfig(lr_type="constant", warmup_ratio=0, lr_min=1e-6)

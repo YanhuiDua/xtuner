@@ -54,8 +54,8 @@ class TestRollout(unittest.TestCase):
         self.max_prompt_length = 512
         self.max_response_length = 1024
         self.context_length = self.max_prompt_length + self.max_response_length
-        from xtuner.v1.ray.judger.gsm8k import GSM8KJudgerConfig
-        gsm8k_judger_config = GSM8KJudgerConfig(judger_name="openai/gsm8k")
+        from xtuner.v1.ray.judger.gsm8k import GSM8KRouterJudgerConfig
+        gsm8k_judger_config = GSM8KRouterJudgerConfig(judger_name="openai/gsm8k")
         self.judger_cfg = JudgerConfig(
             reward_judger_configs=[gsm8k_judger_config],
             worker_log_dir=self.worker_log_dir,

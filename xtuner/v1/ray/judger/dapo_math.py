@@ -3,7 +3,7 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from pydantic import ConfigDict, Field
 
-from .native import NativeJudgerConfig
+from .native import NativeJudgerConfig, RouterJudgerConfig
 
 
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/utils/reward_score/math_dapo.py
@@ -291,7 +291,7 @@ def compute_reward(response, label, extra_info):
     return {"score": reward, "acc": out["acc"]}
 
 
-class DapoMathJudgerConfig(NativeJudgerConfig):
+class _DapoMathJudgerDefaults:
     model_config = ConfigDict(extra="forbid")
     eos_token: List[str] | str
     enable_overlong_buffer: bool
@@ -314,6 +314,7 @@ class DapoMathJudgerConfig(NativeJudgerConfig):
         tokenizer: Any,
         score: int = 1,
         format_score: int = 0,
+        **kwargs,
     ):
         if isinstance(eos_token, str):
             assert eos_token.strip() != "", "eos_token string must not be empty"
@@ -325,7 +326,6 @@ class DapoMathJudgerConfig(NativeJudgerConfig):
         else:
             raise TypeError("eos_token must be a non-empty string or a non-empty list of strings")
 
-        # 初始化基类
         super().__init__(
             judger_name=judger_name,
             eos_token=eos_token,
@@ -336,6 +336,7 @@ class DapoMathJudgerConfig(NativeJudgerConfig):
             overlong_buffer_len=overlong_buffer_len,
             overlong_penalty_factor=overlong_penalty_factor,
             tokenizer=tokenizer,
+            **kwargs,
         )
 
         self.extra_info.update(
@@ -360,3 +361,16 @@ class DapoMathJudgerConfig(NativeJudgerConfig):
                     "tokenizer": tokenizer,
                 }
             )
+
+
+class DapoMathNativeJudgerConfig(_DapoMathJudgerDefaults, NativeJudgerConfig):
+    """Configuration for the DapoMath native judger."""
+
+
+class DapoMathRouterJudgerConfig(_DapoMathJudgerDefaults, RouterJudgerConfig):
+    """Configuration for the DapoMath router judger."""
+
+    num_ray_actors: int = 1
+    num_cpus_per_actor: int = 1
+    cpu_memory_per_actor: int = 1024**3
+

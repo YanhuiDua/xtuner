@@ -89,8 +89,7 @@ RayJudger = cast(ActorClass[NativeJudger], ray.remote(NativeJudger))
 RayJudgerProxy = ActorProxy[NativeJudger]
 
 
-# TODO: rename to `RouterJudger`
-class NativeJudgerRouter(Judger):
+class RouterJudger(Judger):
     """NativeJudger 路由管理器。
 
     功能：
@@ -125,20 +124,15 @@ class NativeJudgerRouter(Judger):
         return self._judger_name
 
 
-# TODO: Use NativeJudgerConfig to build NativeJudger
-# and use NativeJudgerRouterConfig to build NativeJudgerRouter
 class NativeJudgerConfig(BaseModel):
     """Configuration class for NativeJudger.
 
     This class defines the configuration options for initializing a NativeJudger,
-    including resource allocation (number of Ray actors and CPUs per actor),
-    reward function or remote judging service, optional pre/post-processing functions,
+    including reward function or remote judging service, optional pre/post-processing functions,
     request timeout, and any extra information needed for judging.
 
     Attributes:
         judger_name (str): Name identifier for the judger.
-        num_ray_actors (int): Number of Ray actor instances to launch.
-        num_cpus_per_actor (int): Number of CPUs allocated per actor.
         reward_func (Optional[Callable]): Local reward function for judging.
             Exactly one of reward_func or remote_url must be provided.
         remote_url (Optional[str]): Remote service URL for judging.
@@ -149,9 +143,6 @@ class NativeJudgerConfig(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
     judger_name: str
-    num_ray_actors: int = 1
-    num_cpus_per_actor: int = 1
-    cpu_memory_per_actor: int = 1024**3
     reward_handler: Callable | str = Field(default=None, exclude=True)
     request_timeout: float = 30.0
     extra_info: dict = Field(default={}, exclude=True)
@@ -164,8 +155,20 @@ class NativeJudgerConfig(BaseModel):
             extra_info=self.extra_info,
         )
 
-    def build_router(self, pg: PlacementGroup | None = None, start_bundle_idx: int = 0) -> NativeJudgerRouter:
-        """Create and launch Ray actor instances for the GSM8K judger.
+class RouterJudgerConfig(BaseModel):
+    """Configuration class for RouterJudger."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+    judger_name: str
+    num_ray_actors: int = 1
+    num_cpus_per_actor: int = 1
+    cpu_memory_per_actor: int = 1024**3
+    reward_handler: Callable | str = Field(default=None, exclude=True)
+    request_timeout: float = 30.0
+    extra_info: dict = Field(default={}, exclude=True)
+
+    def build_workers(self, pg: PlacementGroup | None = None, start_bundle_idx: int = 0) -> list[RayJudgerProxy]:
+        """Create and launch Ray actor instances for router workers.
 
         This method instantiates multiple NativeJudger Ray actors according to `num_ray_actors`,
         assigning each to a specific bundle in the provided placement group for resource isolation.
@@ -179,7 +182,7 @@ class NativeJudgerConfig(BaseModel):
             List[ActorClass]: A list of Ray actor handles representing the launched judger workers.
         """
         if pg is None:
-            # NOTE: 这里直接在build_router里创建PlacementGroup是为了简化用户使用，用户不需要关心PlacementGroup的细节。
+            # NOTE: 这里直接在build_workers里创建PlacementGroup是为了简化用户使用，用户不需要关心PlacementGroup的细节。
             from xtuner.v1.ray.base import CPUResourcesConfig
 
             cpu_resource_cfg = CPUResourcesConfig(
@@ -219,5 +222,8 @@ class NativeJudgerConfig(BaseModel):
                 )
             )
             workers_list.append(worker)
-        judger_router = NativeJudgerRouter(workers=workers_list, judger_name=self.judger_name)
-        return judger_router
+        return workers_list
+
+    def build(self, pg: PlacementGroup | None = None, start_bundle_idx: int = 0) -> RouterJudger:
+        workers_list = self.build_workers(pg=pg, start_bundle_idx=start_bundle_idx)
+        return RouterJudger(workers=workers_list, judger_name=self.judger_name)
