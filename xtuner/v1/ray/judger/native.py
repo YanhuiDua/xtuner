@@ -10,7 +10,6 @@ from ray.actor import ActorClass, ActorProxy
 from ray.util.placement_group import PlacementGroup
 
 from xtuner.v1.data_proto.rl_data import RolloutState
-from xtuner.v1.utils.type_helper import ray_method
 
 
 class Judger(ABC):
@@ -42,7 +41,6 @@ class NativeJudger(Judger):
         self.reward_handler = reward_handler
         self.request_timeout = request_timeout
 
-    @ray_method
     async def judge(self, rollout_state: RolloutState) -> RolloutState:  # type: ignore[override]
         # native preprocess
         assert rollout_state.response is not None, (

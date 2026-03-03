@@ -73,6 +73,8 @@ class AgentLoop(ABC):
             raise ValueError(f"Invalid judger type: {type(self.judger)}")
         return rollout_state
 
+    async def pause(self): ...
+
 
 class SingleTurnAgentLoop(AgentLoop):
     async def generate_sample(self, rollout_state: RolloutState) -> RolloutState:
