@@ -12,13 +12,27 @@ from xtuner.v1.datasets import RLTokenizeFnConfig
 from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
 from xtuner.v1.model import get_model_config_from_hf
 from xtuner.v1.model.dense.qwen2 import Qwen2Dense7BConfig
-from xtuner.v1.ray.base import AcceleratorResourcesConfig
-from xtuner.v1.ray.config.worker import RolloutConfig
-from xtuner.v1.ray.dataflow import DataFlowConfig, ReplayBufferConfig
-from xtuner.v1.ray.evaluator import EvaluatorConfig
-from xtuner.v1.ray.judger.controller import JudgerConfig
-from xtuner.v1.ray.judger.dapo_math import DapoMathJudgerConfig
-from xtuner.v1.rl.base import WorkerConfig
+from xtuner.v1.rl.utils.accelerator import AcceleratorResourcesConfig
+from xtuner.v1.rl.config.worker import RolloutConfig
+try:
+    from xtuner.v1.ray.dataflow import DataFlowConfig, ReplayBufferConfig
+except Exception:
+    class DataFlowConfig:  # compatibility fallback for removed ray module
+        def __init__(self, *args, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class ReplayBufferConfig:
+        def __init__(self, *args, **kwargs):
+            self.__dict__.update(kwargs)
+from xtuner.v1.rl.evaluator import EvaluatorConfig
+try:
+    from xtuner.v1.ray.judger.controller import JudgerConfig
+except Exception:
+    class JudgerConfig:
+        def __init__(self, *args, **kwargs):
+            self.__dict__.update(kwargs)
+from xtuner.v1.rl.judger.dapo_math import DapoMathRouterJudgerConfig
+from xtuner.v1.rl.trainer.worker import WorkerConfig
 from xtuner.v1.rl.grpo import GRPOLossConfig
 from xtuner.v1.train.rl_trainer import RLTrainerConfig
 
@@ -92,7 +106,7 @@ dataloader_config = DataloaderConfig(pack_max_length=pack_max_length, collator="
 from xtuner.v1.utils.rl_test_utils import get_eos_token
 eos_token_id = get_eos_token(model_path)
 eos_token_str = tokenizer.convert_ids_to_tokens(eos_token_id)
-dapomath_judger_config = DapoMathJudgerConfig(
+dapomath_judger_config = DapoMathRouterJudgerConfig(
     judger_name="dapo_math", 
     eos_token=eos_token_str,
     enable_overlong_buffer = True, 

@@ -1,9 +1,9 @@
 import unittest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
-from xtuner.v1.rl.base.sampler import SamplerConfig, Sampler
-from xtuner.v1.rl.base.producer import SyncProduceStrategyConfig, OverProduceStrategyConfig
-from xtuner.v1.rl.base.replay_buffer import AsyncReplayBufferConfig
+from xtuner.v1.rl.agent_loop.sampler import SamplerConfig, Sampler
+from xtuner.v1.rl.agent_loop.producer import SyncProduceStrategyConfig, OverProduceStrategyConfig
+from xtuner.v1.rl.replay_buffer import AsyncReplayBufferConfig
 from xtuner.v1.data_proto.rl_data import RolloutState, Status
 
 class MockRolloutState:

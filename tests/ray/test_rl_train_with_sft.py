@@ -7,13 +7,13 @@ import json
 import torch
 from xtuner.v1.data_proto.sequence_context import SequenceContext
 import ray
-from xtuner.v1.ray.base import AcceleratorResourcesConfig, AutoAcceleratorWorkers
+from xtuner.v1.rl.utils.accelerator import AcceleratorResourcesConfig, AutoAcceleratorWorkers
 from xtuner.v1.config import (
     AdamWConfig,
     FSDPConfig,
     LRConfig,
 )
-from xtuner.v1.rl.base import WorkerConfig, TrainingController, TrainingWorker as BaseTrainingWorker
+from xtuner.v1.rl.trainer.worker import WorkerConfig, TrainingController, TrainingWorker as BaseTrainingWorker
 from xtuner.v1.rl.grpo.loss import GRPOLossConfig as LossConfig
 from xtuner.v1.model.dense.qwen3 import Qwen3Dense8BConfig
 from xtuner.v1.datasets.sft_tokenize_fn import OpenaiTokenizeFunctionConfig
