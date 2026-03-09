@@ -1,6 +1,6 @@
 import unittest
 import asyncio
-from xtuner.v1.rl.base.replay_buffer import ReplayBuffer, FIFOBackend, StalenessBackend, SyncReplayBufferConfig, AsyncReplayBufferConfig
+from xtuner.v1.rl.replay_buffer import ReplayBuffer, FIFOBackend, StalenessBackend, SyncReplayBufferConfig, AsyncReplayBufferConfig
 from xtuner.v1.data_proto.rl_data import RolloutState, Status
 
 class MockState:

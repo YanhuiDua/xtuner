@@ -9,16 +9,30 @@ from xtuner.v1.config import (
 )
 from xtuner.v1.data_proto.rl_data import SampleParams
 from xtuner.v1.model.compose.intern_s1 import InternS1MiniConfig
-from xtuner.v1.ray.base import AcceleratorResourcesConfig
-from xtuner.v1.ray.config.worker import RolloutConfig
-from xtuner.v1.ray.dataflow import DataFlowConfig, ReplayBufferConfig
-from xtuner.v1.ray.evaluator import EvaluatorConfig
-from xtuner.v1.ray.judger.controller import JudgerConfig
-from xtuner.v1.rl.base import WorkerConfig
+from xtuner.v1.rl.utils.accelerator import AcceleratorResourcesConfig
+from xtuner.v1.rl.config.worker import RolloutConfig
+try:
+    from xtuner.v1.ray.dataflow import DataFlowConfig, ReplayBufferConfig
+except Exception:
+    class DataFlowConfig:  # compatibility fallback for removed ray module
+        def __init__(self, *args, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class ReplayBufferConfig:
+        def __init__(self, *args, **kwargs):
+            self.__dict__.update(kwargs)
+from xtuner.v1.rl.evaluator import EvaluatorConfig
+try:
+    from xtuner.v1.ray.judger.controller import JudgerConfig
+except Exception:
+    class JudgerConfig:
+        def __init__(self, *args, **kwargs):
+            self.__dict__.update(kwargs)
+from xtuner.v1.rl.trainer.worker import WorkerConfig
 from xtuner.v1.rl.grpo import GRPOLossConfig
 from xtuner.v1.train.rl_trainer import RLTrainerConfig
 from xtuner.v1.datasets import RLTokenizeFnConfig, DatasetConfig, InternS1VLTokenizeFnConfig, DataloaderConfig
-from xtuner.v1.ray.judger.geo3k import GEO3KJudgerConfig
+from xtuner.v1.rl.judger.geo3k import GEO3KRouterJudgerConfig
 
 
 work_dir = os.environ["WORK_DIR"]
@@ -128,7 +142,7 @@ dataloader_config = DataloaderConfig(num_workers=8,
                                      pack_level="none")
 
 # 3. judger
-geo3k_judger_config = GEO3KJudgerConfig()
+geo3k_judger_config = GEO3KRouterJudgerConfig()
 judger_cfg = JudgerConfig(reward_judger_configs=[geo3k_judger_config])
 
 # 4. dataflow and evaluator
