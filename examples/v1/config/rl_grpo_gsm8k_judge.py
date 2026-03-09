@@ -14,7 +14,7 @@ from xtuner.v1.datasets.rl_tokenize_fn import RLTextTokenizeFnConfig
 from xtuner.v1.model import get_model_config_from_hf
 from xtuner.v1.rl.utils.accelerator import AcceleratorResourcesConfig
 from xtuner.v1.rl.config.worker import RolloutConfig
-from xtuner.v1.rl.judger.gsm8k import GSM8KRouterJudgerConfig
+from xtuner.v1.rl.judger.gsm8k import GSM8KJudgerConfig
 from xtuner.v1.rl.replay_buffer import SyncReplayBufferConfig
 from xtuner.v1.rl.trainer.worker import WorkerConfig
 from xtuner.v1.rl.agent_loop.agent_loop import SingleTurnAgentLoopConfig
@@ -68,7 +68,7 @@ rollout_config = RolloutConfig(
 )
 
 # 3. judger
-judger_config = GSM8KRouterJudgerConfig(judger_name="openai/gsm8k")
+judger_config = GSM8KJudgerConfig(judger_name="openai/gsm8k", judger_type="router")
 
 # 4. train worker
 lr_cfg = LRConfig(lr_type="constant", warmup_ratio=0, lr_min=1e-6)
