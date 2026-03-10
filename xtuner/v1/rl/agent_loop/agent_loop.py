@@ -148,14 +148,7 @@ class AgentLoop(ABC):
         if not rollout_state.response_steps:
             rollout_state.seq_staleness = 0
         else:
-            valid_steps = rollout_state.response_steps
-            if rollout_state.response_mask is not None:
-                unmasked_steps = [
-                    step for step, mask in zip(rollout_state.response_steps, rollout_state.response_mask) if mask == 1
-                ]
-                if unmasked_steps:
-                    valid_steps = unmasked_steps
-            rollout_state.seq_staleness = max(0, rollout_step - min(valid_steps))
+            rollout_state.seq_staleness = max(0, rollout_step - min(rollout_state.response_steps))
         return rollout_state
 
     async def _run_generation_pipeline(
