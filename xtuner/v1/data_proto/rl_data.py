@@ -97,9 +97,8 @@ class RolloutState(CacheObj, BaseModel):
     task_name: str | None = None
     status: Status = Status.INIT
     error_msg: str | None = None
-    seq_staleness: int = 0  # 整条序列的staleness，一般为最大的token_staleness
-    token_staleness: list[int] | None = None  # 每一个token的staleness，长度和tokens保持一致
     response_mask: list[int] | None = None  # response_ids的长度
+    response_steps: list[int] | None = None  # 记录 response_ids 中每个 token 是在哪个 rollout_step 生成的
     extra_fields: dict[str, Any] = {}
 
     @field_serializer("routed_experts")
@@ -118,6 +117,15 @@ class RolloutState(CacheObj, BaseModel):
             return None
         return value  # list[int]
 
+    def clear_response(self) -> None:
+        """清除与模型输出相关的字段，通常在续写时使用，以避免旧的输出干扰新的推理过程。"""
+        self.response = None
+        self.response_ids = None
+        self.logprobs = None
+        self.routed_experts = None
+        self.finish_reason = None
+        self.response_mask = None
+        self.response_steps = None
 
 def update_status_from_finish_reason(finish_reason: str | None) -> Status:
     """Updates the internal status based on the inference engine's finish

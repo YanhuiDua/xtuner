@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict
 from xtuner.v1.data_proto import RolloutState, SampleParams, Status
 from xtuner.v1.rl.judger import NativeJudger, RouterJudger
 from xtuner.v1.rl.rollout import RolloutController
-from xtuner.v1.rl.utils import create_task
+from xtuner.v1.rl.utils import create_task, get_eos_token
 from xtuner.v1.utils import get_logger
 from xtuner.v1.utils.processing_utils import load_processor, load_tokenizer
 
@@ -51,6 +51,9 @@ class AgentLoop(ABC):
             self.logger = get_logger()
         else:
             self.logger = logger
+        self.max_tokens = self.sample_params.max_tokens
+        eos_token = get_eos_token(self.hf_checkpoint)
+        self.eos_tokens: list[int] = [eos_token] if isinstance(eos_token, int) else eos_token
 
     @abstractmethod
     async def generate_sample(self, rollout_state: RolloutState) -> RolloutState: ...
@@ -60,11 +63,82 @@ class AgentLoop(ABC):
         # Default implementation is a no-op to keep behavior unchanged.
         return None
 
-    async def generate_group(self, rollout_state: list[RolloutState]) -> list[RolloutState]:
+    async def _preprocess(self, rollout_state: RolloutState) -> RolloutState:
+        # for partial rollout
+        if rollout_state.response_ids:
+            is_completed = False
+            if len(rollout_state.response_ids) >= self.max_tokens:
+                self.logger.warning(
+                    f"Response tokens exceed max_tokens limit: {len(rollout_state.response_ids)} >= {self.max_tokens}. Truncating."
+                )
+                rollout_state.response_ids = rollout_state.response_ids[: self.max_tokens]
+                is_completed = True
+            elif rollout_state.response_ids[-1] in self.eos_tokens:  # 修复属性名拼写匹配 __init__ 中的定义
+                self.logger.warning("Response tokens end with EOS token. Marking rollout as completed.")
+                is_completed = True
+
+            # 命中截断或 EOS 提前结束
+            if is_completed:
+                rollout_state.status = Status.COMPLETED
+                return await self.judge_sample(rollout_state)
+
+            # 续写逻辑
+            rollout_state.tokens = list(rollout_state.prompt_ids or []) + rollout_state.response_ids
+            remaining_tokens = self.max_tokens - len(rollout_state.response_ids)
+            rollout_state.sample_params = rollout_state.sample_params.copy(update={"max_tokens": remaining_tokens})
+
+        history_response_ids = (
+            rollout_state.tokens[len(rollout_state.prompt_ids or []) :] if rollout_state.tokens else []
+        )
+        history_response = rollout_state.response or []
+        history_logprobs = rollout_state.logprobs or []
+        history_routed_experts = rollout_state.routed_experts or []
+        rollout_state.extra_fields["history_response_dict"] = {
+            "response_ids": history_response_ids,
+            "response": history_response,
+            "logprobs": history_logprobs,
+            "routed_experts": history_routed_experts,
+        }
+        return rollout_state
+
+    async def _postprocess(
+        self, rollout_state: RolloutState, rollout_step: int, enable_partial_rollout: bool
+    ) -> RolloutState:
+        new_response_len = len(rollout_state.response_ids or [])
+        history_response_dict = rollout_state.extra_fields.get("history_response_dict", {})
+        rollout_state.response_ids = history_response_dict.get("response_ids", []) + rollout_state.response_ids
+        rollout_state.response = history_response_dict.get("response", []) + (rollout_state.response or [])
+        rollout_state.logprobs = history_response_dict.get("logprobs", []) + (rollout_state.logprobs or [])
+        rollout_state.routed_experts = history_response_dict.get("routed_experts", []) + (
+            rollout_state.routed_experts or []
+        )
+
+        if rollout_state.status == Status.ABORTED:
+            response_steps = [rollout_step] * new_response_len
+            if rollout_state.response_steps is None:
+                rollout_state.response_steps = response_steps
+            else:
+                rollout_state.response_steps = rollout_state.response_steps + response_steps
+            if not enable_partial_rollout:
+                rollout_state.clear_response()
+        return rollout_state
+
+    async def _run_generation_pipeline(
+        self, rollout_state: RolloutState, rollout_step: int, enable_partial_rollout: bool
+    ) -> RolloutState:
+        rollout_state = await self._preprocess(rollout_state)
+        if rollout_state.status != Status.COMPLETED:
+            rollout_state = await self.generate_sample(rollout_state)
+        rollout_state = await self._postprocess(rollout_state, rollout_step, enable_partial_rollout)
+        return rollout_state
+
+    async def generate_group(
+        self, rollout_state: list[RolloutState], rollout_step: int, enable_partial_rollout: bool
+    ) -> list[RolloutState]:
         pending_tasks = []
         for state in rollout_state:
             state.sample_params = self.sample_params
-            task = create_task(self.generate_sample(state))
+            task = create_task(self._run_generation_pipeline(state, rollout_step, enable_partial_rollout))
             pending_tasks.append(task)
         generated_samples = asyncio.gather(*pending_tasks)
         group_samples = await generated_samples
@@ -83,7 +157,7 @@ class AgentLoop(ABC):
 
 
 class SingleTurnAgentLoop(AgentLoop):
-    async def generate_sample(self, rollout_state: RolloutState) -> RolloutState:
+    async def generate_sample(self, rollout_state: RolloutState, rollout_step: int) -> RolloutState:
         assert rollout_state.sample_params is not None, "sample_params must be set in rollout_state"
         rollout_state.tokens = rollout_state.prompt_ids
         rollout_state = await self.rollout_ctl.generate.remote(rollout_state)  # type: ignore[attr-defined]

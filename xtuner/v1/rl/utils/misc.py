@@ -1,4 +1,6 @@
 import importlib
+import json
+import os
 import socket
 import typing
 from abc import ABC
@@ -127,3 +129,16 @@ def _is_port_available(check_socket: socket.socket, port: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def get_eos_token(model_path: str) -> int | List[int]:
+    generation_config_path = os.path.join(model_path, "generation_config.json")
+    if not os.path.exists(generation_config_path):
+        logger.warning(
+            f"Config {generation_config_path} does not exist and thus cannot get eos_token. You must provide eos_token manually."
+        )
+        return []
+    with open(generation_config_path) as f:
+        generation_config = json.load(f)
+    eos_token_id = generation_config.get("eos_token_id")
+    return eos_token_id

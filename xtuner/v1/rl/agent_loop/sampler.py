@@ -62,9 +62,14 @@ class Sampler(_DatasetSampler):
         super().__init__(dataloader, prompt_repeat_k)
         self.replay_buffer = replay_buffer
 
-    async def sample(self, task_name: str) -> list[RolloutState]:
-        buffer_data = await self.replay_buffer.get(1, task_name=task_name, group_status=Status.ABORTED)
-        if len(buffer_data) == 0:
-            return self.sample_from_dataloader()
-        else:
-            return buffer_data[0]
+    async def sample(self, task_name: str, sample_from_expired_storage: bool = False) -> list[RolloutState]:
+        statuses_to_check = [Status.ABORTED]
+        if sample_from_expired_storage:
+            statuses_to_check.insert(0, Status.EXPIRED)
+
+        for status in statuses_to_check:
+            buffer_data = await self.replay_buffer.get(1, task_name=task_name, group_status=status)
+            if buffer_data:
+                return buffer_data[0]
+
+        return self.sample_from_dataloader()
