@@ -84,7 +84,7 @@ class ProduceStrategy(ABC):
         replay_buffer: ReplayBuffer,
         batch_size: int,
         task_name: str,
-        rollout_step: int = 0,
+        rollout_step: int,
     ): ...
 
 

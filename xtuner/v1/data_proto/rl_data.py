@@ -128,6 +128,7 @@ class RolloutState(CacheObj, BaseModel):
         self.response_mask = None
         self.response_steps = None
 
+
 def update_status_from_finish_reason(finish_reason: str | None) -> Status:
     """Updates the internal status based on the inference engine's finish
     reason.

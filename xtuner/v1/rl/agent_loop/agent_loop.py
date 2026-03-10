@@ -67,18 +67,24 @@ class AgentLoop(ABC):
         # for partial rollout
         if rollout_state.response_ids:
             is_completed = False
+            response_ids = (
+                rollout_state.response_ids.tolist()
+                if hasattr(rollout_state.response_ids, "tolist")
+                else list(rollout_state.response_ids)
+            )
+            rollout_state.response_ids = response_ids
             response_len = len(rollout_state.response_ids)
             if response_len > self.max_tokens:
                 self.logger.warning(
                     f"Response tokens exceed max_tokens limit: {response_len} > {self.max_tokens}. Truncating."
                 )
-                rollout_state.response_ids = rollout_state.response_ids[:self.max_tokens]
+                rollout_state.response_ids = rollout_state.response_ids[: self.max_tokens]
                 if rollout_state.logprobs is not None:
-                    rollout_state.logprobs = rollout_state.logprobs[:self.max_tokens]
+                    rollout_state.logprobs = rollout_state.logprobs[: self.max_tokens]
                 if rollout_state.response_mask is not None:
-                    rollout_state.response_mask = rollout_state.response_mask[:self.max_tokens]
+                    rollout_state.response_mask = rollout_state.response_mask[: self.max_tokens]
                 if rollout_state.response_steps is not None:
-                    rollout_state.response_steps = rollout_state.response_steps[:self.max_tokens]
+                    rollout_state.response_steps = rollout_state.response_steps[: self.max_tokens]
                 rollout_state.finish_reason = "length"
                 is_completed = True
             elif response_len == self.max_tokens:
@@ -123,7 +129,9 @@ class AgentLoop(ABC):
         rollout_state.response_ids = history_response_dict.get("response_ids", []) + (rollout_state.response_ids or [])
         rollout_state.response = history_response_dict.get("response", "") + (rollout_state.response or "")
         rollout_state.logprobs = history_response_dict.get("logprobs", []) + (rollout_state.logprobs or [])
-        rollout_state.response_mask = history_response_dict.get("response_mask", []) + (rollout_state.response_mask or [])
+        rollout_state.response_mask = history_response_dict.get("response_mask", []) + (
+            rollout_state.response_mask or []
+        )
         rollout_state.routed_experts = history_response_dict.get("routed_experts", []) + (
             rollout_state.routed_experts or []
         )
@@ -166,7 +174,9 @@ class AgentLoop(ABC):
                     rollout_state.response_steps
                 ):
                     unmasked_steps = [
-                        step for step, mask in zip(rollout_state.response_steps, rollout_state.response_mask) if mask == 1
+                        step
+                        for step, mask in zip(rollout_state.response_steps, rollout_state.response_mask)
+                        if mask == 1
                     ]
                     if unmasked_steps:
                         valid_steps = unmasked_steps
