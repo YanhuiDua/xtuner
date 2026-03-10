@@ -115,17 +115,6 @@ class AgentLoop(ABC):
         }
         return rollout_state
 
-    def _update_seq_staleness(self, rollout_state: RolloutState, rollout_step: int) -> None:
-        if not rollout_state.response_steps:
-            rollout_state.seq_staleness = 0
-            return
-        valid_steps = rollout_state.response_steps
-        if rollout_state.response_mask is not None and len(rollout_state.response_mask) == len(rollout_state.response_steps):
-            unmasked_steps = [step for step, mask in zip(rollout_state.response_steps, rollout_state.response_mask) if mask == 1]
-            if unmasked_steps:
-                valid_steps = unmasked_steps
-        rollout_state.seq_staleness = max(0, rollout_step - min(valid_steps))
-
     async def _postprocess(
         self, rollout_state: RolloutState, rollout_step: int, enable_partial_rollout: bool
     ) -> RolloutState:
@@ -145,11 +134,22 @@ class AgentLoop(ABC):
                 rollout_state.response_steps = response_steps
             else:
                 rollout_state.response_steps = rollout_state.response_steps + response_steps
-            self._update_seq_staleness(rollout_state, rollout_step)
             if not enable_partial_rollout:
                 rollout_state.clear_response()
+
+        if not rollout_state.response_steps:
+            rollout_state.seq_staleness = 0
         else:
-            self._update_seq_staleness(rollout_state, rollout_step)
+            valid_steps = rollout_state.response_steps
+            if rollout_state.response_mask is not None and len(rollout_state.response_mask) == len(
+                rollout_state.response_steps
+            ):
+                unmasked_steps = [
+                    step for step, mask in zip(rollout_state.response_steps, rollout_state.response_mask) if mask == 1
+                ]
+                if unmasked_steps:
+                    valid_steps = unmasked_steps
+            rollout_state.seq_staleness = max(0, rollout_step - min(valid_steps))
         return rollout_state
 
     async def _run_generation_pipeline(
@@ -158,7 +158,19 @@ class AgentLoop(ABC):
         rollout_state = await self._preprocess(rollout_state)
         if rollout_state.status == Status.COMPLETED:
             rollout_state.extra_fields.pop("history_response_dict", None)
-            self._update_seq_staleness(rollout_state, rollout_step)
+            if not rollout_state.response_steps:
+                rollout_state.seq_staleness = 0
+            else:
+                valid_steps = rollout_state.response_steps
+                if rollout_state.response_mask is not None and len(rollout_state.response_mask) == len(
+                    rollout_state.response_steps
+                ):
+                    unmasked_steps = [
+                        step for step, mask in zip(rollout_state.response_steps, rollout_state.response_mask) if mask == 1
+                    ]
+                    if unmasked_steps:
+                        valid_steps = unmasked_steps
+                rollout_state.seq_staleness = max(0, rollout_step - min(valid_steps))
             return rollout_state
 
         rollout_state = await self.generate_sample(rollout_state)

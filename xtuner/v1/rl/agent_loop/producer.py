@@ -149,12 +149,12 @@ class AsyncProduceStrategy(ProduceStrategy):
         self.tail_batch_stale_threshold = tail_batch_stale_threshold
         self.tail_batch_trigger_size = tail_batch_trigger_size
 
-    def mark_expired_samples(self, samples: list[RolloutState], rollout_step: int) -> None:
+    def mark_expired_samples(self, samples: list[RolloutState]) -> None:
         for sample in samples:
-            if sample.status != Status.ABORTED or sample.response_steps is None or len(sample.response_steps) == 0:
+            if sample.status != Status.ABORTED:
                 continue
             # 如果一个样本在 rollout_step 之前就被 aborted 了，并且距离现在已经超过 stale threshold 了，就认为它是过期的
-            is_expired = rollout_step - min(sample.response_steps) > self.tail_batch_stale_threshold
+            is_expired = sample.seq_staleness > self.tail_batch_stale_threshold
             sample.status = Status.EXPIRED if is_expired else sample.status
 
     async def produce_batch(
@@ -210,7 +210,7 @@ class AsyncProduceStrategy(ProduceStrategy):
                 items: list[RolloutState] = task.result()
                 if self.is_valid_sample_fn(items):
                     completed_sample_count += 1
-                self.mark_expired_samples(items, rollout_step)
+                self.mark_expired_samples(items)
                 await replay_buffer.put(items, task_name)
 
             while len(
