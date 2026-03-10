@@ -149,9 +149,7 @@ class AgentLoop(ABC):
             rollout_state.seq_staleness = 0
         else:
             valid_steps = rollout_state.response_steps
-            if rollout_state.response_mask is not None and len(rollout_state.response_mask) == len(
-                rollout_state.response_steps
-            ):
+            if rollout_state.response_mask is not None:
                 unmasked_steps = [
                     step for step, mask in zip(rollout_state.response_steps, rollout_state.response_mask) if mask == 1
                 ]
@@ -166,21 +164,6 @@ class AgentLoop(ABC):
         rollout_state = await self._preprocess(rollout_state)
         if rollout_state.status == Status.COMPLETED:
             rollout_state.extra_fields.pop("history_response_dict", None)
-            if not rollout_state.response_steps:
-                rollout_state.seq_staleness = 0
-            else:
-                valid_steps = rollout_state.response_steps
-                if rollout_state.response_mask is not None and len(rollout_state.response_mask) == len(
-                    rollout_state.response_steps
-                ):
-                    unmasked_steps = [
-                        step
-                        for step, mask in zip(rollout_state.response_steps, rollout_state.response_mask)
-                        if mask == 1
-                    ]
-                    if unmasked_steps:
-                        valid_steps = unmasked_steps
-                rollout_state.seq_staleness = max(0, rollout_step - min(valid_steps))
             return rollout_state
 
         rollout_state = await self.generate_sample(rollout_state)
