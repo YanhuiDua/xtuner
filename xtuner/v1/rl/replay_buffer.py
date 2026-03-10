@@ -339,7 +339,7 @@ class ReplayBuffer:
             timestamp_id=0,
             task_name=task_name,
             status=update_group_status(items),
-            staleness=max(item.seq_staleness for item in items),
+            staleness=min(item.seq_staleness for item in items),
         )
         async with self._lock:
             await self._policy.put(storage_item, self._storage)

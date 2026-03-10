@@ -97,6 +97,7 @@ class RolloutState(CacheObj, BaseModel):
     task_name: str | None = None
     status: Status = Status.INIT
     error_msg: str | None = None
+    seq_staleness: int = 0
     response_mask: list[int] | None = None  # response_ids的长度
     response_steps: list[int] | None = None  # 记录 response_ids 中每个 token 是在哪个 rollout_step 生成的
     extra_fields: dict[str, Any] = {}
