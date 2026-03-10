@@ -154,7 +154,7 @@ class AsyncProduceStrategy(ProduceStrategy):
             if sample.status != Status.ABORTED:
                 continue
             # 如果一个样本在 rollout_step 之前就被 aborted 了，并且距离现在已经超过 stale threshold 了，就认为它是过期的
-            is_expired = sample.seq_staleness > self.tail_batch_stale_threshold
+            is_expired = self.tail_batch_stale_threshold > 0 and sample.seq_staleness > self.tail_batch_stale_threshold
             sample.status = Status.EXPIRED if is_expired else sample.status
 
     async def produce_batch(
@@ -172,7 +172,6 @@ class AsyncProduceStrategy(ProduceStrategy):
         sample_from_expired_storage = False
         data_concurrency = int((1 + self.over_sample_threshold) * batch_size)
 
-        # 是否触发tail_batch
         if self.tail_batch_trigger_size > 0 and expired_sample_count >= self.tail_batch_trigger_size:
             logger.info(
                 f"Tail batch trigger condition met: {expired_sample_count} expired samples (threshold: {self.tail_batch_trigger_size}). Enabling tail batch mode."
@@ -236,3 +235,19 @@ class AsyncProduceStrategy(ProduceStrategy):
                     await agent_loop.pause()
                     await asyncio.sleep(1)
         print("All worker tasks have completed after pausing env controller.")
+
+    async def recycle_remaining_completed(self, replay_buffer: ReplayBuffer, task_name: str) -> None:
+        recycle_batch_size = 128
+        while True:
+            remaining_completed = await replay_buffer.get(recycle_batch_size, task_name, Status.COMPLETED)
+            if not remaining_completed:
+                break
+
+            for group in remaining_completed:
+                for sample in group:
+                    if self.tail_batch_stale_threshold > 0 and sample.seq_staleness > self.tail_batch_stale_threshold:
+                        sample.status = Status.EXPIRED
+                    if not self.enable_partial_rollout:
+                        sample.status = Status.ABORTED
+                        sample.clear_response()
+                await replay_buffer.put(group, task_name)

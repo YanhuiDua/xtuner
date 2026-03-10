@@ -10,7 +10,7 @@ from xtuner.v1.rl.rollout import RolloutController
 from xtuner.v1.utils import get_logger
 
 from .agent_loop import AgentLoop, AgentLoopConfig
-from .producer import ProduceStrategy, ProduceStrategyConfig, SyncProduceStrategyConfig
+from .producer import AsyncProduceStrategy, ProduceStrategy, ProduceStrategyConfig, SyncProduceStrategyConfig
 from .sampler import Sampler, SamplerConfig
 
 
@@ -81,6 +81,8 @@ class AgentLoopManager:
         self.logger.info(
             f"[AgentLoopManager][{self.task_name}] replay_buffer.get done completed_groups={len(batch_rollout_states)} elapsed={time.perf_counter() - start:.3f}"
         )
+        if isinstance(self._scheduler, AsyncProduceStrategy):
+            await self._scheduler.recycle_remaining_completed(self._replay_buffer, self.task_name)
         return batch_rollout_states
 
     # # 非共卡

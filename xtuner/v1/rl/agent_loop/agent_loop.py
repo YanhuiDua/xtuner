@@ -2,6 +2,8 @@ import asyncio
 from abc import ABC, abstractmethod
 from typing import Callable
 
+import httpx
+import ray
 from pydantic import BaseModel, ConfigDict
 
 from xtuner.v1.data_proto import RolloutState, SampleParams, Status
@@ -54,14 +56,41 @@ class AgentLoop(ABC):
         self.max_tokens = self.sample_params.max_tokens
         eos_token = get_eos_token(self.hf_checkpoint)
         self.eos_tokens: list[int] = [eos_token] if isinstance(eos_token, int) else eos_token
+        self.rollout_ctl_metadata = ray.get(self.rollout_ctl.get_rollout_metadata.remote())
+        self.infer_server_url = list(self.rollout_ctl_metadata["server_url_dict"].keys())
 
     @abstractmethod
     async def generate_sample(self, rollout_state: RolloutState) -> RolloutState: ...
 
     async def pause(self) -> None:
-        """Pause the agent loop if supported by the implementation."""
-        # Default implementation is a no-op to keep behavior unchanged.
+        pause_time_out = 60.0
+        async with httpx.AsyncClient() as client:
+            tasks = [self._send_abort_request(client, url, timeout=pause_time_out) for url in self.infer_server_url]
+            results = await asyncio.gather(*tasks)
+
+        failed_workers = [url for url, success in results if not success]
+        succeeded_count = len(self.infer_server_url) - len(failed_workers)
+
+        if failed_workers:
+            self.logger.warning(
+                f"Abort requests completed. Succeeded: {succeeded_count}, "
+                f"Failed: {len(failed_workers)}. Failed workers: {failed_workers}"
+            )
+        else:
+            self.logger.info(f"All {succeeded_count} abort requests sent successfully.")
+
         return None
+
+    async def _send_abort_request(self, client, url, timeout):
+        worker_url = f"{url}/abort_request"
+        try:
+            response = await client.post(worker_url, json={"abort_all": True}, timeout=timeout)
+            response.raise_for_status()
+            self.logger.debug(f"Successfully sent abort request to {url}")
+            return url, True
+        except Exception as e:
+            self.logger.error(f"Failed to send abort request to {url}: {e}")
+            return url, False
 
     async def _preprocess(self, rollout_state: RolloutState) -> RolloutState:
         # for partial rollout
@@ -151,16 +180,18 @@ class AgentLoop(ABC):
             rollout_state.seq_staleness = max(0, rollout_step - min(rollout_state.response_steps))
         return rollout_state
 
-    async def _run_generation_pipeline(
+    async def _generate_pipeline(
         self, rollout_state: RolloutState, rollout_step: int = 0, enable_partial_rollout: bool = False
     ) -> RolloutState:
-        rollout_state = await self._preprocess(rollout_state)
+        rollout_state = await self._preprocess(rollout_state)  # preprocess for partial rollout
         if rollout_state.status == Status.COMPLETED:
             rollout_state.extra_fields.pop("history_response_dict", None)
             return rollout_state
 
         rollout_state = await self.generate_sample(rollout_state)
-        rollout_state = await self._postprocess(rollout_state, rollout_step, enable_partial_rollout)
+        rollout_state = await self._postprocess(
+            rollout_state, rollout_step, enable_partial_rollout
+        )  # postprocess for partial rollout
         return rollout_state
 
     async def generate_group(
@@ -169,7 +200,7 @@ class AgentLoop(ABC):
         pending_tasks = []
         for state in rollout_state:
             state.sample_params = self.sample_params
-            task = create_task(self._run_generation_pipeline(state, rollout_step, enable_partial_rollout))
+            task = create_task(self._generate_pipeline(state, rollout_step, enable_partial_rollout))
             pending_tasks.append(task)
         generated_samples = asyncio.gather(*pending_tasks)
         group_samples = await generated_samples
