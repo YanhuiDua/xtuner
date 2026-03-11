@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict
 
 from xtuner.v1.data_proto.rl_data import RolloutState, Status
 from xtuner.v1.rl.replay_buffer import ReplayBuffer
+from xtuner.v1.rl.rollout.utils import continue_genertion, pause_generation
 from xtuner.v1.rl.utils import create_task
 from xtuner.v1.utils import get_logger
 
@@ -166,6 +167,8 @@ class AsyncProduceStrategy(ProduceStrategy):
         task_name: str,
         rollout_step: int,
     ):
+        rollout_ctl = agent_loop.rollout_ctl
+        await continue_genertion(rollout_ctl)
         pending_tasks = set()
         init_completed_sample_count = await replay_buffer.count(task_name=task_name, group_status=Status.COMPLETED)
         expired_sample_count = await replay_buffer.count(task_name=task_name, group_status=Status.EXPIRED)
@@ -228,11 +231,11 @@ class AsyncProduceStrategy(ProduceStrategy):
                 pending_tasks.add(task)
 
         if len(pending_tasks) > 0:
-            await agent_loop.pause()
+            await pause_generation(rollout_ctl)
             while len(pending_tasks) > 0:
                 _, pending_tasks = await asyncio.wait(pending_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED)
                 if len(pending_tasks) > 0:
-                    await agent_loop.pause()
+                    await pause_generation(rollout_ctl)
                     await asyncio.sleep(1)
         print("All worker tasks have completed after pausing env controller.")
 

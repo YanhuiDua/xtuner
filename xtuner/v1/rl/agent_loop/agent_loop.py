@@ -2,8 +2,6 @@ import asyncio
 from abc import ABC, abstractmethod
 from typing import Callable
 
-import httpx
-import ray
 from pydantic import BaseModel, ConfigDict
 
 from xtuner.v1.data_proto import RolloutState, SampleParams, Status
@@ -56,45 +54,13 @@ class AgentLoop(ABC):
         self.max_tokens = self.sample_params.max_tokens
         eos_token = get_eos_token(self.hf_checkpoint)
         self.eos_tokens: list[int] = [eos_token] if isinstance(eos_token, int) else eos_token
-        self.rollout_ctl_metadata = ray.get(self.rollout_ctl.get_rollout_metadata.remote())
-        self.infer_server_url = list(self.rollout_ctl_metadata["server_url_dict"].keys())
 
     @abstractmethod
     async def generate_sample(self, rollout_state: RolloutState) -> RolloutState: ...
 
-    async def pause(self) -> None:
-        pause_time_out = 60.0
-        async with httpx.AsyncClient() as client:
-            tasks = [self._send_abort_request(client, url, timeout=pause_time_out) for url in self.infer_server_url]
-            results = await asyncio.gather(*tasks)
-
-        failed_workers = [url for url, success in results if not success]
-        succeeded_count = len(self.infer_server_url) - len(failed_workers)
-
-        if failed_workers:
-            self.logger.warning(
-                f"Abort requests completed. Succeeded: {succeeded_count}, "
-                f"Failed: {len(failed_workers)}. Failed workers: {failed_workers}"
-            )
-        else:
-            self.logger.info(f"All {succeeded_count} abort requests sent successfully.")
-
-        return None
-
-    async def _send_abort_request(self, client, url, timeout):
-        worker_url = f"{url}/abort_request"
-        try:
-            response = await client.post(worker_url, json={"abort_all": True}, timeout=timeout)
-            response.raise_for_status()
-            self.logger.debug(f"Successfully sent abort request to {url}")
-            return url, True
-        except Exception as e:
-            self.logger.error(f"Failed to send abort request to {url}: {e}")
-            return url, False
-
-    async def _preprocess(self, rollout_state: RolloutState) -> RolloutState:
+    async def _preprocess(self, rollout_state: RolloutState, enable_partial_rollout: bool = False) -> RolloutState:
         # for partial rollout
-        if rollout_state.response_ids:
+        if rollout_state.response_ids and enable_partial_rollout:
             is_completed = False
             response_ids = (
                 rollout_state.response_ids.tolist()
@@ -114,6 +80,7 @@ class AgentLoop(ABC):
                     rollout_state.response_mask = rollout_state.response_mask[: self.max_tokens]
                 if rollout_state.response_steps is not None:
                     rollout_state.response_steps = rollout_state.response_steps[: self.max_tokens]
+                # TODO: 处理 routed_experts 的截断
                 rollout_state.finish_reason = "length"
                 is_completed = True
             elif response_len == self.max_tokens:
@@ -137,16 +104,15 @@ class AgentLoop(ABC):
         history_response_ids = (
             rollout_state.tokens[len(rollout_state.prompt_ids or []) :] if rollout_state.tokens else []
         )
-        history_response = rollout_state.response or ""
-        history_logprobs = rollout_state.logprobs or []
-        history_response_mask = rollout_state.response_mask or []
-        history_routed_experts = rollout_state.routed_experts or []
+        history_response = (rollout_state.response and enable_partial_rollout) or ""
+        history_logprobs = (rollout_state.logprobs and enable_partial_rollout) or []
+        history_response_mask = (rollout_state.response_mask and enable_partial_rollout) or []
+        # TODO: 处理 routed_experts
         rollout_state.extra_fields["history_response_dict"] = {
             "response_ids": history_response_ids,
             "response": history_response,
             "logprobs": history_logprobs,
             "response_mask": history_response_mask,
-            "routed_experts": history_routed_experts,
         }
         return rollout_state
 
@@ -161,23 +127,16 @@ class AgentLoop(ABC):
         rollout_state.response_mask = history_response_dict.get("response_mask", []) + (
             rollout_state.response_mask or []
         )
-        rollout_state.routed_experts = history_response_dict.get("routed_experts", []) + (
-            rollout_state.routed_experts or []
-        )
+        # TODO: 处理 routed_experts
+        response_steps = [rollout_step] * new_response_len
 
-        if rollout_state.status == Status.ABORTED:
-            response_steps = [rollout_step] * new_response_len
-            if rollout_state.response_steps is None:
-                rollout_state.response_steps = response_steps
-            else:
-                rollout_state.response_steps = rollout_state.response_steps + response_steps
-            if not enable_partial_rollout:
-                rollout_state.clear_response()
-
-        if not rollout_state.response_steps:
-            rollout_state.seq_staleness = 0
+        if rollout_state.response_steps is None:
+            rollout_state.response_steps = response_steps
         else:
-            rollout_state.seq_staleness = max(0, rollout_step - min(rollout_state.response_steps))
+            rollout_state.response_steps = rollout_state.response_steps + response_steps
+
+        rollout_state.seq_staleness = max(0, rollout_step - min(rollout_state.response_steps))
+
         return rollout_state
 
     async def _generate_pipeline(
