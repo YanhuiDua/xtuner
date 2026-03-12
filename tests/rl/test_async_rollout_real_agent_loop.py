@@ -64,6 +64,41 @@ class TestAsyncRolloutRealAgentLoop(unittest.IsolatedAsyncioTestCase):
             extra_fields={},
         )
 
+    async def test_real_tail_batch_mark_expired_thresholds(self):
+        def make_sample(staleness: int) -> RolloutState:
+            return RolloutState(
+                uid=500 + staleness,
+                message=[{"role": "user", "content": "tail-threshold"}],
+                prompt_ids=[1],
+                response_ids=[1],
+                status=Status.ABORTED,
+                seq_staleness=staleness,
+            )
+
+        strategy_t1 = AsyncProduceStrategy(
+            over_sample_threshold=0.0,
+            enable_partial_rollout=False,
+            tail_batch_trigger_size=0,
+            tail_batch_stale_threshold=1,
+            is_valid_sample_fn=lambda samples: True,
+            should_continue_fn=lambda completed_count, batch_size, **kwargs: completed_count < batch_size,
+        )
+        sample_t1 = [make_sample(2)]
+        strategy_t1.mark_expired_samples(sample_t1)
+        self.assertEqual(sample_t1[0].status, Status.EXPIRED)
+
+        strategy_t4 = AsyncProduceStrategy(
+            over_sample_threshold=0.0,
+            enable_partial_rollout=False,
+            tail_batch_trigger_size=0,
+            tail_batch_stale_threshold=4,
+            is_valid_sample_fn=lambda samples: True,
+            should_continue_fn=lambda completed_count, batch_size, **kwargs: completed_count < batch_size,
+        )
+        sample_t4 = [make_sample(4)]
+        strategy_t4.mark_expired_samples(sample_t4)
+        self.assertEqual(sample_t4[0].status, Status.ABORTED)
+
     async def test_real_partial_rollout_short_circuit_keeps_response_ids(self):
         model_path = os.environ["ROLLOUT_MODEL_PATH"]
         agent_loop = SingleTurnAgentLoop(
@@ -179,6 +214,85 @@ class TestAsyncRolloutRealAgentLoop(unittest.IsolatedAsyncioTestCase):
         last_round_remaining = remain_aborted
         await strategy.produce_batch(loop, sampler, replay_buffer, batch_size, task_name, rollout_step=1)
         self.assertEqual(sampler.sampled_from_aborted, last_round_remaining)
+
+    async def test_real_tail_batch_mode_switch_and_reset_staleness(self):
+        class RealTailSampler:
+            def __init__(self, replay_buffer):
+                self.replay_buffer = replay_buffer
+                self.sample_from_expired_flags: list[bool] = []
+                self.uid = 0
+
+            async def sample(self, task_name: str, sample_from_expired_storage: bool = False):
+                self.sample_from_expired_flags.append(sample_from_expired_storage)
+                if sample_from_expired_storage:
+                    expired = await self.replay_buffer.get(1, task_name, Status.EXPIRED)
+                    if expired:
+                        for item in expired[0]:
+                            item.seq_staleness = 0
+                        return expired[0]
+                state = RolloutState(
+                    uid=800 + self.uid,
+                    message=[{"role": "user", "content": "fallback"}],
+                    prompt_ids=self.tokenizer("fallback", return_tensors="pt")["input_ids"].flatten().tolist(),
+                    sample_params=SampleParams(max_tokens=8, temperature=0.0, return_token_ids=True),
+                    status=Status.INIT,
+                    extra_fields={},
+                )
+                self.uid += 1
+                return [state]
+
+        class RealLoopWrapper:
+            def __init__(self, real_loop):
+                self._real_loop = real_loop
+                self.rollout_ctl = real_loop.rollout_ctl
+
+            async def generate_group(self, rollout_state, rollout_step=0, enable_partial_rollout=False):
+                for item in rollout_state:
+                    item.status = Status.COMPLETED
+                return rollout_state
+
+        task_name = "real_tail_mode_task"
+        replay_buffer = AsyncReplayBufferConfig(min_staleness=1, max_staleness=5).build()
+        for i in range(2):
+            await replay_buffer.put(
+                [
+                    RolloutState(
+                        uid=900 + i,
+                        message=[{"role": "user", "content": "expired"}],
+                        prompt_ids=[1],
+                        response_ids=[9],
+                        status=Status.EXPIRED,
+                        seq_staleness=7,
+                    )
+                ],
+                task_name,
+            )
+
+        model_path = os.environ["ROLLOUT_MODEL_PATH"]
+        real_loop = SingleTurnAgentLoop(
+            rollout_ctl=self.rollout_controller,
+            sample_params=self.sample_params,
+            hf_checkpoint=model_path,
+            judger=None,
+        )
+        loop = RealLoopWrapper(real_loop)
+        sampler = RealTailSampler(replay_buffer)
+
+        strategy = AsyncProduceStrategy(
+            over_sample_threshold=1.0,
+            enable_partial_rollout=False,
+            tail_batch_trigger_size=1,
+            tail_batch_stale_threshold=1,
+            is_valid_sample_fn=lambda samples: all(s.status == Status.COMPLETED for s in samples),
+            should_continue_fn=lambda completed_count, batch_size, **kwargs: completed_count < batch_size,
+        )
+
+        await strategy.produce_batch(loop, sampler, replay_buffer, batch_size=1, task_name=task_name, rollout_step=3)
+
+        self.assertTrue(any(sampler.sample_from_expired_flags))
+        completed_groups = await replay_buffer.get(10, task_name, Status.COMPLETED)
+        self.assertGreater(len(completed_groups), 0)
+        self.assertEqual(completed_groups[0][0].seq_staleness, 0)
 
 
 if __name__ == "__main__":

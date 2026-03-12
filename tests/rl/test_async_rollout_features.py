@@ -91,6 +91,118 @@ class MultiRoundAgentLoop:
 
 
 class TestAsyncRolloutFeatures(unittest.IsolatedAsyncioTestCase):
+    async def test_tail_batch_mark_expired_thresholds(self):
+        def make_sample(staleness: int) -> RolloutState:
+            return RolloutState(
+                uid=100 + staleness,
+                message=[{"role": "user", "content": "tail"}],
+                prompt_ids=[1],
+                response_ids=[1],
+                status=Status.ABORTED,
+                seq_staleness=staleness,
+            )
+
+        strategy_t1 = AsyncProduceStrategy(
+            over_sample_threshold=0.0,
+            enable_partial_rollout=False,
+            tail_batch_trigger_size=0,
+            tail_batch_stale_threshold=1,
+            is_valid_sample_fn=lambda samples: True,
+            should_continue_fn=lambda completed_count, batch_size, **kwargs: completed_count < batch_size,
+        )
+        samples_t1 = [make_sample(1), make_sample(2)]
+        strategy_t1.mark_expired_samples(samples_t1)
+        self.assertEqual(samples_t1[0].status, Status.ABORTED)
+        self.assertEqual(samples_t1[1].status, Status.EXPIRED)
+
+        strategy_t4 = AsyncProduceStrategy(
+            over_sample_threshold=0.0,
+            enable_partial_rollout=False,
+            tail_batch_trigger_size=0,
+            tail_batch_stale_threshold=4,
+            is_valid_sample_fn=lambda samples: True,
+            should_continue_fn=lambda completed_count, batch_size, **kwargs: completed_count < batch_size,
+        )
+        samples_t4 = [make_sample(4), make_sample(5)]
+        strategy_t4.mark_expired_samples(samples_t4)
+        self.assertEqual(samples_t4[0].status, Status.ABORTED)
+        self.assertEqual(samples_t4[1].status, Status.EXPIRED)
+
+    async def test_tail_batch_mode_switch_and_reset_staleness(self):
+        class TailSampler:
+            def __init__(self, replay_buffer):
+                self.replay_buffer = replay_buffer
+                self.flags: list[bool] = []
+                self.uid = 0
+
+            async def sample(self, task_name: str, sample_from_expired_storage: bool = False):
+                self.flags.append(sample_from_expired_storage)
+                if sample_from_expired_storage:
+                    expired = await self.replay_buffer.get(1, task_name=task_name, group_status=Status.EXPIRED)
+                    if expired:
+                        for item in expired[0]:
+                            item.seq_staleness = 0
+                        return expired[0]
+                item = RolloutState(
+                    uid=1000 + self.uid,
+                    message=[{"role": "user", "content": "fresh"}],
+                    prompt_ids=[1],
+                    response_ids=[],
+                    status=Status.INIT,
+                    seq_staleness=0,
+                )
+                self.uid += 1
+                return [item]
+
+        class TailAgentLoop:
+            def __init__(self):
+                self.rollout_ctl = object()
+
+            async def generate_group(self, rollout_state, rollout_step=0, enable_partial_rollout=False):
+                for item in rollout_state:
+                    item.status = Status.COMPLETED
+                return rollout_state
+
+        replay_buffer = AsyncReplayBufferConfig(min_staleness=1, max_staleness=5).build()
+        task_name = "tail_mode_task"
+        # put two expired groups so expired_count > trigger_size(=1)
+        for i in range(2):
+            await replay_buffer.put(
+                [
+                    RolloutState(
+                        uid=200 + i,
+                        message=[{"role": "user", "content": "expired"}],
+                        prompt_ids=[1],
+                        response_ids=[9],
+                        status=Status.EXPIRED,
+                        seq_staleness=6,
+                    )
+                ],
+                task_name,
+            )
+
+        sampler = TailSampler(replay_buffer)
+        agent_loop = TailAgentLoop()
+        strategy = AsyncProduceStrategy(
+            over_sample_threshold=1.0,
+            enable_partial_rollout=False,
+            tail_batch_trigger_size=1,
+            tail_batch_stale_threshold=1,
+            is_valid_sample_fn=lambda samples: all(s.status == Status.COMPLETED for s in samples),
+            should_continue_fn=lambda completed_count, batch_size, **kwargs: completed_count < batch_size,
+        )
+
+        with (
+            patch("xtuner.v1.rl.agent_loop.producer.continue_genertion", new=AsyncMock()),
+            patch("xtuner.v1.rl.agent_loop.producer.pause_generation", new=AsyncMock()),
+        ):
+            await strategy.produce_batch(agent_loop, sampler, replay_buffer, batch_size=1, task_name=task_name, rollout_step=1)
+
+        self.assertTrue(any(sampler.flags))
+        completed_groups = await replay_buffer.get(10, task_name, Status.COMPLETED)
+        self.assertGreater(len(completed_groups), 0)
+        self.assertEqual(completed_groups[0][0].seq_staleness, 0)
+
     async def test_oversampling_round_consistency(self):
         replay_buffer = AsyncReplayBufferConfig(min_staleness=1, max_staleness=5).build()
         sampler = InstrumentedSampler(replay_buffer)
