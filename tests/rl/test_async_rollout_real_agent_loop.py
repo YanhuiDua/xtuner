@@ -2,39 +2,21 @@ from __future__ import annotations
 import os
 import unittest
 
+import asyncio
 
-def _integration_env_ready() -> tuple[bool, str]:
-    required = ["ROLLOUT_MODEL_PATH"]
-    for key in required:
-        if not os.environ.get(key):
-            return False, f"missing env {key}"
-    try:
-        import ray  # noqa: F401
-        import torch  # noqa: F401
-    except Exception as e:  # pragma: no cover
-        return False, f"missing runtime deps: {e}"
-    return True, ""
+import ray
+import torch
+from transformers import AutoTokenizer
 
-
-_READY, _REASON = _integration_env_ready()
-
-if _READY:
-    import asyncio
-
-    import ray
-    import torch
-    from transformers import AutoTokenizer
-
-    from xtuner.v1.data_proto import RolloutState, SampleParams, Status
-    from xtuner.v1.rl.agent_loop.agent_loop import SingleTurnAgentLoop
-    from xtuner.v1.rl.agent_loop.producer import AsyncProduceStrategy
-    from xtuner.v1.rl.replay_buffer import AsyncReplayBufferConfig
-    from xtuner.v1.rl.rollout import RolloutController
-    from xtuner.v1.rl.rollout.worker import RolloutConfig
-    from xtuner.v1.rl.utils import AcceleratorResourcesConfig, AutoAcceleratorWorkers
+from xtuner.v1.data_proto import RolloutState, SampleParams, Status
+from xtuner.v1.rl.agent_loop.agent_loop import SingleTurnAgentLoop
+from xtuner.v1.rl.agent_loop.producer import AsyncProduceStrategy
+from xtuner.v1.rl.replay_buffer import AsyncReplayBufferConfig
+from xtuner.v1.rl.rollout import RolloutController
+from xtuner.v1.rl.rollout.worker import RolloutConfig
+from xtuner.v1.rl.utils import AcceleratorResourcesConfig, AutoAcceleratorWorkers
 
 
-@unittest.skipUnless(_READY, f"integration env not ready: {_REASON}")
 class TestAsyncRolloutRealAgentLoop(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
