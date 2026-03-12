@@ -161,6 +161,9 @@ class TestAsyncRolloutFeatures(unittest.IsolatedAsyncioTestCase):
             async def generate_group(self, rollout_state, rollout_step=0, enable_partial_rollout=False):
                 for item in rollout_state:
                     item.status = Status.COMPLETED
+                    # emulate new-generation output in tail-batch mode
+                    item.response_ids = [777]
+                    item.response = "latest"
                 return rollout_state
 
         replay_buffer = AsyncReplayBufferConfig(min_staleness=1, max_staleness=5).build()
@@ -201,6 +204,8 @@ class TestAsyncRolloutFeatures(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(sampler.flags))
         completed_groups = await replay_buffer.get(10, task_name, Status.COMPLETED)
         self.assertGreater(len(completed_groups), 0)
+        # expired sample output should be fresh (no old token carry-over)
+        self.assertEqual(completed_groups[0][0].response_ids, [777])
         self.assertEqual(completed_groups[0][0].seq_staleness, 0)
 
     async def test_oversampling_round_consistency(self):

@@ -249,6 +249,9 @@ class TestAsyncRolloutRealAgentLoop(unittest.IsolatedAsyncioTestCase):
             async def generate_group(self, rollout_state, rollout_step=0, enable_partial_rollout=False):
                 for item in rollout_state:
                     item.status = Status.COMPLETED
+                    # emulate new-generation output in tail-batch mode
+                    item.response_ids = [888]
+                    item.response = "latest"
                 return rollout_state
 
         task_name = "real_tail_mode_task"
@@ -292,6 +295,8 @@ class TestAsyncRolloutRealAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(sampler.sample_from_expired_flags))
         completed_groups = await replay_buffer.get(10, task_name, Status.COMPLETED)
         self.assertGreater(len(completed_groups), 0)
+        # expired sample output should be fresh (no old token carry-over)
+        self.assertEqual(completed_groups[0][0].response_ids, [888])
         self.assertEqual(completed_groups[0][0].seq_staleness, 0)
 
 
