@@ -60,53 +60,35 @@ class AgentLoop(ABC):
 
     async def _preprocess(self, rollout_state: RolloutState, enable_partial_rollout: bool = False) -> RolloutState:
         # for partial rollout
-        if rollout_state.response_ids and enable_partial_rollout:
-            is_completed = False
-            response_ids = (
-                rollout_state.response_ids.tolist()
-                if hasattr(rollout_state.response_ids, "tolist")
-                else list(rollout_state.response_ids)
-            )
-            rollout_state.response_ids = response_ids
-            response_len = len(rollout_state.response_ids)
-            if response_len > self.max_tokens:
-                self.logger.warning(
-                    f"Response tokens exceed max_tokens limit: {response_len} > {self.max_tokens}. Truncating."
-                )
-                rollout_state.response_ids = rollout_state.response_ids[: self.max_tokens]
-                if rollout_state.logprobs is not None:
-                    rollout_state.logprobs = rollout_state.logprobs[: self.max_tokens]
-                if rollout_state.response_mask is not None:
-                    rollout_state.response_mask = rollout_state.response_mask[: self.max_tokens]
-                if rollout_state.response_steps is not None:
-                    rollout_state.response_steps = rollout_state.response_steps[: self.max_tokens]
-                # TODO: 处理 routed_experts 的截断
-                rollout_state.finish_reason = "length"
-                is_completed = True
-            elif response_len == self.max_tokens:
-                rollout_state.finish_reason = "length"
-                is_completed = True
-            elif rollout_state.response_ids[-1] in self.eos_tokens:  # 修复属性名拼写匹配 __init__ 中的定义
-                self.logger.warning("Response tokens end with EOS token. Marking rollout as completed.")
-                rollout_state.finish_reason = "stop"
-                is_completed = True
+        if (
+            not enable_partial_rollout
+            or rollout_state.response_ids is None
+            or len(rollout_state.response_ids) == 0
+            or rollout_state.status == Status.COMPLETED
+        ):
+            return rollout_state
 
-            # 命中截断或 EOS 提前结束
-            if is_completed:
-                rollout_state.status = Status.COMPLETED
-                return await self.judge_sample(rollout_state)
-
-            # 续写逻辑
-            rollout_state.tokens = list(rollout_state.prompt_ids or []) + rollout_state.response_ids
-            remaining_tokens = self.max_tokens - len(rollout_state.response_ids)
-            rollout_state.sample_params = rollout_state.sample_params.copy(update={"max_tokens": remaining_tokens})
-
+        response_ids = (
+            rollout_state.response_ids.tolist()
+            if hasattr(rollout_state.response_ids, "tolist")
+            else list(rollout_state.response_ids)
+        )
+        rollout_state.response_ids = response_ids  # 之前n轮的response_ids
+        response_len = len(rollout_state.response_ids)
+        rollout_state.tokens = list(rollout_state.prompt_ids or []) + rollout_state.response_ids
+        remaining_tokens = self.max_tokens - len(rollout_state.response_ids)
+        rollout_state.sample_params = rollout_state.sample_params.copy(update={"max_tokens": remaining_tokens})
+        self.logger.info(
+            f"Sample: {rollout_state.uid} continue rollout with {response_len} response tokens. Remaining tokens allowed: {remaining_tokens}. status: {rollout_state.status}, prompt_ids_len: {len(rollout_state.prompt_ids or [])}, response_ids_len: {len(rollout_state.response_ids)}, total_tokens_len: {len(rollout_state.tokens)}"
+        )
         history_response_ids = (
             rollout_state.tokens[len(rollout_state.prompt_ids or []) :] if rollout_state.tokens else []
         )
-        history_response = (rollout_state.response and enable_partial_rollout) or ""
-        history_logprobs = (rollout_state.logprobs and enable_partial_rollout) or []
-        history_response_mask = (rollout_state.response_mask and enable_partial_rollout) or []
+        history_response = rollout_state.response if (enable_partial_rollout and rollout_state.response) else ""
+        history_logprobs = rollout_state.logprobs if (enable_partial_rollout and rollout_state.logprobs) else []
+        history_response_mask = (
+            rollout_state.response_mask if (enable_partial_rollout and rollout_state.response_mask) else []
+        )
         # TODO: 处理 routed_experts
         rollout_state.extra_fields["history_response_dict"] = {
             "response_ids": history_response_ids,
@@ -116,41 +98,33 @@ class AgentLoop(ABC):
         }
         return rollout_state
 
-    async def _postprocess(
-        self, rollout_state: RolloutState, rollout_step: int, enable_partial_rollout: bool
-    ) -> RolloutState:
+    async def _postprocess(self, rollout_state: RolloutState, rollout_step: int) -> RolloutState:
         new_response_len = len(rollout_state.response_ids or [])
         history_response_dict = rollout_state.extra_fields.pop("history_response_dict", {})
-        rollout_state.response_ids = history_response_dict.get("response_ids", []) + (rollout_state.response_ids or [])
-        rollout_state.response = history_response_dict.get("response", "") + (rollout_state.response or "")
-        rollout_state.logprobs = history_response_dict.get("logprobs", []) + (rollout_state.logprobs or [])
-        rollout_state.response_mask = history_response_dict.get("response_mask", []) + (
-            rollout_state.response_mask or []
-        )
+
+        history_response_ids = history_response_dict.get("response_ids", [])
+        history_logprobs = history_response_dict.get("logprobs", [])
+        history_response_mask = history_response_dict.get("response_mask", [])
+        history_response = history_response_dict.get("response", "")
+        rollout_state.response_ids = history_response_ids + (rollout_state.response_ids or [])
+        rollout_state.response = history_response + (rollout_state.response or "")
+        rollout_state.logprobs = history_logprobs + (rollout_state.logprobs or [])
+        rollout_state.response_mask = history_response_mask + (rollout_state.response_mask or [])
         # TODO: 处理 routed_experts
         response_steps = [rollout_step] * new_response_len
+        rollout_state.response_steps = (rollout_state.response_steps or []) + response_steps
 
-        if rollout_state.response_steps is None:
-            rollout_state.response_steps = response_steps
-        else:
-            rollout_state.response_steps = rollout_state.response_steps + response_steps
-
-        rollout_state.seq_staleness = max(0, rollout_step - min(rollout_state.response_steps))
+        cur_rollout_steps = min(rollout_state.response_steps, default=rollout_step)
+        rollout_state.seq_staleness = rollout_step - cur_rollout_steps
 
         return rollout_state
 
     async def _generate_pipeline(
         self, rollout_state: RolloutState, rollout_step: int = 0, enable_partial_rollout: bool = False
     ) -> RolloutState:
-        rollout_state = await self._preprocess(rollout_state)  # preprocess for partial rollout
-        if rollout_state.status == Status.COMPLETED:
-            rollout_state.extra_fields.pop("history_response_dict", None)
-            return rollout_state
-
+        rollout_state = await self._preprocess(rollout_state, enable_partial_rollout)  # preprocess for partial rollout
         rollout_state = await self.generate_sample(rollout_state)
-        rollout_state = await self._postprocess(
-            rollout_state, rollout_step, enable_partial_rollout
-        )  # postprocess for partial rollout
+        rollout_state = await self._postprocess(rollout_state, rollout_step)  # postprocess for partial rollout
         return rollout_state
 
     async def generate_group(

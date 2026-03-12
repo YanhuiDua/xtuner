@@ -173,7 +173,7 @@ class AsyncProduceStrategy(ProduceStrategy):
         init_completed_sample_count = await replay_buffer.count(task_name=task_name, group_status=Status.COMPLETED)
         expired_sample_count = await replay_buffer.count(task_name=task_name, group_status=Status.EXPIRED)
         sample_from_expired_storage = False
-        data_concurrency = int((1 + self.over_sample_threshold) * batch_size)
+        data_concurrency = int((1 + self.over_sample_threshold) * batch_size) - init_completed_sample_count
 
         if self.tail_batch_trigger_size > 0 and expired_sample_count >= self.tail_batch_trigger_size:
             logger.info(
@@ -209,11 +209,14 @@ class AsyncProduceStrategy(ProduceStrategy):
             # 如果要过滤，在这个地方处理，然后加入到 replay buffer
             # 如果被过滤的数据就放到 put_to_filtered pool 中
             for task in done_tasks:
-                items: list[RolloutState] = task.result()
-                if self.is_valid_sample_fn(items):
+                running_items: list[RolloutState] = task.result()
+                if self.is_valid_sample_fn(running_items):
                     completed_sample_count += 1
-                self.mark_expired_samples(items)
-                await replay_buffer.put(items, task_name)
+                self.mark_expired_samples(running_items)
+                await replay_buffer.put(running_items, task_name)
+                logger.info(
+                    f"Collected {completed_sample_count}/{batch_size} valid samples for task {task_name}. group_staleness: {max(item.seq_staleness for item in running_items)}, Current completed samples in replay buffer: {await replay_buffer.count(task_name=task_name, group_status=Status.COMPLETED)}."
+                )
 
             while len(
                 pending_tasks
@@ -233,24 +236,47 @@ class AsyncProduceStrategy(ProduceStrategy):
         if len(pending_tasks) > 0:
             await pause_generation(rollout_ctl)
             while len(pending_tasks) > 0:
-                _, pending_tasks = await asyncio.wait(pending_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+                done_task, pending_tasks = await asyncio.wait(
+                    pending_tasks, timeout=1, return_when=asyncio.FIRST_COMPLETED
+                )
+
+                for task in done_task:
+                    paused_items: list[RolloutState] = task.result()
+                    self.mark_expired_samples(paused_items)
+                    for item in paused_items:
+                        logger.info(
+                            f"Collecting aborted sample {item.uid} with {item.status} status after pausing env controller, length of response_ids: {len(item.response_ids)}."
+                        )
+                    await replay_buffer.put(paused_items, task_name)
                 if len(pending_tasks) > 0:
                     await pause_generation(rollout_ctl)
                     await asyncio.sleep(1)
-        print("All worker tasks have completed after pausing env controller.")
+
+        completed_sample_count = await replay_buffer.count(task_name=task_name, group_status=Status.COMPLETED)
+        aborted_sample_count = await replay_buffer.count(task_name=task_name, group_status=Status.ABORTED)
+        expired_sample_count = await replay_buffer.count(task_name=task_name, group_status=Status.EXPIRED)
+        logger.info(
+            f"Finished AsyncProduceStrategy for task {task_name}. Final counts - Completed: {completed_sample_count}, Aborted: {aborted_sample_count}, Expired: {expired_sample_count}."
+        )
+        logger.info("All worker tasks have completed after pausing env controller.")
 
     async def recycle_remaining_completed(self, replay_buffer: ReplayBuffer, task_name: str) -> None:
-        recycle_batch_size = 128
-        while True:
-            remaining_completed = await replay_buffer.get(recycle_batch_size, task_name, Status.COMPLETED)
-            if not remaining_completed:
-                break
+        if self.tail_batch_stale_threshold == 0 or self.enable_partial_rollout:
+            logger.info(
+                "Tail batch stale threshold is 0 or partial rollout is enabled, skipping recycling of remaining completed samples."
+            )
+            return
 
-            for group in remaining_completed:
-                for sample in group:
-                    if self.tail_batch_stale_threshold > 0 and sample.seq_staleness > self.tail_batch_stale_threshold:
-                        sample.status = Status.EXPIRED
-                    if not self.enable_partial_rollout:
-                        sample.status = Status.ABORTED
-                        sample.clear_response()
-                await replay_buffer.put(group, task_name)
+        remaining_completed_count = await replay_buffer.count(task_name=task_name, group_status=Status.COMPLETED)
+        remaining_completed = await replay_buffer.get(remaining_completed_count, task_name, Status.COMPLETED)
+        logger.info(f"Recycling batch of {remaining_completed_count} completed samples for task {task_name}.")
+        if not remaining_completed:
+            return
+
+        for group in remaining_completed:
+            for sample in group:
+                if self.tail_batch_stale_threshold > 0 and sample.seq_staleness > self.tail_batch_stale_threshold:
+                    sample.status = Status.EXPIRED
+                if not self.enable_partial_rollout:
+                    sample.status = Status.ABORTED
+            await replay_buffer.put(group, task_name)

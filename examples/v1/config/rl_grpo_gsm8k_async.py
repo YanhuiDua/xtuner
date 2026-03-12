@@ -39,14 +39,14 @@ global_batch_size = 64 * train_optimizer_steps
 prompt_repeat_k = 5
 rollout_tp_size = 1
 rollout_ep_size = 1
-max_prompt_length = 512
-max_response_length = 1024
-pack_max_length = 32 * 1024
+max_prompt_length = 2048
+max_response_length = 8192
+pack_max_length = 10 * 1024
 
 # 1. resources
 resources = AcceleratorResourcesConfig(
     accelerator="GPU",
-    num_workers=8 * WORLD_SIZE,
+    num_workers=1 * WORLD_SIZE,
     num_cpus_per_worker=12,
     cpu_memory_per_worker=16 * 1024**3,  # 16 GB
 )
@@ -130,8 +130,8 @@ agent_loop_config = SingleTurnAgentLoopConfig(
     sample_params=training_sample_params,
 )
 produce_strategy_config = AsyncProduceStrategyConfig(
-    over_sample_threshold = 0.2,
-    enable_partial_rollout = False,
+    over_sample_threshold = 0.8,
+    enable_partial_rollout = True,
     tail_batch_stale_threshold=0,
     tail_batch_trigger_size=0
 )

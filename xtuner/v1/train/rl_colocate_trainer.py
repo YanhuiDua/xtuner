@@ -456,10 +456,13 @@ class RLColocateTrainer:
                 response_len_list.append(len(response_ids))
 
                 # 根据 response_mask 计算 response_ids 对应的shifted_labels
-                if group[i].response_mask is None:
+                if group[i].response_mask is None or len(group[i].response_mask) == 0:
                     response_mask = [1] * len(response_ids)
                     response_labels = response_ids
                 else:
+                    assert len(group[i].response_mask) == len(response_ids), (
+                        f"{len(group[i].response_mask)} vs {len(response_ids)}"
+                    )
                     response_mask = cast(list[int], group[i].response_mask)
                     response_labels = [
                         response_id if mask_id != 0 else -100

@@ -68,7 +68,7 @@ class RolloutState(CacheObj, BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     # --- 数据 ---
-    message_uid: int | None = None  # 通过计算原始的message的哈希值得到的id，一组的数据为同一个prompt_id
+    message_uid: str | None = None  # 通过计算原始的message的哈希值得到的id，一组的数据为同一个prompt_id
     message: list[dict[str, Any]]  # dataset输出，需要在AgentLoop中转换成input_ids
     prompt_ids: list[int] | None = None  # 原始 prompt的token ids
     data_source: dict[str, Any] | str | None = None
@@ -94,6 +94,7 @@ class RolloutState(CacheObj, BaseModel):
     reward: dict[str, Any] | None = None
 
     #  --- 状态 ---
+    uid: int | None = None
     task_name: str | None = None
     status: Status = Status.INIT
     error_msg: str | None = None
@@ -117,16 +118,6 @@ class RolloutState(CacheObj, BaseModel):
         if type(value).__name__ == "ObjectRef" and "ray" in getattr(type(value), "__module__", ""):
             return None
         return value  # list[int]
-
-    def clear_response(self) -> None:
-        """清除与模型输出相关的字段，通常在续写时使用，以避免旧的输出干扰新的推理过程。"""
-        self.response = None
-        self.response_ids = None
-        self.logprobs = None
-        self.routed_experts = None
-        self.finish_reason = None
-        self.response_mask = None
-        self.response_steps = None
 
 
 def update_status_from_finish_reason(finish_reason: str | None) -> Status:

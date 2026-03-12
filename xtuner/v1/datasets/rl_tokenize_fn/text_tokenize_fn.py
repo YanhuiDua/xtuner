@@ -1,4 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import hashlib
+import json
+
 from pydantic import BaseModel, ConfigDict
 
 from transformers import PreTrainedTokenizer
@@ -61,9 +64,13 @@ class RLTextTokenizeFn(CachableTokenizeFunction[RolloutState]):
             if self.max_length is not None:
                 assert num_tokens <= self.max_length, f"num_tokens {num_tokens} > max_length {self.max_length}"
 
+        message_str = json.dumps(message, sort_keys=True)
+        message_uid_hash = hashlib.md5(message_str.encode("utf-8")).hexdigest()
+
         rollout_state = RolloutState(
             prompt_ids=prompt_token_ids,
             message=message,
+            message_uid=message_uid_hash,
             data_source=item.get("data_source", "default"),
             reward_model=item.get("reward_model", {}),
             num_tokens=num_tokens,

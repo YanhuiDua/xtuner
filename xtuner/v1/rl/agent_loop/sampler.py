@@ -1,4 +1,5 @@
 from typing import Iterator, Optional, cast
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 
@@ -7,6 +8,10 @@ from xtuner.v1.data_proto.rl_data import RolloutState, Status
 from xtuner.v1.datasets.config import DataloaderConfig
 from xtuner.v1.datasets.dataloader import Dataloader
 from xtuner.v1.rl.replay_buffer import ReplayBuffer
+from xtuner.v1.utils import get_logger
+
+
+logger = get_logger()
 
 
 class SamplerConfig(BaseModel):
@@ -48,7 +53,13 @@ class _DatasetSampler:
             self.dataloader.set_epoch(self.cur_epoch)
             self.dataloader_iter = iter(self.dataloader)
             data = next(self.dataloader_iter)[0]
-        group_data = [data] * self.prompt_repeat_k
+        import copy
+
+        group_data = []
+        for _ in range(self.prompt_repeat_k):
+            new_data = copy.deepcopy(data)
+            new_data.uid = uuid4().int
+            group_data.append(new_data)
         return cast(list[RolloutState], group_data)
 
 
@@ -70,6 +81,9 @@ class Sampler(_DatasetSampler):
         for status in statuses_to_check:
             buffer_data = await self.replay_buffer.get(1, task_name=task_name, group_status=status)
             if buffer_data:
+                logger.info(
+                    f"Sampled {len(buffer_data)} items with {status} status from replay buffer for task {task_name}."
+                )
                 return buffer_data[0]
 
         return self.sample_from_dataloader()
