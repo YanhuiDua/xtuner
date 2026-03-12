@@ -13,7 +13,7 @@ from xtuner.v1.rl.agent_loop.agent_loop import SingleTurnAgentLoop
 from xtuner.v1.rl.agent_loop.producer import AsyncProduceStrategy
 from xtuner.v1.rl.replay_buffer import AsyncReplayBufferConfig
 from xtuner.v1.rl.rollout import RolloutController
-from xtuner.v1.rl.rollout.worker import RolloutConfig
+from xtuner.v1.rl.rollout.worker import RolloutConfig, get_eos_token
 from xtuner.v1.rl.utils import AcceleratorResourcesConfig, AutoAcceleratorWorkers
 
 
@@ -83,7 +83,9 @@ class TestAsyncRolloutRealAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out_len.response_ids, [11, 12, 13, 14, 15, 16, 17, 18])
 
         # case 2: EOS already reached in partial rollout -> response_ids should remain unchanged
-        eos_id = agent_loop.eos_tokens[0]
+        # EOS id comes from rollout-worker side source to ensure worker can perceive it.
+        worker_eos = get_eos_token(model_path)
+        eos_id = worker_eos[0] if isinstance(worker_eos, list) else worker_eos
         state_eos = self._make_state(2, "Say hi again", max_tokens=16)
         state_eos.status = Status.ABORTED
         state_eos.response_ids = [31, eos_id]
@@ -91,6 +93,19 @@ class TestAsyncRolloutRealAgentLoop(unittest.IsolatedAsyncioTestCase):
 
         out_eos = await agent_loop._generate_pipeline(state_eos, rollout_step=2, enable_partial_rollout=True)
         self.assertEqual(out_eos.response_ids, [31, eos_id])
+
+        # case 3: after multiple partial rollouts, response_ids length should never exceed initial max_tokens
+        total_max_tokens = 16
+        multi = self._make_state(3, "Count from one.", max_tokens=total_max_tokens)
+        multi.status = Status.ABORTED
+        multi.response_ids = [41, 42]
+        multi.response = "start"
+
+        for step in range(3, 9):
+            multi.status = Status.ABORTED
+            multi = await agent_loop._generate_pipeline(multi, rollout_step=step, enable_partial_rollout=True)
+
+        self.assertLessEqual(len(multi.response_ids), total_max_tokens)
 
     async def test_real_oversampling_round_consistency(self):
         class RealSampler:
