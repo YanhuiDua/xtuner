@@ -1,7 +1,9 @@
 import asyncio
+import pickle
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, fields, replace
 from itertools import count
+from pathlib import Path
 from typing import Any, List, TypeAlias, Union
 
 import pandas as pd
@@ -62,6 +64,12 @@ class StorageBackend(ABC):
 
     @abstractmethod
     def __len__(self) -> int: ...
+
+    @abstractmethod
+    def state_dict(self) -> dict[str, Any]: ...
+
+    @abstractmethod
+    def load_state_dict(self, state: dict[str, Any]) -> None: ...
 
 
 class ReplayPolicy(ABC):
@@ -144,6 +152,21 @@ class NaiveStorage(StorageBackend):
 
     def __len__(self) -> int:
         return len(self._items)
+
+    def state_dict(self) -> dict[str, Any]:
+        max_uid = max(self._items, default=0)
+        max_timestamp_id = max((item.timestamp_id for item in self._items.values()), default=0)
+        return {
+            "items": list(self._items.values()),
+            "next_uid": max_uid + 1,
+            "next_timestamp_id": max_timestamp_id + 1,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        items: list[StorageItem] = state["items"]
+        self._items = {item.uid: item for item in items}
+        self._uid_gen = count(state["next_uid"])
+        self._timestamp_id_gen = count(state["next_timestamp_id"])
 
 
 class PandasStorage(StorageBackend):
@@ -257,6 +280,22 @@ class PandasStorage(StorageBackend):
     def __len__(self) -> int:
         return len(self._df) + len(self._buffer)
 
+    def state_dict(self) -> dict[str, Any]:
+        self._flush_buffer()
+        max_uid = int(self._df["uid"].max()) if not self._df.empty else 0
+        max_timestamp_id = int(self._df["timestamp_id"].max()) if not self._df.empty else 0
+        return {
+            "df": self._df.copy(deep=True),
+            "next_uid": max_uid + 1,
+            "next_timestamp_id": max_timestamp_id + 1,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self._df = state["df"].copy(deep=True)
+        self._buffer = []
+        self._uid_gen = count(state["next_uid"])
+        self._timestamp_id_gen = count(state["next_timestamp_id"])
+
 
 class FIFOBackend(ReplayPolicy):
     async def put(self, item: StorageItem, storage_backend: StorageBackend) -> None:
@@ -330,6 +369,34 @@ class ReplayBuffer:
 
     def __len__(self) -> int:
         return len(self._storage)
+
+    async def save(self, path: str | Path) -> None:
+        file_path = Path(path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        async with self._lock:
+            state = {
+                "policy": type(self._policy).__name__,
+                "storage": type(self._storage).__name__,
+                "storage_state": self._storage.state_dict(),
+            }
+        with open(file_path, "wb") as f:
+            pickle.dump(state, f)
+
+    async def resume(self, path: str | Path) -> None:
+        file_path = Path(path)
+        with open(file_path, "rb") as f:
+            state = pickle.load(f)
+
+        if state["policy"] != type(self._policy).__name__:
+            raise ValueError(f"Replay policy mismatch: expected {type(self._policy).__name__}, got {state['policy']}")
+
+        if state["storage"] != type(self._storage).__name__:
+            raise ValueError(
+                f"Storage backend mismatch: expected {type(self._storage).__name__}, got {state['storage']}"
+            )
+
+        async with self._lock:
+            self._storage.load_state_dict(state["storage_state"])
 
 
 class SyncReplayBufferConfig(BaseModel):
