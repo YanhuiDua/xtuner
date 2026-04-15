@@ -2,7 +2,7 @@ import asyncio
 import os
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, TypeAlias, TypedDict
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeAlias, TypedDict
 from uuid import uuid4
 
 import ray
@@ -17,6 +17,10 @@ from .reasoning_parser import ReasoningParser
 from .tool_call_parser import ToolCallParser
 from .utils import ROLLOUT_RAY_GET_TIMEOUT, RolloutHealthChecker, SessionRouter
 from .worker import RolloutConfig, RolloutWorker
+
+
+if TYPE_CHECKING:
+    from xtuner.v1.rl.gateway.config import GatewayConfig
 
 
 @dataclass
@@ -54,6 +58,10 @@ class RolloutWorkerMetadata(TypedDict):
     # 键：服务器 URL 字符串
     # 值：布尔值，True 表示该 worker 处于活跃状态，False 表示已失效或停用
     worker_server_urls_status: Dict[str, bool]
+
+    # Gateway HTTP server URL (e.g. "http://1.2.3.4:8080").
+    # Set after start_gateway() is called; None if the gateway has not been started.
+    api_server_url: Optional[str]
 
 
 class RolloutController:
@@ -98,6 +106,31 @@ class RolloutController:
         self.health_checker.start()
         self._tool_call_parser: ToolCallParser | None = None
         self._reasoning_parser: ReasoningParser | None = None
+        self._gateway_url: str | None = None
+
+    def start_gateway(self, config: "GatewayConfig") -> str:
+        """Start the gateway HTTP server in a daemon thread and return its URL.
+
+        The gateway exposes OpenAI-compatible endpoints that forward requests to
+        this controller via :class:`~xtuner.v1.rl.gateway.backend.local_backend.LocalRolloutBackend`.
+        Agent loops (e.g. CamelAgentLoop) discover the URL via :meth:`get_rollout_metadata`.
+
+        Args:
+            config: Gateway configuration.  ``port`` and ``host`` control where
+                the server binds; ``capture_path`` enables per-request trace files.
+
+        Returns:
+            The base URL of the gateway, e.g. ``"http://1.2.3.4:8080"``.
+        """
+        from xtuner.v1.rl.gateway import build_local_gateway_app, serve_gateway_in_thread
+
+        app = build_local_gateway_app(self, config=config)
+        serve_gateway_in_thread(app, config)
+        node_ip = ray.util.get_node_ip_address()
+        url = f"http://{node_ip}:{config.port}"
+        self._gateway_url = url
+        self.logger.info(f"Gateway server started at {url}")
+        return url
 
     def get_rollout_metadata(self) -> RolloutWorkerMetadata:
         """Get information about the current rollout setup.
@@ -113,6 +146,7 @@ class RolloutController:
             "server_url_dict": self.worker_server_urls_map,
             "rollout_config": self.config,
             "worker_server_urls_status": worker_server_urls_status,
+            "api_server_url": self._gateway_url,
         }
         return rollout_metadata
 

@@ -18,16 +18,13 @@ from xtuner.v1.rl.gateway.adapters import (
     ResponsesResponse,
 )
 from xtuner.v1.rl.gateway import build_local_gateway_app
+from xtuner.v1.rl.gateway.config import GatewayConfig
 from xtuner.v1.rl.rollout import RolloutController
 from xtuner.v1.rl.rollout.worker import RolloutConfig
 from xtuner.v1.rl.utils import AcceleratorResourcesConfig, AutoAcceleratorWorkers
 
 
 MODEL_PATH = os.environ["ROLLOUT_MODEL_PATH"]
-CAPTURE_OUTPUT_PATH = Path(__file__).with_name("gateway_capture_output.jsonl")
-OPENAI_BODY_OUTPUT_PATH = Path(__file__).with_name("openai_body.json")
-ANTHROPIC_BODY_OUTPUT_PATH = Path(__file__).with_name("anthropic_body.json")
-RESPONSES_BODY_OUTPUT_PATH = Path(__file__).with_name("responses_body.json")
 RESOURCE_MAP = {
     "npu": "NPU",
     "cuda": "GPU",
@@ -50,6 +47,10 @@ class TestGatewayProtocolChain(unittest.TestCase):
         ray.init(address="local", ignore_reinit_error=True)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.worker_log_dir = os.path.join(self.temp_dir.name, "work_dirs")
+        self.capture_output_path = Path(self.temp_dir.name) / "gateway_capture_output.jsonl"
+        self.openai_body_output_path = Path(self.temp_dir.name) / "openai_body.json"
+        self.anthropic_body_output_path = Path(self.temp_dir.name) / "anthropic_body.json"
+        self.responses_body_output_path = Path(self.temp_dir.name) / "responses_body.json"
         self.controller = None
         self.placement_group = None
         self._capture_line_count_before = self._read_capture_records_count()
@@ -99,15 +100,15 @@ class TestGatewayProtocolChain(unittest.TestCase):
         return RolloutController(rollout_config, self.placement_group)
 
     def _read_capture_records_count(self) -> int:
-        if not CAPTURE_OUTPUT_PATH.exists():
+        if not self.capture_output_path.exists():
             return 0
-        with CAPTURE_OUTPUT_PATH.open("r", encoding="utf-8") as f:
+        with self.capture_output_path.open("r", encoding="utf-8") as f:
             return sum(1 for _ in f)
 
     def _read_new_capture_records(self) -> list[dict]:
-        if not CAPTURE_OUTPUT_PATH.exists():
+        if not self.capture_output_path.exists():
             return []
-        with CAPTURE_OUTPUT_PATH.open("r", encoding="utf-8") as f:
+        with self.capture_output_path.open("r", encoding="utf-8") as f:
             lines = f.readlines()
         return [json.loads(line) for line in lines[self._capture_line_count_before :]]
 
@@ -144,7 +145,7 @@ class TestGatewayProtocolChain(unittest.TestCase):
         self.controller = self._build_controller()
         app = build_local_gateway_app(
             self.controller,
-            capture_path=str(CAPTURE_OUTPUT_PATH),
+            config=GatewayConfig(port=8080, capture_path=str(self.capture_output_path)),
         )
 
         openai_payload = {
@@ -294,7 +295,7 @@ class TestGatewayProtocolChain(unittest.TestCase):
             openai_response = client.post("/v1/chat/completions", json=openai_payload)
             self.assertEqual(openai_response.status_code, 200, openai_response.text)
             openai_body = openai_response.json()
-            self._write_json_output(OPENAI_BODY_OUTPUT_PATH, openai_body)
+            self._write_json_output(self.openai_body_output_path, openai_body)
             print("openai_body:", json.dumps(openai_body, ensure_ascii=False, indent=2))
             self.assertEqual(openai_body["model"], self.controller.config.model_name)
             self.assertEqual(openai_body["choices"][0]["message"]["role"], "assistant")
@@ -306,7 +307,7 @@ class TestGatewayProtocolChain(unittest.TestCase):
             anthropic_response = client.post("/v1/messages", json=anthropic_payload)
             self.assertEqual(anthropic_response.status_code, 200, anthropic_response.text)
             anthropic_body = anthropic_response.json()
-            self._write_json_output(ANTHROPIC_BODY_OUTPUT_PATH, anthropic_body)
+            self._write_json_output(self.anthropic_body_output_path, anthropic_body)
             print("anthropic_body:", json.dumps(anthropic_body, ensure_ascii=False, indent=2))
             self.assertEqual(anthropic_body["type"], "message")
             self.assertEqual(anthropic_body["role"], "assistant")
@@ -317,7 +318,7 @@ class TestGatewayProtocolChain(unittest.TestCase):
             responses_response = client.post("/v1/responses", json=responses_payload)
             self.assertEqual(responses_response.status_code, 200, responses_response.text)
             responses_body = responses_response.json()
-            self._write_json_output(RESPONSES_BODY_OUTPUT_PATH, responses_body)
+            self._write_json_output(self.responses_body_output_path, responses_body)
             print("responses_body:", json.dumps(responses_body, ensure_ascii=False, indent=2))
             self.assertEqual(responses_body["object"], "response")
             self.assertEqual(responses_body["model"], self.controller.config.model_name)
@@ -407,7 +408,7 @@ class TestGatewayProtocolChain(unittest.TestCase):
         self.controller = self._build_controller()
         app = build_local_gateway_app(
             self.controller,
-            capture_path=str(CAPTURE_OUTPUT_PATH),
+            config=GatewayConfig(port=8080, capture_path=str(self.capture_output_path)),
         )
 
         with TestClient(app) as client:
@@ -438,7 +439,7 @@ class TestGatewayProtocolChain(unittest.TestCase):
         self.controller = self._build_controller()
         app = build_local_gateway_app(
             self.controller,
-            capture_path=str(CAPTURE_OUTPUT_PATH),
+            config=GatewayConfig(port=8080, capture_path=str(self.capture_output_path)),
         )
 
         openai_payload = {
@@ -659,7 +660,7 @@ class TestGatewayProtocolChain(unittest.TestCase):
         self.controller = self._build_controller()
         app = build_local_gateway_app(
             self.controller,
-            capture_path=str(CAPTURE_OUTPUT_PATH),
+            config=GatewayConfig(port=8080, capture_path=str(self.capture_output_path)),
         )
         overflow_prompt = "Beijing weather " * max(self.controller.config.context_length, 1)
         openai_payload = {

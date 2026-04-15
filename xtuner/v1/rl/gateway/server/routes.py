@@ -17,7 +17,27 @@ from ..adapters import (
 from ..adapters.responses import OpenAIResponsesAdapter
 from ..backend.protocol import GatewayBackend
 from ..core.exceptions import GatewayStateError
-from .factory import get_anthropic_adapter, get_openai_adapter, get_responses_adapter
+
+
+def get_openai_adapter(request: Request) -> OpenAIChatAdapter:
+    adapter = getattr(request.app.state, "gateway_openai_adapter", None)
+    if adapter is None:
+        raise GatewayStateError("Gateway OpenAI adapter is not configured.")
+    return cast(OpenAIChatAdapter, adapter)
+
+
+def get_anthropic_adapter(request: Request) -> AnthropicChatAdapter:
+    adapter = getattr(request.app.state, "gateway_anthropic_adapter", None)
+    if adapter is None:
+        raise GatewayStateError("Gateway Anthropic adapter is not configured.")
+    return cast(AnthropicChatAdapter, adapter)
+
+
+def get_responses_adapter(request: Request) -> OpenAIResponsesAdapter:
+    adapter = getattr(request.app.state, "gateway_responses_adapter", None)
+    if adapter is None:
+        raise GatewayStateError("Gateway Responses adapter is not configured.")
+    return cast(OpenAIResponsesAdapter, adapter)
 
 
 # ---------------------------------------------------------------------------

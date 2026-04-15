@@ -1,5 +1,13 @@
 from .backend.local_backend import LocalRolloutBackend
-from .server.app import build_local_gateway_app
+from .config import GatewayConfig
+from .server import build_gateway_app, build_local_gateway_app, serve_gateway, serve_gateway_in_thread
 
 
-__all__ = ["LocalRolloutBackend", "build_local_gateway_app"]
+__all__ = [
+    "GatewayConfig",
+    "LocalRolloutBackend",
+    "build_gateway_app",
+    "build_local_gateway_app",
+    "serve_gateway",
+    "serve_gateway_in_thread",
+]
