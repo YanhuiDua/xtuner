@@ -13,6 +13,8 @@ from xtuner.v1.data_proto.rl_data import RolloutState, Status
 from xtuner.v1.rl.utils import AutoAcceleratorWorkers
 from xtuner.v1.utils import get_logger
 
+from .reasoning_parser import ReasoningParser
+from .tool_call_parser import ToolCallParser
 from .utils import ROLLOUT_RAY_GET_TIMEOUT, RolloutHealthChecker, SessionRouter
 from .worker import RolloutConfig, RolloutWorker
 
@@ -94,6 +96,8 @@ class RolloutController:
             worker_infos_lock=self.worker_info_lock,
         )
         self.health_checker.start()
+        self._tool_call_parser: ToolCallParser | None = None
+        self._reasoning_parser: ReasoningParser | None = None
 
     def get_rollout_metadata(self) -> RolloutWorkerMetadata:
         """Get information about the current rollout setup.
@@ -111,6 +115,21 @@ class RolloutController:
             "worker_server_urls_status": worker_server_urls_status,
         }
         return rollout_metadata
+
+    def configure_output_parsers(
+        self,
+        tool_call_parser: ToolCallParser | None = None,
+        reasoning_parser: ReasoningParser | None = None,
+    ) -> None:
+        """Configure parsers that will be applied automatically after each
+        generate() call.
+
+        Args:
+            tool_call_parser: Parser to extract structured tool calls from model output.
+            reasoning_parser: Parser to extract reasoning traces from model output.
+        """
+        self._tool_call_parser = tool_call_parser
+        self._reasoning_parser = reasoning_parser
 
     def get_ready_status(self) -> tuple[bool, dict[str, Any]]:
         with self.worker_info_lock:
@@ -134,6 +153,7 @@ class RolloutController:
             response_rollout_state = await asyncio.wait_for(
                 response_ref, timeout=self.config.rollout_timeout * self.timeout_multiplier
             )
+            self._apply_output_parsers(response_rollout_state)
             return response_rollout_state
         except asyncio.TimeoutError:
             self.logger.error(f"Rollout timeout for worker {worker}. Skipping sample.")
@@ -142,6 +162,21 @@ class RolloutController:
                 f"Rollout request timed out after {self.config.rollout_timeout * self.timeout_multiplier} seconds."
             )
             return rollout_state
+
+    def _apply_output_parsers(self, rollout_state: RolloutState) -> None:
+        """Apply tool-call and reasoning parsers to the rollout state in-
+        place."""
+        if self._tool_call_parser is not None:
+            parsed = self._tool_call_parser.parse(rollout_state)
+            rollout_state.tool_calls = parsed.tool_calls
+            rollout_state.response = parsed.remaining_text or None
+        if self._reasoning_parser is not None:
+            parsed_reasoning = self._reasoning_parser.parse(rollout_state)
+            rollout_state.response = parsed_reasoning.remaining_text
+            if parsed_reasoning.reasoning_text:
+                rollout_state.extra_fields["reasoning_text"] = parsed_reasoning.reasoning_text
+            else:
+                rollout_state.extra_fields.pop("reasoning_text", None)
 
     def pause_generation(self):
         self.health_checker.pause()
