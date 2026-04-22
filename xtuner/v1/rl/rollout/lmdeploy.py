@@ -1,7 +1,7 @@
 import os
 from argparse import Namespace
 from itertools import chain
-from typing import List
+from typing import Any, Dict, List
 
 import ray
 import requests

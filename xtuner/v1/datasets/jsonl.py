@@ -23,7 +23,9 @@ from torch import distributed as dist
 from tqdm import tqdm
 
 from xtuner.v1.datasets.data_item import CacheItem
+from xtuner.v1.datasets.pt_tokenize_fn.long_text import LongTextPretrainTokenizeFunction
 from xtuner.v1.utils import CacheDict, CacheObj, SharedMemory, get_logger
+from xtuner.v1.utils.dist_utils import get_local_process_group, get_local_world_size, is_local_rank0
 
 from .utils import CachableTokenizeFunction, calculate_xxhash
 
@@ -360,9 +362,12 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
             assert isinstance(max_length, int)
             _filtered = [i for i in _sampled if num_tokens[i] <= max_length]
 
-            if len(_filtered) < len(_sampled):
-                missed_num = len(_sampled) - len(_filtered)
-                logger.warning(f"{self.path} has {missed_num} prompt length>{max_length}, discard.")
+        tok_hash_str = ""
+        if isinstance(tokenize_fn, CachableTokenizeFunction):
+            try:
+                tok_hash_str = tokenize_fn.hash()
+            except (NotImplementedError, ValueError):
+                tok_hash_str = tokenize_fn.__class__.__name__
 
             _sampled = _filtered
 
@@ -445,9 +450,16 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
         tokenized = tokenize_fn(json.loads(line))
         if isinstance(tokenized, CacheObj):
             num_tokens = tokenized.num_tokens
+            proxy_attn_flops = getattr(tokenized, "proxy_attn_flops", None)
         else:
             num_tokens = tokenized["num_tokens"]
-        return {"num_tokens": num_tokens}
+            proxy_attn_flops = tokenized.get("proxy_attn_flops")
+        if proxy_attn_flops is None:
+            proxy_attn_flops = num_tokens
+        res = {"num_tokens": num_tokens, "proxy_attn_flops": proxy_attn_flops}
+        if not isinstance(tokenized, CacheObj) and "chunks" in tokenized:
+            res["chunks"] = tokenized["chunks"]
+        return res
 
     def count_tokens(self, offsets, cache_dir=None):
         self.tokenize_fn.set_state("cache")
