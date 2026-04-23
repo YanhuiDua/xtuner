@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from mmengine import mkdir_or_exist
 from mmengine.dist import barrier, get_rank
+from pydantic import BaseModel
 from torch import distributed as dist
 from tqdm import tqdm
 
@@ -364,10 +365,7 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
 
         tok_hash_str = ""
         if isinstance(tokenize_fn, CachableTokenizeFunction):
-            try:
-                tok_hash_str = tokenize_fn.hash()
-            except (NotImplementedError, ValueError):
-                tok_hash_str = tokenize_fn.__class__.__name__
+            tok_hash_str = tokenize_fn.hash()
 
             _sampled = _filtered
 
@@ -444,22 +442,28 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
     @staticmethod
     def _tokenize_by_offset(
         data: bytes,
-        tokenize_fn: Callable[[dict], CacheDict | CacheObj],
+        tokenize_fn: Callable[[dict], CacheItem | BaseModel],
     ) -> dict:
         line = data.decode()
         tokenized = tokenize_fn(json.loads(line))
-        if isinstance(tokenized, CacheObj):
-            num_tokens = tokenized.num_tokens
+        if isinstance(tokenized, dict):
+            return cast(dict, tokenized)
+        if isinstance(tokenized, BaseModel):
+            # RL tokenize functions return RolloutState, a Pydantic model,
+            # during cache building. Extract cache metadata here so those
+            # tokenizers do not need to return a separate CacheItem dict.
+            num_tokens = getattr(tokenized, "num_tokens", None)
+            if num_tokens is None:
+                raise TypeError(f"{type(tokenized).__name__} must provide `num_tokens` for dataset cache.")
             proxy_attn_flops = getattr(tokenized, "proxy_attn_flops", None)
-        else:
-            num_tokens = tokenized["num_tokens"]
-            proxy_attn_flops = tokenized.get("proxy_attn_flops")
-        if proxy_attn_flops is None:
-            proxy_attn_flops = num_tokens
-        res = {"num_tokens": num_tokens, "proxy_attn_flops": proxy_attn_flops}
-        if not isinstance(tokenized, CacheObj) and "chunks" in tokenized:
-            res["chunks"] = tokenized["chunks"]
-        return res
+            if proxy_attn_flops is None:
+                proxy_attn_flops = float(num_tokens)
+            res = {"num_tokens": num_tokens, "proxy_attn_flops": proxy_attn_flops}
+            chunks = getattr(tokenized, "chunks", None)
+            if chunks is not None:
+                res["chunks"] = chunks
+            return res
+        raise TypeError(f"{type(tokenized).__name__} must be a CacheItem-like dict or a Pydantic model.")
 
     def count_tokens(self, offsets, cache_dir=None):
         self.tokenize_fn.set_state("cache")
