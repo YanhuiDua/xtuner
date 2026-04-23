@@ -1,9 +1,7 @@
 import torch
 from typing_extensions import TypedDict
 
-
-class CacheItem(TypedDict):
-    num_tokens: int
+from xtuner.v1.data_proto.cache_item import CacheItem
 
 
 class DataItem(CacheItem):

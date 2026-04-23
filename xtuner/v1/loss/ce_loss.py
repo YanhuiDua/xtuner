@@ -7,10 +7,11 @@ import torch.nn.functional as F
 from cyclopts import Parameter
 from torch.distributed.device_mesh import DeviceMesh
 
-from xtuner.v1.loss import BaseLossConfig, BaseLossContext, BaseLossKwargs
 from xtuner.v1.utils.device import get_device
 
 # from xtuner.v1.profiler.prober import ProberList
+from .base_loss_ctx import BaseLossConfig, BaseLossContext, BaseLossKwargs
+from .chunk_loss import ChunkLoss
 from .utils import sp_gather, sp_split
 
 
