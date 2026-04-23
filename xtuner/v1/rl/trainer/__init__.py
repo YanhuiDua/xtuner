@@ -5,7 +5,7 @@ from ..rollout_is import (
     compute_rollout_importance_weights,
     merge_rollout_is_metrics,
 )
-from .controller import ColateItem, RawTrainingController, TrainingController, TrainingControllerProxy
+from .controller import ColateItem, TrainingController
 from .worker import TrainingWorker, WorkerConfig, WorkerInputItem, WorkerLogItem, WorkerTrainLogItem
 
 
