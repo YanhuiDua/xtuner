@@ -20,7 +20,7 @@ TRAIN_RAY_GET_TIMEOUT = os.getenv("XTUNER_TRAIN_RAY_GET_TIMEOUT", 5 * 3600)  # d
 class ColateItem(TypedDict):
     seq_ctx: SequenceContext
     shifted_labels: torch.Tensor
-    advantage: float
+    advantage: list[float] | torch.Tensor
     rollout_logprobs: torch.Tensor | None
 
 
@@ -92,7 +92,19 @@ class TrainingController:
             pad_len = pack_max_length - total_len
             seq_ctx_list = [data_batches[i]["seq_ctx"] for i in indices]
             label_list = [data_batches[i]["shifted_labels"] for i in indices]
-            advantage_list = [data_batches[i]["advantage"] for i in indices]
+            advantage_list = []
+            for i in indices:
+                raw_advantage = data_batches[i]["advantage"]
+                if isinstance(raw_advantage, torch.Tensor):
+                    sample_advantage = raw_advantage.flatten().float().tolist()
+                elif isinstance(raw_advantage, list):
+                    sample_advantage = list(raw_advantage)
+                else:
+                    raise TypeError(f"advantage must be a token-level tensor or list, got {type(raw_advantage)}")
+                assert len(sample_advantage) == data_batches[i]["shifted_labels"].numel(), (
+                    f"{len(sample_advantage)} vs {data_batches[i]['shifted_labels'].numel()}"
+                )
+                advantage_list.append(sample_advantage)
 
             rollout_logprobs_list = None
             if "rollout_logprobs" in data_batches[0] and data_batches[0]["rollout_logprobs"] is not None:
@@ -116,7 +128,6 @@ class TrainingController:
                     dtype=data_batches[0]["shifted_labels"].dtype,
                     device=data_batches[0]["shifted_labels"].device,
                 )
-                pad_advantages = [-100] * pad_len
                 if is_qwen3_vl:
                     _position_ids_list = []
                     for pad_token in pad_tokens:
@@ -130,7 +141,7 @@ class TrainingController:
 
                 seq_ctx_list.append(pad_seq_ctx)
                 label_list.append(pad_labels)
-                advantage_list.append(pad_advantages)
+                advantage_list.append([-100] * pad_len)
                 if rollout_logprobs_list is not None:
                     pad_rollout_logprobs = torch.zeros(
                         1,

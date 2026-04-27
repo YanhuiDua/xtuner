@@ -84,7 +84,13 @@ class _DatasetSampler:
             if XTUNER_DETERMINISTIC:
                 new_data.message_uid = message_uid
                 new_data.uid = uid_base + item_idx
-                new_data.session_uid = new_data.uid
+                new_data.extra_fields.update(
+                    {
+                        "deterministic_root_id": uid_base,
+                        "deterministic_action_id": uid_base,
+                        "deterministic_observation_id": new_data.uid,
+                    }
+                )
             else:
                 new_data.uid = uuid4().int
             group_data.append(new_data)
@@ -108,8 +114,13 @@ class Sampler(_DatasetSampler):
         for status in group_status or []:
             buffer_data = await self.replay_buffer.get(1, task_name=task_name, group_status=status)
             if buffer_data:
+                for item in buffer_data[0]:
+                    item.task_name = task_name
                 return buffer_data[0]
-        return self.sample_from_dataloader()
+        sampled_data = self.sample_from_dataloader()
+        for item in sampled_data:
+            item.task_name = task_name
+        return sampled_data
 
     def save(self, checkpoint_path: Path | str) -> None:
         """Save the sampler's dataloader state to checkpoint."""

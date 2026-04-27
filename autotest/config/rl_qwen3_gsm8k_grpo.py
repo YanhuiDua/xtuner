@@ -38,9 +38,9 @@ enable_return_routed_experts = os.environ.get("ENABLE_RETURN_ROUTED_EXPERTS", "0
 WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 
 # basic settings
-experimental_name = "grpo_gsm8k"
+experimental_name = "grpo_gsm8k_tiny"
 total_train_steps = 45
-evaluate_step = 45
+evaluate_step = 15
 train_optimizer_steps = 1
 train_batch_size = 64 * train_optimizer_steps
 prompt_repeat_k = 5
@@ -66,7 +66,7 @@ rollout_config = RolloutConfig(
     dtype="bfloat16",
     tensor_parallel_size=rollout_tp_size,
     expert_parallel_size=rollout_ep_size,
-    gpu_memory_utilization=0.8,
+    gpu_memory_utilization=0.85,
     context_length=max_response_length + max_prompt_length,
     enable_return_routed_experts=(enable_return_routed_experts == "1"),
 )
@@ -82,19 +82,16 @@ if hasattr(model_cfg, "balancing_loss_cfg"):
     model_cfg.balancing_loss_cfg = None
 if hasattr(model_cfg, "z_loss_cfg"):
     model_cfg.z_loss_cfg = None
-optim_cfg = AdamWConfig(lr=1e-6, foreach=False, weight_decay=0.1)
+optim_cfg = AdamWConfig(lr=1e-6, foreach=False)
 loss_cfg = GRPOLossConfig(
     policy_loss_cfg=dict(
-        cliprange_high=0.28,
+        cliprange_high=0.2,
         cliprange_low=0.2,
         loss_type=os.environ.get("LOSS_TYPE", "vanilla"),
-        clip_ratio_c=10.0,
-        log_prob_diff_min=-20.0,
-        log_prob_diff_max=20.0,
     ),
     ignore_idx=-100,
-    use_kl_loss=False,
-    kl_loss_coef=0.0,
+    use_kl_loss=True,
+    kl_loss_coef=0.001,
     kl_loss_type="low_var_kl",
     mode=os.environ.get("LOSS_MODE", "chunk"),
     chunk_size=512,
@@ -198,9 +195,9 @@ trainer = RLColocateTrainerConfig(
     train_batch_size=train_batch_size,
     advantage_estimator_config=GRPOAdvantageConfig(eps=1e-8),
     enable_evaluate=True,
-    enable_initial_evaluate=False,
+    enable_initial_evaluate=True,
     evaluate_step=evaluate_step,
     work_dir=work_dir,
-    seed=123,
+    seed=42,
     debug_rollout=False,
 )

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import threading
 from dataclasses import dataclass
@@ -33,6 +34,37 @@ class WorkerInfo:
     actor: RolloutWorker
     url: str
     is_active: bool = True
+
+
+def _deterministic_sampling_seed(random_seed: int, rollout_state: RolloutState) -> int:
+    # Keep this aligned with the legacy deterministic rollout path, where each
+    # prompt group restarts the rollout seed from random_seed + repeat_index.
+    action_id = rollout_state.extra_fields.get("deterministic_action_id")
+    observation_id = rollout_state.extra_fields.get("deterministic_observation_id")
+    if action_id is not None and observation_id is not None:
+        try:
+            return random_seed + (int(observation_id) - int(action_id))
+        except (TypeError, ValueError):
+            pass
+    return random_seed + ((rollout_state.uid or 0) - (rollout_state.message_uid or 0))
+
+
+def _deterministic_session_id(environment: str, rollout_state: RolloutState) -> int:
+    """Build the legacy deterministic rollout session id when metadata exists."""
+
+    root_id = rollout_state.extra_fields.get("deterministic_root_id")
+    action_id = rollout_state.extra_fields.get("deterministic_action_id")
+    observation_id = rollout_state.extra_fields.get("deterministic_observation_id")
+    if root_id is None or action_id is None or observation_id is None:
+        if rollout_state.session_uid is not None:
+            return rollout_state.session_uid
+        if rollout_state.uid is not None:
+            return rollout_state.uid
+        return uuid4().int
+
+    session_key = f"{environment}|{root_id}|{action_id}|{observation_id}"
+    session_id = int.from_bytes(hashlib.sha256(session_key.encode("utf-8")).digest()[:8], "big")
+    return session_id or 1
 
 
 class RolloutWorkerMetadata(TypedDict):
@@ -189,12 +221,13 @@ class RolloutController:
     async def generate(self, rollout_state: RolloutState) -> RolloutState:
         if XTUNER_DETERMINISTIC:
             sample_params = rollout_state.sample_params.model_copy(deep=True)
-            sample_params.sampling_seed = self.config.random_seed + (
-                (rollout_state.uid or 0) - (rollout_state.message_uid or 0)
-            )
+            sample_params.sampling_seed = _deterministic_sampling_seed(self.config.random_seed, rollout_state)
             rollout_state.sample_params = sample_params
 
-        session_id = rollout_state.session_uid if rollout_state.session_uid is not None else uuid4().int
+        if XTUNER_DETERMINISTIC:
+            session_id = _deterministic_session_id(self.config.env, rollout_state)
+        else:
+            session_id = rollout_state.session_uid if rollout_state.session_uid is not None else uuid4().int
         worker = await self.router.get_worker(session_id)
         if worker is None:
             rollout_state.status = Status.FAILED

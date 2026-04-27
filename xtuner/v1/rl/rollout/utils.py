@@ -3,7 +3,6 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from itertools import cycle
 from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
@@ -37,7 +36,6 @@ class SessionRouter:
         # OrderedDict: key=session_id -> value=(worker_rank, last_used_ts)
         self._map: OrderedDict[int, tuple[int, float]] = OrderedDict()
 
-        self._worker_cycler = cycle(worker_infos.keys())
         self._lock = asyncio.Lock()
         self.logger = get_logger()
 
@@ -62,20 +60,35 @@ class SessionRouter:
         while len(self._map) > self._max_sessions:
             self._map.popitem(last=False)
 
-    def _choose_next_active_worker(self) -> tuple[int, Any]:
-        n = len(self._worker_infos)
-        for _ in range(n):
-            rank = next(self._worker_cycler)
-            if self._worker_infos_lock is None:
-                info = self._worker_infos[rank]
-                if info and info.is_active:
-                    return rank, info.actor
-            else:
-                with self._worker_infos_lock:
-                    info = self._worker_infos[rank]
-                    if info and info.is_active:
-                        return rank, info.actor
-        return -1, None
+    def _active_workers(self) -> list[tuple[int, Any]]:
+        if self._worker_infos_lock is None:
+            return [
+                (rank, info.actor)
+                for rank, info in self._worker_infos.items()
+                if info is not None and info.is_active
+            ]
+        with self._worker_infos_lock:
+            return [
+                (rank, info.actor)
+                for rank, info in self._worker_infos.items()
+                if info is not None and info.is_active
+            ]
+
+    def _choose_worker_for_session(self, session_id: int) -> tuple[int, Any]:
+        active_workers = self._active_workers()
+        if not active_workers:
+            return -1, None
+        return active_workers[session_id % len(active_workers)]
+
+    def _get_worker_by_rank(self, worker_rank: int) -> Optional[Any]:
+        if self._worker_infos_lock is None:
+            info = self._worker_infos.get(worker_rank)
+        else:
+            with self._worker_infos_lock:
+                info = self._worker_infos.get(worker_rank)
+        if info and info.is_active:
+            return info.actor
+        return None
 
     async def get_worker(self, session_id: int) -> Optional[Any]:
         async with self._lock:
@@ -83,16 +96,12 @@ class SessionRouter:
 
             if session_id in self._map:
                 worker_rank, _ = self._map.pop(session_id)
-                if self._worker_infos_lock is None:
-                    info = self._worker_infos.get(worker_rank)
-                else:
-                    with self._worker_infos_lock:
-                        info = self._worker_infos.get(worker_rank)
-                if info and info.is_active:
+                worker = self._get_worker_by_rank(worker_rank)
+                if worker is not None:
                     self._map[session_id] = (worker_rank, self._now())
-                    return info.actor
+                    return worker
 
-            rank, worker = self._choose_next_active_worker()
+            rank, worker = self._choose_worker_for_session(session_id)
             if rank == -1:
                 return None
             self._map[session_id] = (rank, self._now())

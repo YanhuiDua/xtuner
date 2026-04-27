@@ -48,6 +48,15 @@ from xtuner.v1.utils.device import get_device, get_torch_device_module
 PG_READY_TIMEOUT = 30
 DEVICE = get_device()
 DEVICE_MODULE = get_torch_device_module()
+_MAIN_COMPAT_TRAIN_SHUFFLE_RANDOM_BURN = 28
+
+
+def _build_main_compatible_train_shuffle_rng(seed: int) -> random.Random:
+    rng = random.Random(seed)
+    # Legacy main reaches the first RL train-data shuffle after these driver-side RNG draws.
+    for _ in range(_MAIN_COMPAT_TRAIN_SHUFFLE_RANDOM_BURN):
+        rng.random()
+    return rng
 
 
 def check_fa3():
@@ -312,6 +321,9 @@ class BaseRLTrainer:
         self._sync_weights_interval = cfg.sync_weights_interval
         set_deterministic()
         set_random_seed(cfg.seed)
+        self._train_data_shuffle_rng: random.Random | None = None
+        if XTUNER_DETERMINISTIC:
+            self._train_data_shuffle_rng = _build_main_compatible_train_shuffle_rng(cfg.seed)
 
     def _init_train_worker_config(self, cfg: BaseRLTrainerConfig, log_dir: Path) -> None:
         if cfg.train_worker_cfg.seed is None:
@@ -634,12 +646,13 @@ class BaseRLTrainer:
                 shifted_labels = [-100] * (len(prompt_ids) - 1) + response_labels
                 shifted_labels_t = torch.tensor(shifted_labels, dtype=torch.int64).unsqueeze(0)
 
-                # 根据 response_mask 计算新的 advantages
-                advatnages_val = advantages[i].item()
-                actual_advantages = [advatnages_val] * len(prompt_ids) + [
-                    0.0 if mask == 0 else advatnages_val for mask in response_mask
+                advantage_val = advantages[i].item()
+                token_advantages = [advantage_val] * len(prompt_ids) + [
+                    0.0 if mask == 0 else advantage_val for mask in response_mask
                 ]
-                advantages_list.extend(actual_advantages[:-1])
+                token_advantages = token_advantages[:-1]
+                assert len(token_advantages) == len(input_ids), f"{len(token_advantages)} vs {len(input_ids)}"
+                advantages_list.extend([0.0 if mask == 0 else advantage_val for mask in response_mask])
 
                 assert len(input_ids) <= pack_max_length, f"{len(input_ids)} vs {pack_max_length}"
                 input_ids_t = torch.tensor(input_ids, dtype=torch.int64).unsqueeze(0)
@@ -660,14 +673,16 @@ class BaseRLTrainer:
                 data_dict = {
                     "seq_ctx": seq_ctx,
                     "shifted_labels": shifted_labels_t,
-                    "advantage": actual_advantages,
+                    "advantage": token_advantages,
                     "rollout_logprobs": rollout_logprobs,
                 }
 
                 seq_ctx.rollout_routed_experts = group[i].routed_experts  # n,layer*expert
 
                 data_batches.append(data_dict)
-        if not XTUNER_DETERMINISTIC:
+        if self._train_data_shuffle_rng is not None:
+            self._train_data_shuffle_rng.shuffle(data_batches)
+        else:
             random.shuffle(data_batches)
 
         rewards_t = torch.tensor(rewards_list).float() if rewards_list else torch.tensor([0.0]).float()
