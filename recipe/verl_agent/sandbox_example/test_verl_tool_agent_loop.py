@@ -17,10 +17,10 @@ from transformers import AutoTokenizer
 from xtuner.v1.rl.rollout.worker import RolloutConfig
 from xtuner.v1.rl.utils import AcceleratorResourcesConfig, AutoAcceleratorWorkers
 from recipe.verl_agent.common.agent_loop_verl_tool import VerlToolAgentLoopConfig
-from xtuner.v1.rl.agent_loop import AgentLoopManagerConfig, SyncProduceStrategyConfig, SamplerConfig
+from xtuner.v1.rl.agent_loop_manager import AgentLoopManagerConfig, SamplerConfig, SyncProduceStrategyConfig
 from xtuner.v1.data_proto import RolloutState, Status, SampleParams
 from xtuner.v1.rl.rollout import RolloutController
-from xtuner.v1.rl.judger.gsm8k import GSM8KRouterJudgerConfig
+from xtuner.v1.rl.judger.gsm8k import GSM8KJudgerConfig
 from xtuner.v1.rl.utils import create_task
 from xtuner.v1.rl.replay_buffer import SyncReplayBufferConfig
 from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
@@ -250,7 +250,7 @@ class TestVerlToolAgentLoop(unittest.IsolatedAsyncioTestCase):
             context_length=self.context_length,
             worker_log_dir=self.worker_log_dir,
         )
-        judger_config = GSM8KRouterJudgerConfig(judger_name="openai/gsm8k")
+        judger_config = GSM8KJudgerConfig(judger_name="openai/gsm8k", num_ray_actors=1)
 
         training_sample_params = SampleParams(
             max_tokens=self.max_response_length,
@@ -323,7 +323,7 @@ class TestVerlToolAgentLoop(unittest.IsolatedAsyncioTestCase):
             context_length=self.context_length,
             worker_log_dir=self.worker_log_dir,
         )
-        judger_config = GSM8KRouterJudgerConfig(judger_name="openai/gsm8k")
+        judger_config = GSM8KJudgerConfig(judger_name="openai/gsm8k", num_ray_actors=1)
 
         training_sample_params = SampleParams(
             max_tokens=self.max_response_length,
@@ -384,8 +384,9 @@ class TestVerlToolAgentLoop(unittest.IsolatedAsyncioTestCase):
         )
 
         # 4. 执行 produce_batch
-        batch_rollout_states = await agent_loop_manager.produce_batch(batch_size=4)
-
+        results = await agent_loop_manager.produce_batch(batch_size=4, train_step=0, model_step=0)
+        batch_rollout_states = results.rollout_states
+        
         # 5. 验证结果
         self.assertEqual(len(batch_rollout_states), 4)
         for group_state in batch_rollout_states:

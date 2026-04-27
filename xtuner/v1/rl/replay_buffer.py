@@ -2,12 +2,14 @@ import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, fields, replace
 from itertools import count
+from pathlib import Path
 from typing import Any, List, TypeAlias, Union
 
 import pandas as pd
-from pydantic import BaseModel
+import torch
+from pydantic import BaseModel, ConfigDict
 
-from xtuner.v1.data_proto.rl_data import RolloutState, Status, update_group_status
+from xtuner.v1.data_proto.rl_data import RolloutState, Status, refresh_seq_staleness, update_group_status
 from xtuner.v1.rl.utils import (
     BetweenNode,
     ConditionNode,
@@ -19,6 +21,10 @@ from xtuner.v1.rl.utils import (
     SetNode,
     parse_query,
 )
+from xtuner.v1.utils import get_logger
+
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -61,7 +67,16 @@ class StorageBackend(ABC):
     async def delete(self, uids: list[int]) -> None: ...
 
     @abstractmethod
+    async def update(self, items: list[StorageItem]) -> None: ...
+
+    @abstractmethod
     def __len__(self) -> int: ...
+
+    @abstractmethod
+    def state_dict(self) -> dict[str, Any]: ...
+
+    @abstractmethod
+    def load_state_dict(self, state: dict[str, Any]) -> None: ...
 
 
 class ReplayPolicy(ABC):
@@ -142,8 +157,31 @@ class NaiveStorage(StorageBackend):
         for uid in uids:
             self._items.pop(uid, None)
 
+    async def update(self, items: list[StorageItem]) -> None:
+        for item in items:
+            old_item = self._items.get(item.uid)
+            if old_item is None:
+                continue
+            # 原地更新保留 uid/timestamp，避免刷新 staleness 改变 replay 顺序。
+            self._items[item.uid] = replace(item, uid=old_item.uid, timestamp_id=old_item.timestamp_id)
+
     def __len__(self) -> int:
         return len(self._items)
+
+    def state_dict(self) -> dict[str, Any]:
+        max_uid = max(self._items, default=0)
+        max_timestamp_id = max((item.timestamp_id for item in self._items.values()), default=0)
+        return {
+            "items": list(self._items.values()),
+            "next_uid": max_uid + 1,
+            "next_timestamp_id": max_timestamp_id + 1,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        items: list[StorageItem] = state["items"]
+        self._items = {item.uid: item for item in items}
+        self._uid_gen = count(state["next_uid"])
+        self._timestamp_id_gen = count(state["next_timestamp_id"])
 
 
 class PandasStorage(StorageBackend):
@@ -254,11 +292,40 @@ class PandasStorage(StorageBackend):
             return
         self._df = self._df[~self._df["uid"].isin(uids)]
 
+    async def update(self, items: list[StorageItem]) -> None:
+        self._flush_buffer()
+        if not items or self._df.empty:
+            return
+        for item in items:
+            mask = self._df["uid"] == item.uid
+            if not mask.any():
+                continue
+            for row_idx in self._df.index[mask]:
+                self._df.at[row_idx, "status"] = item.status
+                self._df.at[row_idx, "staleness"] = item.staleness
+                self._df.at[row_idx, "item"] = item.item
+
     def __len__(self) -> int:
         return len(self._df) + len(self._buffer)
 
+    def state_dict(self) -> dict[str, Any]:
+        self._flush_buffer()
+        max_uid = int(self._df["uid"].max()) if not self._df.empty else 0
+        max_timestamp_id = int(self._df["timestamp_id"].max()) if not self._df.empty else 0
+        return {
+            "df": self._df.copy(deep=True),
+            "next_uid": max_uid + 1,
+            "next_timestamp_id": max_timestamp_id + 1,
+        }
 
-class FIFOBackend(ReplayPolicy):
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self._df = state["df"].copy(deep=True)
+        self._buffer = []
+        self._uid_gen = count(state["next_uid"])
+        self._timestamp_id_gen = count(state["next_timestamp_id"])
+
+
+class FIFOReplayPolicy(ReplayPolicy):
     async def put(self, item: StorageItem, storage_backend: StorageBackend) -> None:
         if not item.item:
             return
@@ -275,7 +342,7 @@ class FIFOBackend(ReplayPolicy):
         return [record.item for record in selected]
 
 
-class StalenessBackend(ReplayPolicy):
+class StalenessReplayPolicy(ReplayPolicy):
     async def put(self, item: StorageItem, storage_backend: StorageBackend) -> None:
         if not item.item:
             return
@@ -297,6 +364,8 @@ class StalenessBackend(ReplayPolicy):
 
 
 class ReplayBuffer:
+    _SAVE_PATH = "replay_buffer.pth"
+
     def __init__(self, policy: ReplayPolicy, storage_backend: StorageBackend):
         self._policy = policy
         self._storage = storage_backend
@@ -328,16 +397,90 @@ class ReplayBuffer:
         async with self._lock:
             return await self._policy.count(query_dsl, self._storage)
 
+    async def refresh_staleness(
+        self,
+        task_name: str,
+        current_train_step: int,
+        stale_threshold: int,
+        statuses: list[Status] | None = None,
+    ) -> int:
+        # 刷新可复用样本的 staleness；completed / aborted 都可能来自旧权重，需要按 train_step 淘汰。
+        if stale_threshold <= 0:
+            raise ValueError(f"stale_threshold must be positive, got {stale_threshold}.")
+        if statuses is None:
+            statuses = [Status.COMPLETED, Status.ABORTED]
+        query_dsl: QueryDict = {
+            "$and": [
+                {"task_name": task_name},
+                {"status": {"$in": statuses}},
+            ]
+        }
+        async with self._lock:
+            records = await self._storage.get(query_dsl)
+            updated_records: list[StorageItem] = []
+            expired_count = 0
+            for record in records:
+                refresh_seq_staleness(record.item, current_train_step)
+                staleness = max((getattr(item, "seq_staleness", 0) for item in record.item), default=0)
+                should_expire = any(getattr(item, "seq_staleness", 0) >= stale_threshold for item in record.item)
+                if should_expire:
+                    # completed / aborted 样本超过 step 级阈值时整组翻转，后续 sampler 可按 EXPIRED 重新取样。
+                    for item in record.item:
+                        item.status = Status.EXPIRED
+                    status = Status.EXPIRED
+                    expired_count += 1
+                else:
+                    status = update_group_status(record.item)
+                updated_records.append(replace(record, status=status, staleness=staleness))
+            await self._storage.update(updated_records)
+            return expired_count
+
     def __len__(self) -> int:
         return len(self._storage)
 
+    async def save(self, path: str | Path) -> None:
+        file_path = Path(path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        replay_buffer_path = file_path / self._SAVE_PATH
+        async with self._lock:
+            state = {
+                "policy": type(self._policy).__name__,
+                "storage": type(self._storage).__name__,
+                "storage_state": self._storage.state_dict(),
+            }
+        await asyncio.to_thread(torch.save, state, replay_buffer_path)
+        logger.info(f"Replay buffer saved to {replay_buffer_path}")
+
+    async def resume(self, path: str | Path) -> None:
+        if len(self._storage) > 0:
+            raise RuntimeError("Cannot resume into a non-empty buffer")
+
+        file_path = Path(path)
+        replay_buffer_path = file_path / self._SAVE_PATH
+        state = await asyncio.to_thread(torch.load, replay_buffer_path, map_location="cpu", weights_only=False)
+        if state["policy"] != type(self._policy).__name__:
+            raise ValueError(f"Replay policy mismatch: expected {type(self._policy).__name__}, got {state['policy']}")
+
+        if state["storage"] != type(self._storage).__name__:
+            raise ValueError(
+                f"Storage backend mismatch: expected {type(self._storage).__name__}, got {state['storage']}"
+            )
+
+        async with self._lock:
+            self._storage.load_state_dict(state["storage_state"])
+        logger.info(f"Replay buffer resumed from {replay_buffer_path}")
+
 
 class SyncReplayBufferConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     def build(self):
-        return ReplayBuffer(policy=FIFOBackend(), storage_backend=NaiveStorage())
+        return ReplayBuffer(policy=FIFOReplayPolicy(), storage_backend=NaiveStorage())
 
 
 class AsyncReplayBufferConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     def build(self):
-        policy = StalenessBackend()
+        policy = StalenessReplayPolicy()
         return ReplayBuffer(policy=policy, storage_backend=NaiveStorage())

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Sequence, TypeAlias, Typ
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
 
+import numpy as np
 import ray
 import requests
 import torch
@@ -54,7 +55,7 @@ from xtuner.v1.utils import (
 )
 from xtuner.v1.utils.load_spec import LoadEnum
 
-from .rollout_is import merge_rollout_is_metrics
+from ..rollout_is import merge_rollout_is_metrics
 
 
 DeviceMeshRaw: TypeAlias = List[List[int]]  # A list of lists representing device mesh indices
@@ -188,7 +189,7 @@ class WorkerConfig(BaseModel):
         )(TrainingWorker)
         train_workers, _ = AutoAcceleratorWorkers.from_placement_group(TrainingWorkerCls, self, placement_group)
         ray.wait([w.ready.remote() for w in train_workers])
-        return TrainingController.remote(workers=train_workers)
+        return TrainingController(workers=train_workers)
 
 
 class WorkerInputItem(TypedDict):
@@ -538,13 +539,16 @@ class TrainingWorker(SingleAcceleratorWorker):
             seq_ctx = data["seq_ctx"]
             pixel_values = seq_ctx.pixel_values
             if pixel_values is not None:
-                if not isinstance(pixel_values, torch.Tensor):
+                if not isinstance(pixel_values, np.ndarray):
                     assert isinstance(pixel_values, list), (
                         f"pixel_values should be list of tensor, got {type(pixel_values)}"
                     )
                     pixel_values = [ray.get(pixel_obf) for pixel_obf in pixel_values]
+                    pixel_values = [torch.as_tensor(pixel_value) for pixel_value in pixel_values]
                     pixel_values = torch.cat(pixel_values, dim=0)
                     seq_ctx.pixel_values = pixel_values
+                else:
+                    raise NotImplementedError("The case where pixel_values is a numpy array is not implemented yet.")
 
             rollout_routed_experts = seq_ctx.rollout_routed_experts
             if rollout_routed_experts is not None:
@@ -857,6 +861,7 @@ class TrainingWorker(SingleAcceleratorWorker):
         server_url_dict: ServiceUrlMap,
         rollout_config: RolloutConfig,
         worker_server_urls_status: Dict[str, bool],
+        api_server_url: str | None = None,
     ):
         """Update the rollout information for the training worker."""
         tp = rollout_config.tensor_parallel_size

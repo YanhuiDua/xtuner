@@ -11,6 +11,9 @@ from .misc import (
     ScalarOperator,
     SetNode,
     SetOperator,
+    calculate_seq_staleness,
+    chat_trace_records_to_rollout_states,
+    find_free_ports,
     gather_logprobs,
     get_eos_token,
     load_function,
@@ -29,6 +32,7 @@ from .ray_worker import (
     AutoAcceleratorWorkers,
     AutoCPUWorkers,
     BaseCPUWorker,
+    CPUActorLauncher,
     CPUResourcesConfig,
     SingleAcceleratorWorker,
 )
@@ -39,6 +43,7 @@ __all__ = [
     "SingleAcceleratorWorker",
     "AutoAcceleratorWorkers",
     "CPUResourcesConfig",
+    "CPUActorLauncher",
     "BaseCPUWorker",
     "AutoCPUWorkers",
     "get_ray_accelerator",
@@ -64,4 +69,7 @@ __all__ = [
     "LogicOperator",
     "Operators",
     "get_eos_token",
+    "calculate_seq_staleness",
+    "chat_trace_records_to_rollout_states",
+    "find_free_ports",
 ]

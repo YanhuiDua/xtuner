@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import base64
 from enum import Enum
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
+import numpy as np
 import torch
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 from typing_extensions import NotRequired, TypedDict
 
 # ====================================
 # ====== DataFlow 数据流 ==============
 # ====================================
+from xtuner.v1.data_proto.utils import calculate_seq_staleness
 from xtuner.v1.utils.cache import CacheObj
 from xtuner.v1.utils.logger import get_logger
 
@@ -59,9 +62,24 @@ class Status(Enum):
 
 class MultimodalInfo(TypedDict):
     # 使用TypedDict给出pixel_values的类型提示
-    pixel_values: NotRequired[torch.Tensor | RayObjectRef | None]
+    pixel_values: NotRequired[np.ndarray | RayObjectRef | None]
     image_grid_thw: NotRequired[torch.Tensor]
-    position_ids: NotRequired[torch.Tensor]
+
+
+class RolloutFunctionCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    arguments: Any = Field(default_factory=dict)
+    raw_arguments_text: str | None = None
+
+
+class RolloutToolCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    type: Literal["function"] = "function"
+    function: RolloutFunctionCall
 
 
 class RolloutState(CacheObj, BaseModel):
@@ -74,21 +92,28 @@ class RolloutState(CacheObj, BaseModel):
     data_source: dict[str, Any] | str | None = None
     mm_info: MultimodalInfo | None = None
     reward_model: dict[str, Any] | None = None
-    num_tokens: int | None = None  # 用于 cache 管理
 
     # --- InferEngine 输入 ---
     session_uid: int | None = None
     tokens: list[int] | None = None  # 每一次推理引擎的实际输入
     tools: list | None = None
-    tool_choice: str | None = None
+    tool_choice: str | dict[str, Any] | None = None
     sample_params: SampleParams = SampleParams()
 
     # --- InferEngine 输出 ---
+    # 每一次推理引擎的实际输出, 在rollout worker中被覆盖写
     response: str | None = None
+    tool_calls: list[RolloutToolCall] | None = None
     response_ids: list[int] | None = None
     logprobs: list[float] | None = None
     routed_experts: list[int] | RayObjectRef | None = None
     finish_reason: str | None = None
+    # response_mask: 记录response_ids中哪个token算loss, 与response_ids长度相同，每轮rollout在 agent_loop.generate 中覆盖写
+    response_mask: list[int] | None = None
+    # response_model_steps：记录 response_ids 中每个 token 来自哪个 model_step，与 response_ids 长度相同。
+    response_model_steps: list[int] | None = None
+    # 记录该样本过期程度，即最早生成 token 的模型版本与当前训练步数的差值，数值越大表示越过期。
+    seq_staleness: int = 0
 
     #  --- Judger 输出 ---
     reward: dict[str, Any] | None = None
@@ -98,26 +123,53 @@ class RolloutState(CacheObj, BaseModel):
     task_name: str | None = None
     status: Status = Status.INIT
     error_msg: str | None = None
-    seq_staleness: int = 0
-    response_mask: list[int] | None = None  # response_ids的长度
-    response_rollout_steps: list[int] | None = None  # 记录 response_ids 中每个 token 是在哪个 rollout_step 生成的
+    position_ids: torch.Tensor | None = None
     extra_fields: dict[str, Any] = {}
 
     @field_serializer("routed_experts")
-    def _serialize_routed_experts(self, value: list[int] | RayObjectRef | None) -> list[int] | None:
-        """Dump 时跳过 ray.ObjectRef，序列化为 None，避免 PydanticSerializationError。"""
+    def _serialize_routed_experts(self, value: list[int] | RayObjectRef | None) -> list[int] | str | None:
+        """序列化 routed_experts 字段：
+
+        - None -> None
+        - list[int] -> list[int]（原样保留）
+        - RayObjectRef -> base64 编码的字符串（通过 ray.cloudpickle 序列化）
+        """
+        import ray
+
         if value is None:
             return None
-        try:
-            import ray
+        if isinstance(value, ray.ObjectRef):
+            data = ray.cloudpickle.dumps(value)
+            return base64.b64encode(data).decode("utf-8")
+        return value
 
-            if isinstance(value, ray.ObjectRef):
-                return None
-        except ImportError:
-            pass
-        if type(value).__name__ == "ObjectRef" and "ray" in getattr(type(value), "__module__", ""):
+    @field_validator("routed_experts", mode="before")
+    @classmethod
+    def _deserialize_routed_experts(cls, value: Any) -> list[int] | RayObjectRef | None:
+        """反序列化 routed_experts 字段：
+
+        - None -> None
+        - list[int] -> list[int]（原样保留）
+        - str（base64 编码）-> RayObjectRef（通过 ray.cloudpickle 反序列化）
+        - RayObjectRef -> RayObjectRef（原样保留）
+        """
+        import ray
+
+        if value is None:
             return None
-        return value  # list[int]
+        if isinstance(value, ray.ObjectRef):
+            return value
+        if isinstance(value, str):
+            data = base64.b64decode(value)
+            return ray.cloudpickle.loads(data)
+        if isinstance(value, list):
+            return value
+        return value
+
+    @field_serializer("mm_info")
+    def _serialize_mm_info(self, value: MultimodalInfo | None) -> MultimodalInfo | None:
+        # TODO: Not currently needed
+        return None
 
 
 def update_status_from_finish_reason(finish_reason: str | None) -> Status:
@@ -202,31 +254,40 @@ def update_group_status(rollout_states: list[RolloutState]) -> Status:
         return Status.COMPLETED
 
 
-def update_seq_staleness(rollout_state: RolloutState, rollout_step: int) -> RolloutState:
-    """计算 response_rollout_steps 列表，表示 rollout_state.response_ids 中的每个 token
-    是在哪个 rollout_step 生成的。"""
+def update_sample_version(rollout_state: RolloutState, model_step: int) -> RolloutState:
+    """Append token source model version for newly generated response
+    tokens."""
     response_len = len(rollout_state.response_ids or [])
-    response_rollout_steps = [rollout_step] * response_len
-    rollout_state.response_rollout_steps = (rollout_state.response_rollout_steps or []) + response_rollout_steps
-
-    cur_rollout_steps = min(rollout_state.response_rollout_steps, default=rollout_step)
-    rollout_state.seq_staleness = rollout_step - cur_rollout_steps
-    logger.debug(
-        f"Updated seq_staleness for sample {rollout_state.uid} | Current rollout step: {rollout_step} | Earliest response token rollout step: {cur_rollout_steps} | Updated seq_staleness: {rollout_state.seq_staleness}"
-    )
+    response_model_steps = list(getattr(rollout_state, "response_model_steps", None) or [])
+    missing_response_steps = max(0, response_len - len(response_model_steps))
+    if missing_response_steps:
+        response_model_steps.extend([model_step] * missing_response_steps)
+    rollout_state.response_model_steps = response_model_steps
     return rollout_state
 
 
-def update_expired_status(samples: list[RolloutState], tail_batch_stale_threshold: int = 0) -> list[RolloutState]:
-    if tail_batch_stale_threshold <= 0:
-        return samples
+def refresh_seq_staleness(group: list[RolloutState], current_train_step: int) -> list[RolloutState]:
+    for rollout_state in group:
+        # response_model_steps 记录每个 response token 的模型版本；
+        # 最早版本决定整条样本的滞后程度。
+        response_model_steps = getattr(rollout_state, "response_model_steps", None) or []
+        if response_model_steps:
+            rollout_state.seq_staleness = calculate_seq_staleness(min(response_model_steps), current_train_step)
+        else:
+            rollout_state.seq_staleness = 0
+    return group
+
+
+def update_expired_status(samples: list[RolloutState], stale_threshold: int) -> list[RolloutState]:
+    if stale_threshold <= 0:
+        raise ValueError(f"stale_threshold must be positive, got {stale_threshold}.")
     is_group_expired = False
 
     # 1. 检查组内是否存过期的样本
     for sample in samples:
-        if sample.status == Status.ABORTED and sample.seq_staleness >= tail_batch_stale_threshold:
+        if sample.status == Status.ABORTED and sample.seq_staleness >= stale_threshold:
             logger.debug(
-                f"Sample {sample.uid} (seq_staleness: {sample.seq_staleness}) exceeded threshold ({tail_batch_stale_threshold}). Triggering group expiration."
+                f"Sample {sample.uid} (seq_staleness: {sample.seq_staleness}) exceeded threshold ({stale_threshold}). Triggering group expiration."
             )
             is_group_expired = True
             break  # 一旦发现过期，直接跳出，无需检查剩余样本

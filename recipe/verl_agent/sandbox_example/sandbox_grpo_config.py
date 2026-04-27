@@ -14,14 +14,14 @@ from xtuner.v1.datasets.rl_tokenize_fn import RLTextTokenizeFnConfig
 from xtuner.v1.model import get_model_config_from_hf
 from xtuner.v1.rl.utils import AcceleratorResourcesConfig
 from xtuner.v1.rl.rollout.worker import RolloutConfig
-from xtuner.v1.rl.judger.gsm8k import GSM8KRouterJudgerConfig
+from xtuner.v1.rl.judger.gsm8k import GSM8KJudgerConfig
 from xtuner.v1.rl.utils import create_task
 from xtuner.v1.rl.replay_buffer import SyncReplayBufferConfig
 from xtuner.v1.rl.trainer import WorkerConfig
-from xtuner.v1.rl.agent_loop import AgentLoopManagerConfig, SyncProduceStrategyConfig, SamplerConfig
+from xtuner.v1.rl.agent_loop_manager import AgentLoopManagerConfig, SamplerConfig, SyncProduceStrategyConfig
 from xtuner.v1.rl.evaluator import EvaluatorConfig
 from xtuner.v1.rl.loss import GRPOLossConfig
-from xtuner.v1.train.rl_colocate_trainer import RLColocateTrainerConfig
+from xtuner.v1.train.rl_trainer import RLColocateTrainerConfig
 from recipe.verl_agent.common.agent_loop_verl_tool import VerlToolAgentLoopConfig
 # env
 work_dir = os.environ["WORK_DIR"]
@@ -33,10 +33,10 @@ WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 
 # basic settings
 experimental_name = "grpo_gsm8k_verl_tool"
-rollout_steps = 45
+total_train_steps = 45
 evaluate_step = 45
 train_optimizer_steps = 1
-global_batch_size = 64 * train_optimizer_steps
+train_batch_size = 64 * train_optimizer_steps
 prompt_repeat_k = 5
 rollout_tp_size = 1
 rollout_ep_size = 1
@@ -66,7 +66,7 @@ rollout_config = RolloutConfig(
 )
 
 # 3. judger
-judger_config = GSM8KRouterJudgerConfig(judger_name="openai/gsm8k")
+judger_config = GSM8KJudgerConfig(judger_name="openai/gsm8k", num_ray_actors=1)
 
 # 4. train worker
 lr_cfg = LRConfig(lr_type="constant", warmup_ratio=0, lr_min=1e-6)
@@ -302,8 +302,8 @@ trainer = RLColocateTrainerConfig(
     eval_agent_loop_manager_cfg=eval_agent_loop_manager_cfg,
     evaluator_config=evaluator_config,
     load_from=model_path,
-    rollout_steps=rollout_steps,
-    global_batch_size=global_batch_size,
+    total_train_steps=total_train_steps,
+    train_batch_size=train_batch_size,
     enable_evaluate=True,
     enable_initial_evaluate=False,
     evaluate_step=evaluate_step,

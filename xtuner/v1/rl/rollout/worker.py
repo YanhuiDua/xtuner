@@ -117,6 +117,10 @@ class RolloutConfig(BaseModel):
         int,
         Parameter(group=infer_group, help="Port number for the rollout API server. If not set, 8000 will be used."),
     ] = 8000
+    api_host: Annotated[
+        str,
+        Parameter(group=infer_group, help="Host for the rollout API server."),
+    ] = "0.0.0.0"
     gpus_per_node: Annotated[int, Parameter(group=infer_group, help="Number of GPUs allocated per node.")] = 8
     dtype: Annotated[
         str,
@@ -219,6 +223,20 @@ class RolloutConfig(BaseModel):
             help="Context length for the rollout worker.",
         ),
     ] = None
+    tool_call_parser: Annotated[
+        Literal["none", "qwen3", "qwen3p5"],
+        Parameter(
+            group=infer_group,
+            help='Structured tool-call parser to apply to rollout output. Use "none" to disable parsing, "qwen3" to enable Qwen3 tool-call parsing, or "qwen3p5" to enable Qwen3.5 coder-style tool-call parsing.',
+        ),
+    ] = "none"
+    reasoning_parser: Annotated[
+        Literal["none", "qwen3"],
+        Parameter(
+            group=infer_group,
+            help='Reasoning parser to apply to rollout output. Use "none" to disable parsing or "qwen3" to enable Qwen3 <think> parsing.',
+        ),
+    ] = "none"
     enable_float8: Annotated[
         bool,
         Parameter(
@@ -248,6 +266,20 @@ class RolloutConfig(BaseModel):
         ),
     ] = 1
     worker_log_dir: Annotated[Path, Parameter(help="Directory to save worker logs.")] = Path.cwd() / "work_dir"
+    health_check_interval_seconds: Annotated[
+        float,
+        Parameter(
+            group=infer_group,
+            help="Interval in seconds between rollout worker health checks.",
+        ),
+    ] = 30.0
+    health_check_failure_threshold: Annotated[
+        int,
+        Parameter(
+            group=infer_group,
+            help="Number of consecutive health check failures required before marking a worker inactive.",
+        ),
+    ] = 3
     _logged_server_urls_per_engine: bool = PrivateAttr(default=False)
 
     @property
@@ -299,7 +331,7 @@ class RolloutConfig(BaseModel):
         while True:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 try:
-                    s.bind(("localhost", port))
+                    s.bind((self.api_host if self.api_host != "0.0.0.0" else "localhost", port))
                     break
                 except OSError:
                     port += 1
@@ -468,7 +500,7 @@ class RolloutWorker(SingleAcceleratorWorker):
     def shutdown(self):
         """Shut down the worker, its server task, and any child processes."""
         if self.server_task is not None:
-            ray.cancel(self.server_task)
+            ray.cancel(self.server_task, force=True)
             return
 
         if self.server_process is not None:
@@ -557,7 +589,7 @@ class RolloutWorker(SingleAcceleratorWorker):
             rollout_state.response = ""
             rollout_state.logprobs = []
             rollout_state.response_mask = []
-            rollout_state.response_rollout_steps = []
+            rollout_state.response_model_steps = []
             rollout_state.finish_reason = "stop" if is_eos_reached else "length"
             return rollout_state
 

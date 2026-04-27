@@ -17,10 +17,11 @@ from xtuner.v1.rl.rollout.worker import RolloutConfig
 from xtuner.v1.rl.judger import GSM8KJudgerConfig
 from xtuner.v1.rl.replay_buffer import AsyncReplayBufferConfig
 from xtuner.v1.rl.trainer import WorkerConfig
-from xtuner.v1.rl.agent_loop import AgentLoopManagerConfig, SingleTurnAgentLoopConfig, AsyncProduceStrategyConfig, SamplerConfig
+from xtuner.v1.rl.agent_loop import SingleTurnAgentLoopConfig
+from xtuner.v1.rl.agent_loop_manager import AgentLoopManagerConfig, AsyncProduceStrategyConfig, SamplerConfig, TaskSpecConfig
 from xtuner.v1.rl.evaluator import EvaluatorConfig
 from xtuner.v1.rl.loss import GRPOLossConfig
-from xtuner.v1.train.rl_colocate_trainer import RLColocateTrainerConfig
+from xtuner.v1.train.rl_trainer import RLColocateTrainerConfig
 
 # env
 work_dir = os.environ["WORK_DIR"]
@@ -32,10 +33,10 @@ NNODE = int(os.environ.get("WORLD_SIZE", "1"))
 
 # basic settings
 experimental_name = "grpo_gsm8k"
-rollout_steps = 45
+total_train_steps = 45
 evaluate_step = 45
 train_optimizer_steps = 1
-global_batch_size = 64 * train_optimizer_steps
+train_batch_size = 64 * train_optimizer_steps
 prompt_repeat_k = 5
 rollout_tp_size = 1
 rollout_ep_size = 1
@@ -65,7 +66,7 @@ rollout_config = RolloutConfig(
 )
 
 # 3. judger
-judger_config = GSM8KJudgerConfig(judger_name="openai/gsm8k", judger_type="router")
+judger_config = GSM8KJudgerConfig(judger_name="openai/gsm8k", num_ray_actors=1)
 
 # 4. train worker
 lr_cfg = LRConfig(lr_type="constant", warmup_ratio=0, lr_min=1e-6)
@@ -132,14 +133,17 @@ agent_loop_config = SingleTurnAgentLoopConfig(
 produce_strategy_config = AsyncProduceStrategyConfig(
     over_sample_threshold = 0.8,
     enable_partial_rollout = True,
-    tail_batch_stale_threshold=1,
+    max_staleness=0,
     tail_batch_trigger_size=64
 )
 agent_loop_manager_cfg = AgentLoopManagerConfig(
-    task_name="train_task",
-    agent_loop_config=agent_loop_config,
-    produce_strategy_config=produce_strategy_config,
-    sampler_config=sampler_config,
+    tasks=TaskSpecConfig(
+        task_name="train_task",
+        agent_loop_config=agent_loop_config,
+        judger_config=judger_config,
+        produce_strategy_config=produce_strategy_config,
+        sampler_config=sampler_config,
+    ),
 )
 
 # 6. eval agent loop manager
@@ -169,9 +173,12 @@ eval_agent_loop_config = SingleTurnAgentLoopConfig(
     sample_params=evaluation_sample_params,
 )
 eval_agent_loop_manager_cfg = AgentLoopManagerConfig(
-    task_name="eval_task",
-    agent_loop_config=eval_agent_loop_config,
-    sampler_config=eval_sampler_config,
+    tasks=TaskSpecConfig(
+        task_name="eval_task",
+        agent_loop_config=eval_agent_loop_config,
+        judger_config=judger_config,
+        sampler_config=eval_sampler_config,
+    ),
 )
 
 # 7. evaluator
@@ -182,15 +189,14 @@ trainer = RLColocateTrainerConfig(
     resources=resources,
     train_worker_cfg=train_worker_cfg,  # TODO: uniform naming of cfg and config
     rollout_config=rollout_config,
-    judger_config=judger_config,
     tokenizer_path=model_path,
     replay_buffer_config=AsyncReplayBufferConfig(),
     agent_loop_manager_cfg=agent_loop_manager_cfg,
     eval_agent_loop_manager_cfg=eval_agent_loop_manager_cfg,
     evaluator_config=evaluator_config,
     load_from=model_path,
-    rollout_steps=rollout_steps,
-    global_batch_size=global_batch_size,
+    total_train_steps=total_train_steps,
+    train_batch_size=train_batch_size,
     enable_evaluate=True,
     enable_initial_evaluate=False,
     evaluate_step=evaluate_step,
