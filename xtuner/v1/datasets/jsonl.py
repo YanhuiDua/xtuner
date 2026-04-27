@@ -13,7 +13,7 @@ from io import BytesIO
 from multiprocessing import Process, Queue
 from pathlib import Path
 from threading import Lock
-from typing import Callable, TypeVar, cast
+from typing import Any, Callable, Dict, TypeVar, cast
 
 import numpy as np
 import torch
@@ -449,6 +449,7 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
         if isinstance(tokenized, dict):
             res = {"num_tokens": tokenized["num_tokens"], "proxy_attn_flops": tokenized["proxy_attn_flops"]}
             if "chunks" in tokenized:
+                tokenized = cast(dict[str, Any], tokenized)
                 res["chunks"] = tokenized["chunks"]
             return res
         if isinstance(tokenized, BaseModel):

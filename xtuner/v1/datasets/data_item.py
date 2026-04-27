@@ -1,5 +1,4 @@
 import torch
-from typing_extensions import TypedDict
 
 from xtuner.v1.data_proto.cache_item import CacheItem
 
