@@ -92,7 +92,7 @@ DEFAULT_AGENTS: list[AgentSpec] = [
 ]
 
 # Placeholder image — each task overrides this via sandbox_spec in extra_info.
-DEFAULT_SANDBOX = SandboxSpec(image="tb2-eval-placeholder", ttl_seconds=3600, workspace_path="/app")
+DEFAULT_SANDBOX = SandboxSpec(image="tb2-eval-placeholder", ttl_seconds=11700, workspace_path="/app")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -216,7 +216,7 @@ def tb2_eval_pipeline(
             workspace=ws,
             extras={"WORKSPACE": ws},
         ),
-        timeout=3600,
+        timeout=10800,
         post=[
             DownloadHook([ws, "/tmp/agent_response.txt"]),
             ReadFileHook("/tmp/message.json", "message"),

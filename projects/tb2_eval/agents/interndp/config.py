@@ -72,6 +72,8 @@ env_agent = dict(
     actions=base_actions,
     max_turn=100,
     enable_no_thinking_penalty=False,
+    max_tool_response_length=4096,
+    tool_response_truncate_side="left",
 )
 
 agent_config = dict(

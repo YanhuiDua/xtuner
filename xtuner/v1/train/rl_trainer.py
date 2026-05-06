@@ -553,7 +553,27 @@ class RLTrainer:
         """Performs a single rollout step to generate experience."""
         with timer("generation", step_timer_dict):
             ray.get(self._rollout_env_controller.update_active_workers.remote())
-            dataflow_result = ray.get(self._rollout_dataflow.run.remote())
+            # Ultimate fallback: without a timeout, dataflow.run can hang
+            # forever when inner rollout workers die and their pending tasks
+            # never resolve.  12h is deliberately loose — normal long-tail
+            # rollout batches run ~5h, so anything past 12h is almost
+            # certainly a real deadlock worth surfacing to the driver.
+            dataflow_ref = self._rollout_dataflow.run.remote()
+            try:
+                dataflow_result = ray.get(dataflow_ref, timeout=12 * 3600)
+            except ray.exceptions.GetTimeoutError:
+                self.logger.error(
+                    f"rollout_idx {rollout_idx}: dataflow.run exceeded 12h, "
+                    f"likely a stuck rollout/sandbox. cancelling task and raising."
+                )
+                try:
+                    ray.cancel(dataflow_ref, force=True)
+                except Exception as exc:
+                    self.logger.warning(f"ray.cancel of dataflow task failed: {exc}")
+                raise RuntimeError(
+                    f"dataflow.run hung for 12h at rollout_idx={rollout_idx}; "
+                    f"check ray dashboard for dead actors"
+                ) from None
 
         if XTUNER_DETERMINISTIC:
             data_groups, multimodal_train_infos = self._sort_rollout_outputs(
