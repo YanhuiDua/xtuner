@@ -214,14 +214,13 @@ class LMDeployWorker(RolloutWorker):
         """It will implemented for LMDeploy worker in the future."""
         pass
 
-    def _decode_routed_experts(self, routed_experts: Any):
+    async def _decode_routed_experts(self, routed_experts: Any):
         if isinstance(routed_experts, str):
             if self.lmdeploy_actor is None:
                 self.lmdeploy_actor = ray.get_actor(SHARED_STORE, namespace=SHARED_STORE_NAMESPACE)
             assert self.lmdeploy_actor is not None, "LMDeploy actor should be available in the shared store."
-            routed_experts_ref = self.lmdeploy_actor.get.remote(routed_experts)
-            return routed_experts_ref
-        return torch.tensor(routed_experts)
+            routed_experts = await self.lmdeploy_actor.get.remote(routed_experts)
+        return torch.as_tensor(routed_experts, dtype=torch.long)
 
     def _transform_rollout_config_to_server_configs(self) -> Namespace:
         """Transform the RolloutConfig into a Namespace suitable for the

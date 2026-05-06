@@ -7,14 +7,14 @@ import time
 import traceback
 import uuid
 from abc import abstractmethod
+from inspect import isawaitable
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import httpx
-import numpy as np
 import ray
 import requests  # type: ignore[import-untyped]
+import torch
 from packaging.version import Version
-from ray import ObjectRef, cloudpickle
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from transformers import AutoTokenizer
@@ -22,7 +22,6 @@ from xtuner.v1.data_proto.rl_data import RLRolloutResponseItem, RolloutState
 from xtuner.v1.ray import find_master_addr_and_port
 from xtuner.v1.ray.base import AutoAcceleratorWorkers, SingleAcceleratorWorker
 from xtuner.v1.ray.config import RolloutConfig
-from xtuner.v1.ray.rollout.routed_expert_store import get_store
 from xtuner.v1.utils import get_logger
 from xtuner.v1.utils.httpx_utils import HttpRequestErrorType, HttpRequestResult
 
@@ -154,7 +153,7 @@ class RolloutWorker(SingleAcceleratorWorker):
         self.launch_server()
         return (self.rank, self.server_url)
 
-    def _decode_routed_experts(self, routed_experts: Any) -> Any:
+    async def _decode_routed_experts(self, routed_experts: Any) -> Any:
         return routed_experts
 
     def set_engine_rank_mesh_array(self, engine_rank_mesh_array: list[list[int]]):
@@ -579,54 +578,14 @@ class RolloutWorker(SingleAcceleratorWorker):
                         "routed_experts" in input_extra_info and input_extra_info["routed_experts"] is not None
                     )
                     routed_experts = response["meta_info"].pop("routed_experts")  # token[layer[expert]]
-                    store = get_store()
                     if routed_experts is not None and not exist_history_routed_experts:
-                        # Turn 1: materialize tensor locally, then register its
-                        # ref with the store.  Using ray.put here (in the
-                        # worker) keeps the tensor in THIS node's plasma so
-                        # traffic doesn't funnel to the store actor's node.
-                        # The [local_ref] wrapper bypasses Ray's auto-deref
-                        # so the store receives the ref itself.
-                        decoded = self._decode_routed_experts(routed_experts)
-                        if isinstance(decoded, ObjectRef):
-                            tensor = await decoded
-                            ray.internal.free([decoded], local_only=False)
-                        else:
-                            tensor = decoded
-                        local_ref = ray.put(tensor)
-                        key = await store.put_ref.remote([local_ref])
-                        extra_info["routed_experts"] = key
+                        decoded = await self._decode_routed_experts(routed_experts)
+                        decoded = torch.as_tensor(decoded, dtype=torch.long)
+                        extra_info["routed_experts"] = decoded
                     elif routed_experts is not None and exist_history_routed_experts:
-                        # Turn 2+: concat history (in store) with new decoded chunk, re-put.
-                        decoded = self._decode_routed_experts(routed_experts)
-                        if isinstance(decoded, ObjectRef):
-                            cur_routed_experts = await decoded
-                            ray.internal.free([decoded], local_only=False)
-                        else:
-                            cur_routed_experts = decoded
-
-                        history_routed_experts_key = input_extra_info["routed_experts"]
-                        if isinstance(history_routed_experts_key, str):
-                            # New path: uuid key into RoutedExpertStore.  Do NOT
-                            # release here — a rollout retry may re-consume the
-                            # same history key.  Store TTL GC handles cleanup.
-                            history_ref = await store.get_ref.remote(history_routed_experts_key)
-                            history_routed_experts = await history_ref
-                        elif isinstance(history_routed_experts_key, ObjectRef):
-                            history_routed_experts = await history_routed_experts_key
-                            ray.internal.free([history_routed_experts_key], local_only=False)
-                        elif isinstance(history_routed_experts_key, (bytes, bytearray)):
-                            # Legacy path: controller.py serialized ref as base64(cloudpickle(...)),
-                            # tokenize.py base64-decoded to bytes.
-                            history_ref = cloudpickle.loads(history_routed_experts_key)
-                            history_routed_experts = await history_ref
-                            ray.internal.free([history_ref], local_only=False)
-                        else:
-                            raise TypeError(
-                                f"Unexpected type for input_extra_info['routed_experts']: "
-                                f"{type(history_routed_experts_key)}"
-                            )
-                        del input_extra_info
+                        decoded = await self._decode_routed_experts(routed_experts)
+                        history_routed_experts = torch.as_tensor(input_extra_info["routed_experts"], dtype=torch.long)
+                        cur_routed_experts = torch.as_tensor(decoded, dtype=torch.long)
 
                         assert (history_routed_experts.shape[0] - 1) > 0 and history_routed_experts.shape[
                             0
@@ -635,7 +594,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                         )
                         init_cur_roued_experts = cur_routed_experts.shape[0]
                         cur_routed_experts = cur_routed_experts[history_routed_experts.shape[0] :, :, :]
-                        concat_routed_experts = np.concatenate((history_routed_experts, cur_routed_experts), axis=0)
+                        concat_routed_experts = torch.cat((history_routed_experts, cur_routed_experts), dim=0)
                         prompt_tokens = response["meta_info"].get("prompt_tokens", 0)
                         response_tokens = response["meta_info"].get("completion_tokens", 0)
                         assert concat_routed_experts.shape[0] == prompt_tokens + response_tokens - 1, (
@@ -646,11 +605,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                             f"Tokens(prompt={prompt_tokens}, response={response_tokens}, total={prompt_tokens + response_tokens}) | "
                             f"Experts(exist={history_routed_experts.shape}, init_cur={init_cur_roued_experts}, cur={cur_routed_experts.shape}, concat={concat_routed_experts.shape})"
                         )
-                        # Same local-put pattern as turn 1 — keep concat tensor
-                        # in this worker's node plasma, store only registers.
-                        local_ref = ray.put(concat_routed_experts)
-                        key = await store.put_ref.remote([local_ref])
-                        extra_info["routed_experts"] = key
+                        extra_info["routed_experts"] = concat_routed_experts
                         del history_routed_experts
                         del cur_routed_experts
                     else:

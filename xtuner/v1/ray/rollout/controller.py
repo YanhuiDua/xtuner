@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 from uuid import uuid4
 
+import numpy as np
 import ray
+import torch
 import uvicorn
 from fastapi import FastAPI
 from ray.util.placement_group import PlacementGroup
@@ -27,8 +29,6 @@ from .worker import RolloutWorker
 
 
 ROLLOUT_RAY_GET_TIMEOUT = os.getenv("XTUNER_ROLLOUT_RAY_GET_TIMEOUT", 5 * 3600)  # default 5 hours
-
-
 @dataclass
 class WorkerInfo:
     """A data class to hold all state information for a single worker."""
@@ -484,10 +484,6 @@ class RolloutController:
 
         @app.post("/v1/chat/completions")
         async def chat_completions(request: LagentChatCompletionRequest):
-            import base64
-
-            from ray import cloudpickle
-
             inputs = tokenize(self.tokenizer, request.messages, request.tools)
             response: RLRolloutResponseItem = await self.rollout(
                 prompt=request.messages,
@@ -500,14 +496,13 @@ class RolloutController:
                     {"routed_experts": inputs["routed_experts"]} if inputs["routed_experts"] is not None else {}
                 ),
             )
-            # Rollout worker now returns a uuid str key (into RoutedExpertStore)
-            # rather than an ObjectRef.  Legacy ObjectRef path kept as a
-            # defensive fallback and encoded the same way as before so older
-            # clients still decode correctly.
-            if isinstance(response.extra_info.get("routed_experts"), ray.ObjectRef):
-                response.extra_info["routed_experts"] = base64.b64encode(
-                    cloudpickle.dumps(response.extra_info["routed_experts"])
-                ).decode("utf-8")
+            if response.extra_info.get("routed_experts") is not None:
+                routed_experts = response.extra_info["routed_experts"]
+                if isinstance(routed_experts, torch.Tensor):
+                    response.extra_info["routed_experts"] = routed_experts.cpu().tolist()
+                elif isinstance(routed_experts, np.ndarray):
+                    response.extra_info["routed_experts"] = routed_experts.tolist()
+
             message = AgentMessage.from_model_response(response, "assistant")
             message = self.reasoning_parser.parse_response(message)
             message = self.tool_call_parser.parse_response(message)

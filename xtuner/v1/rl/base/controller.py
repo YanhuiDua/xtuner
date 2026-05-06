@@ -124,8 +124,16 @@ class RawTrainingController:
                     pad_seq_ctx.position_ids = torch.cat(_position_ids_list, dim=-1)
 
                 if has_rollout_routed_experts:
-                    pad_rand_index = torch.randint(low=0, high=n_routed_experts, size=(pad_len, 1, 1))
-                    pad_seq_ctx.rollout_routed_experts = pad_rand_index
+                    routed_experts = torch.randint(
+                        low=0,
+                        high=language_cfg.n_routed_experts,
+                        size=(
+                            pad_len,
+                            language_cfg.num_hidden_layers,
+                            language_cfg.num_experts_per_tok,
+                        ),
+                    )
+                    pad_seq_ctx.rollout_routed_experts = routed_experts
 
                 seq_ctx_list.append(pad_seq_ctx)
                 label_list.append(pad_labels)
@@ -230,12 +238,16 @@ class RawTrainingController:
             )
 
             if has_rollout_routed_experts:
-                pad_rand_index = torch.randint(
+                rollout_routed_experts_tensor = torch.randint(
                     low=0,
-                    high=1,
-                    size=(1, 1, 1),  # add dummy data, true data will be initialized in train worker.fit
+                    high=language_cfg.n_routed_experts,
+                    size=(
+                        pack_max_length,
+                        language_cfg.num_hidden_layers,
+                        language_cfg.num_experts_per_tok,
+                    ),
                 )
-                pad_seq_ctx.rollout_routed_experts = pad_rand_index
+                pad_seq_ctx.rollout_routed_experts = rollout_routed_experts_tensor
 
             pad_rollout_logprobs = None
             if "rollout_logprobs" in packed_data_batches[0] and packed_data_batches[0]["rollout_logprobs"] is not None:

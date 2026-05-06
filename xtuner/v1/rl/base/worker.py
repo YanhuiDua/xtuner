@@ -13,7 +13,6 @@ import torch.distributed as dist
 import tqdm
 from mmengine.runner import set_random_seed
 from pydantic import BaseModel, ConfigDict
-from ray import cloudpickle
 from ray.actor import ActorClass, ActorProxy
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -37,7 +36,6 @@ from xtuner.v1.model.compose.qwen3_vl import Qwen3VLForConditionalGeneration
 from xtuner.v1.model.utils.misc import ModelForwardExtraLogInfo
 from xtuner.v1.ray.base import SingleAcceleratorWorker
 from xtuner.v1.ray.config import RolloutConfig
-from xtuner.v1.ray.rollout.routed_expert_store import get_store
 from xtuner.v1.rl.base.loss import BaseRLLossContext
 from xtuner.v1.train.trainer import LoadCheckpointConfig
 from xtuner.v1.utils import (
@@ -412,89 +410,37 @@ class TrainingWorker(SingleAcceleratorWorker):
             else self.config.model_cfg
         )
 
-        to_free_routed_expert_refs: list[ray.ObjectRef] = []
-        # Store keys to release AFTER consumption.  Training is 1:1 — each
-        # rollout's final key appears in this train step exactly once —
-        # so releasing here is safe (no double-consume from training side).
-        # SP-mesh: multiple ranks see the same data; only rank-0 releases,
-        # gated by dist.barrier() so other ranks finish their ray.get first.
-        to_release_pin_keys: list[str] = []
+        assert seq_ctx.input_ids is not None, "input_ids is None"
+        target_shape = (
+            seq_ctx.input_ids.size(1),
+            language_cfg.num_hidden_layers,
+            language_cfg.num_experts_per_tok,
+        )
         if isinstance(rollout_routed_experts, list):
-            # list[n,l,e]
             out_rollout_routed_expert = []
             for rollout_routed_expert in rollout_routed_experts:
-                if isinstance(rollout_routed_expert, torch.Tensor):
-                    rollout_routed_experts_tensor = torch.randint(
-                        low=0,
-                        high=language_cfg.n_routed_experts,
-                        size=(
-                            rollout_routed_expert.size(0),
-                            language_cfg.num_hidden_layers,
-                            language_cfg.num_experts_per_tok,
-                        ),
-                    )
-                    out_rollout_routed_expert.append(rollout_routed_experts_tensor)
-                elif isinstance(rollout_routed_expert, str):
-                    # New path: uuid key → RoutedExpertStore.  Owner is the
-                    # store actor, so ray.get is reliable regardless of
-                    # lmdeploy worker state.
-                    store = get_store()
-                    pin_key = rollout_routed_expert
-                    pin_ref = ray.get(store.get_ref.remote(pin_key))
-                    rollout_routed_expert = ray.get(pin_ref)
-                    if self.sp_mesh is None or self.sp_mesh.size() == 1:
-                        store.release.remote(pin_key)
-                    elif self.sp_mesh.get_local_rank() == 0:
-                        to_release_pin_keys.append(pin_key)
-                    rollout_routed_expert = torch.as_tensor(rollout_routed_expert, dtype=torch.long)
-                    rollout_routed_expert = rollout_routed_expert.reshape(
-                        -1, language_cfg.num_hidden_layers, language_cfg.num_experts_per_tok
-                    )
-                    out_rollout_routed_expert.append(rollout_routed_expert)
-                else:
-                    # Legacy path: bytes (base64-decoded cloudpickle of ObjectRef).
-                    rollout_routed_expert_refs = cloudpickle.loads(rollout_routed_expert)
-                    rollout_routed_expert = ray.get(rollout_routed_expert_refs)
-                    # free obj store explicitly
-                    if self.sp_mesh is None or self.sp_mesh.size() == 1:
-                        ray.internal.free(rollout_routed_expert_refs, local_only=False)
-                    else:
-                        if self.sp_mesh.get_local_rank() == 0:
-                            # only free once of sp mesh
-                            to_free_routed_expert_refs.append(rollout_routed_expert_refs)
-                    rollout_routed_expert = torch.as_tensor(rollout_routed_expert, dtype=torch.long)
-                    rollout_routed_expert = rollout_routed_expert.reshape(
-                        -1, language_cfg.num_hidden_layers, language_cfg.num_experts_per_tok
-                    )
-                    out_rollout_routed_expert.append(rollout_routed_expert)
+                rollout_routed_expert = torch.as_tensor(rollout_routed_expert, dtype=torch.long)
+                rollout_routed_expert = rollout_routed_expert.reshape(
+                    -1, language_cfg.num_hidden_layers, language_cfg.num_experts_per_tok
+                )
+                out_rollout_routed_expert.append(rollout_routed_expert)
 
             seq_ctx.rollout_routed_experts = torch.cat(out_rollout_routed_expert, dim=0)  # max_len,l,e
         else:
             assert isinstance(rollout_routed_experts, torch.Tensor), (
                 f"padding experts should be a dummy tensor, bug got {type(rollout_routed_experts)}"
             )
-            rollout_routed_experts_tensor = torch.randint(
-                low=0,
-                high=language_cfg.n_routed_experts,
-                size=(
-                    self.config.pack_max_length,
-                    language_cfg.num_hidden_layers,
-                    language_cfg.num_experts_per_tok,
-                ),
-            )
-            seq_ctx.rollout_routed_experts = rollout_routed_experts_tensor
+            rollout_routed_experts = torch.as_tensor(rollout_routed_experts, dtype=torch.long)
+            if tuple(rollout_routed_experts.shape) == target_shape:
+                seq_ctx.rollout_routed_experts = rollout_routed_experts
+            else:
+                seq_ctx.rollout_routed_experts = torch.randint(
+                    low=0,
+                    high=language_cfg.n_routed_experts,
+                    size=target_shape,
+                )
 
-        assert seq_ctx.input_ids is not None, "input_ids is None"
         assert seq_ctx.rollout_routed_experts.size(0) == seq_ctx.input_ids.size(1)
-
-        if self.sp_mesh is not None and self.sp_mesh.size() > 1:
-            dist.barrier()
-            for free_routed_expert_refs in to_free_routed_expert_refs:
-                ray.internal.free(free_routed_expert_refs, local_only=False)
-            if to_release_pin_keys:
-                get_store().release_many.remote(to_release_pin_keys)
-            del to_free_routed_expert_refs
-            del to_release_pin_keys
 
     @ray_method
     def fit(self, data_batches: list[WorkerInputItem], rollout_idx: int) -> WorkerLogItem:
