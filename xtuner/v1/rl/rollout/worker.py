@@ -27,7 +27,6 @@ from xtuner.v1.rl.utils import (
     AutoAcceleratorWorkers,
     CPUResourcesConfig,
     SingleAcceleratorWorker,
-    cancel_and_drain,
     find_master_addr_and_port,
     get_eos_token,
     register_cpu_resources,
@@ -35,6 +34,12 @@ from xtuner.v1.rl.utils import (
 from xtuner.v1.utils import get_logger
 from xtuner.v1.utils.httpx_utils import HttpRequestErrorType, HttpRequestResult
 
+from .dispatch_diagnostics import (
+    DispatchDiagnosticsConfig,
+    DispatchHttpGate,
+    DispatchStageTracker,
+    build_rollout_request_id,
+)
 from .utils import PartialRolloutHandler
 
 
@@ -316,6 +321,27 @@ class RolloutConfig(BaseModel):
             help="Number of consecutive health check failures required before marking a worker inactive.",
         ),
     ] = 3
+    rollout_dispatch_diagnostics: Annotated[
+        bool,
+        Parameter(
+            group=infer_group,
+            help="Enable rollout dispatch diagnostics for Ray, HTTP, and inference engine queues.",
+        ),
+    ] = False
+    rollout_dispatch_log_interval_seconds: Annotated[
+        float,
+        Parameter(
+            group=infer_group,
+            help="Minimum interval in seconds between rollout dispatch diagnostic logs.",
+        ),
+    ] = 30.0
+    rollout_dispatch_grace_seconds: Annotated[
+        float,
+        Parameter(
+            group=infer_group,
+            help="Grace period in seconds before rollout dispatch diagnostics report sustained queueing.",
+        ),
+    ] = 2.0
     _logged_server_urls_per_engine: bool = PrivateAttr(default=False)
 
     @property
@@ -507,9 +533,23 @@ class RolloutWorker(SingleAcceleratorWorker):
         assert config.rollout_max_batch_size_per_instance, (
             "rollout_max_batch_size_per_instance must be set in RolloutConfig"
         )
-        http_concurrency = config.rollout_max_batch_size_per_instance * config.allow_over_concurrency_ratio
+        http_concurrency = max(
+            1,
+            math.ceil(config.rollout_max_batch_size_per_instance * config.allow_over_concurrency_ratio),
+        )
         limits = httpx.Limits(max_connections=http_concurrency, max_keepalive_connections=100)
         self.client = httpx.AsyncClient(limits=limits, timeout=self.config.rollout_timeout)
+        self.dispatch_diag_config = None
+        self.dispatch_diag = None
+        self.http_gate = None
+        if config.rollout_dispatch_diagnostics:
+            self.dispatch_diag_config = DispatchDiagnosticsConfig.from_rollout_config(config)
+            self.dispatch_diag = DispatchStageTracker(
+                name=f"rollout_worker:{rank}",
+                config=self.dispatch_diag_config,
+                metadata={"rank": rank, "http_concurrency": http_concurrency},
+            )
+            self.http_gate = DispatchHttpGate(limit=http_concurrency, tracker=self.dispatch_diag)
         self.server_task = None
         self.engine_bundle_idxs: list[int] = []
         self.server_process: Optional[multiprocessing.Process] = None
@@ -654,11 +694,41 @@ class RolloutWorker(SingleAcceleratorWorker):
             self.logger.error(f"Health check failed for server {self.server_url}: {e}")
             return False
 
+    @ray.method(concurrency_group=ROLLOUT_CONCURRENCY_GROUP_CONTROL)
+    def get_dispatch_diagnostics(self) -> dict[str, Any]:
+        """Return local rollout dispatch diagnostic counters for this
+        worker."""
+        if self.dispatch_diag is None:
+            return {
+                "enabled": False,
+                "name": f"rollout_worker:{self.rank}",
+                "metadata": {"rank": self.rank},
+                "active_by_stage": {},
+                "entered_total_by_stage": {},
+                "finished_total_by_status": {},
+                "oldest_active_s_by_stage": {},
+            }
+        return self.dispatch_diag.snapshot()
+
     async def _decode_routed_experts(self, routed_experts: Any) -> Any:
         return routed_experts
 
     @ray.method(concurrency_group=ROLLOUT_CONCURRENCY_GROUP_GENERATE)
     async def generate(self, rollout_state: RolloutState) -> RolloutState:
+        result_state = rollout_state
+        dispatch_diag = self.dispatch_diag
+        if dispatch_diag is not None:
+            request_id = build_rollout_request_id(rollout_state)
+            dispatch_diag.enter_worker(request_id)
+            try:
+                result_state = await self._generate_impl(rollout_state)
+                return result_state
+            finally:
+                dispatch_diag.finish(request_id, getattr(result_state, "status", None))
+
+        return await self._generate_impl(rollout_state)
+
+    async def _generate_impl(self, rollout_state: RolloutState) -> RolloutState:
         # TODO(@duanyanhui):
         # 1. support claude format input
         # 2. 需要看下新的输入输出(RolloutState)怎么适配PartialRollout的逻辑，先跑起来
@@ -717,7 +787,15 @@ class RolloutWorker(SingleAcceleratorWorker):
 
         for attempt in range(max_retries + 1):
             is_last_attempt = attempt == max_retries
-            http_result = await self._safe_post_request(endpoint_url, headers=headers, payload=payload)
+            attempt_request_id = None
+            if self.http_gate is not None:
+                attempt_request_id = build_rollout_request_id(rollout_state, attempt=attempt)
+            http_result = await self._safe_post_request(
+                endpoint_url,
+                headers=headers,
+                payload=payload,
+                request_id=attempt_request_id,
+            )
 
             # Case 1: HTTP Request is Successful
             if http_result.response:
@@ -897,9 +975,19 @@ class RolloutWorker(SingleAcceleratorWorker):
             ray.cancel(self.server_task)
             raise TimeoutError("Server failed to start within the timeout period.")
 
-    async def _safe_post_request(self, url, headers, payload) -> HttpRequestResult:
+    async def _safe_post_request(self, url, headers, payload, request_id: str | None = None) -> HttpRequestResult:
         send_task = None
         abort_task = None
+        http_gate = getattr(self, "http_gate", None)
+        if request_id is None and http_gate is not None:
+            request_id = f"{url}:{id(payload)}"
+
+        async def cancel_and_drain(task: asyncio.Task | None) -> None:
+            if task is None:
+                return
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
         try:
             if self.receive_abort_request.is_set():
@@ -911,7 +999,17 @@ class RolloutWorker(SingleAcceleratorWorker):
                 headers=headers,
                 json=payload,
             )
-            send_task = asyncio.create_task(self.client.send(req))
+
+            if http_gate is None:
+                send_task = asyncio.create_task(self.client.send(req))
+            else:
+                assert request_id is not None
+
+                async def send_request():
+                    async with http_gate.slot(request_id):
+                        return await self.client.send(req)
+
+                send_task = asyncio.create_task(send_request())
             abort_task = asyncio.create_task(self._wait_abort_request())
             done, _ = await asyncio.wait(
                 {send_task, abort_task},
@@ -946,6 +1044,15 @@ class RolloutWorker(SingleAcceleratorWorker):
             result = HttpRequestResult(error_type=error_type, exception=e, url=url, payload=payload)
             return result
         finally:
+            dispatch_diag = getattr(self, "dispatch_diag", None)
+            if dispatch_diag is not None and request_id is not None:
+                status = None
+                if send_task is not None:
+                    if send_task.cancelled():
+                        status = "cancelled"
+                    elif send_task.done():
+                        status = "error" if send_task.exception() is not None else "success"
+                dispatch_diag.finish(request_id, status)
             if abort_task is not None and not abort_task.done():
                 await cancel_and_drain(abort_task)
 

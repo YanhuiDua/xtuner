@@ -37,6 +37,7 @@ class SessionRouter:
 
         # OrderedDict: key=session_id -> value=(worker_rank, last_used_ts)
         self._map: OrderedDict[int, tuple[int, float]] = OrderedDict()
+        self._map_lock = threading.RLock()
 
         self._worker_cycler = cycle(worker_infos.keys())
         self._lock = asyncio.Lock()
@@ -80,25 +81,44 @@ class SessionRouter:
 
     async def get_worker(self, session_id: int) -> Optional[Any]:
         async with self._lock:
-            self._evict_expired()
+            with self._map_lock:
+                self._evict_expired()
 
-            if session_id in self._map:
-                worker_rank, _ = self._map.pop(session_id)
-                if self._worker_infos_lock is None:
-                    info = self._worker_infos.get(worker_rank)
-                else:
-                    with self._worker_infos_lock:
+                if session_id in self._map:
+                    worker_rank, _ = self._map.pop(session_id)
+                    if self._worker_infos_lock is None:
                         info = self._worker_infos.get(worker_rank)
-                if info and info.is_active:
-                    self._map[session_id] = (worker_rank, self._now())
-                    return info.actor
+                    else:
+                        with self._worker_infos_lock:
+                            info = self._worker_infos.get(worker_rank)
+                    if info and info.is_active:
+                        self._map[session_id] = (worker_rank, self._now())
+                        return info.actor
 
-            rank, worker = self._choose_next_active_worker()
-            if rank == -1:
-                return None
-            self._map[session_id] = (rank, self._now())
-            self._evict_lru_to_capacity()
-            return worker
+                rank, worker = self._choose_next_active_worker()
+                if rank == -1:
+                    return None
+                self._map[session_id] = (rank, self._now())
+                self._evict_lru_to_capacity()
+                return worker
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._map_lock:
+            session_count = len(self._map)
+        if self._worker_infos_lock is None:
+            worker_infos = list(self._worker_infos.values())
+        else:
+            with self._worker_infos_lock:
+                worker_infos = list(self._worker_infos.values())
+        total_workers = len(worker_infos)
+        active_workers = sum(1 for info in worker_infos if info and info.is_active)
+        return {
+            "session_count": session_count,
+            "max_sessions": self._max_sessions,
+            "max_idle_seconds": self._max_idle,
+            "active_workers": active_workers,
+            "total_workers": total_workers,
+        }
 
 
 class RolloutHealthChecker:

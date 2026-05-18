@@ -1,6 +1,7 @@
 import asyncio
 import os
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeAlias, TypedDict
@@ -15,6 +16,16 @@ from xtuner.v1.data_proto.rl_data import RolloutState, Status
 from xtuner.v1.rl.utils import AutoAcceleratorWorkers
 from xtuner.v1.utils import XTUNER_DETERMINISTIC, get_logger
 
+from .dispatch_diagnostics import (
+    CONTROLLER_ACTIVE,
+    WORKER_SUBMITTED,
+    AggregateDispatchCounter,
+    DispatchDiagnosticsConfig,
+    EngineMetricsReader,
+    analyze_dispatch_summary,
+    format_dispatch_summary,
+    summarize_dispatch_diagnostics,
+)
 from .parser.factory import build_reasoning_parser, build_tool_call_parser
 from .parser.reasoning_parser import ReasoningParser
 from .parser.tool_parser import ToolCallParser
@@ -115,6 +126,25 @@ class RolloutController:
         self.health_checker.start()
         self._tool_call_parser, self._reasoning_parser = self._build_output_parsers()
         self._gateway_url: str | None = None
+        self.dispatch_diag_config = None
+        self.dispatch_counter = None
+        self.engine_metrics_reader = None
+        self._last_dispatch_diag_log_time = 0.0
+        if infer_config.rollout_dispatch_diagnostics:
+            self.dispatch_diag_config = DispatchDiagnosticsConfig.from_rollout_config(infer_config)
+            self.dispatch_counter = AggregateDispatchCounter(
+                enabled=True,
+                name="rollout_controller",
+                metadata={"active_worker_count": self.num_active_workers},
+            )
+            self.engine_metrics_reader = EngineMetricsReader(
+                timeout_seconds=self.dispatch_diag_config.engine_metrics_timeout_seconds
+            )
+            self.logger.info(
+                "Rollout dispatch diagnostics enabled: "
+                f"grace_seconds={self.dispatch_diag_config.grace_seconds}, "
+                f"log_interval_seconds={self.dispatch_diag_config.log_interval_seconds}"
+            )
 
     def start_gateway(self, config: "GatewayConfig") -> str | None:
         """Start the gateway HTTP server in a daemon thread and return its URL.
@@ -194,6 +224,9 @@ class RolloutController:
 
     @ray.method(concurrency_group=ROLLOUT_CONCURRENCY_GROUP_GENERATE)
     async def generate(self, rollout_state: RolloutState) -> RolloutState:
+        dispatch_counter = self.dispatch_counter
+        if dispatch_counter is not None:
+            dispatch_counter.enter(CONTROLLER_ACTIVE)
         if XTUNER_DETERMINISTIC:
             sample_params = rollout_state.sample_params.model_copy(deep=True)
             sample_params.sampling_seed = self.config.random_seed + (
@@ -201,19 +234,26 @@ class RolloutController:
             )
             rollout_state.sample_params = sample_params
 
-        session_id = rollout_state.session_uid if rollout_state.session_uid is not None else uuid4().int
-        worker = await self.router.get_worker(session_id)
-        if worker is None:
-            rollout_state.status = Status.FAILED
-            rollout_state.error_msg = "No active rollout worker available."
-            return rollout_state
-
-        response_ref = worker.generate.remote(rollout_state=rollout_state)  # type: ignore[attr-defined]
+        worker = None
         try:
-            response_rollout_state = await asyncio.wait_for(
-                response_ref,
-                timeout=self.config.rollout_timeout * self.timeout_multiplier,
-            )
+            session_id = rollout_state.session_uid if rollout_state.session_uid is not None else uuid4().int
+            worker = await self.router.get_worker(session_id)
+            if worker is None:
+                rollout_state.status = Status.FAILED
+                rollout_state.error_msg = "No active rollout worker available."
+                return rollout_state
+
+            response_ref = worker.generate.remote(rollout_state=rollout_state)  # type: ignore[attr-defined]
+            if dispatch_counter is not None:
+                dispatch_counter.enter(WORKER_SUBMITTED)
+            try:
+                response_rollout_state = await asyncio.wait_for(
+                    response_ref,
+                    timeout=self.config.rollout_timeout * self.timeout_multiplier,
+                )
+            finally:
+                if dispatch_counter is not None:
+                    dispatch_counter.finish(WORKER_SUBMITTED)
             self._apply_output_parsers(response_rollout_state)
             return response_rollout_state
         except asyncio.TimeoutError:
@@ -223,6 +263,9 @@ class RolloutController:
                 f"Rollout request timed out after {self.config.rollout_timeout * self.timeout_multiplier} seconds."
             )
             return rollout_state
+        finally:
+            if dispatch_counter is not None:
+                dispatch_counter.finish(CONTROLLER_ACTIVE)
 
     def _apply_output_parsers(self, rollout_state: RolloutState) -> None:
         """Apply tool-call and reasoning parsers to the rollout state in-
@@ -248,13 +291,86 @@ class RolloutController:
 
     @ray.method(concurrency_group=ROLLOUT_CONCURRENCY_GROUP_CONTROL)
     def pause_generation(self):
+        self._log_dispatch_diagnostics("pause_start", raise_on_warning=False)
         self.health_checker.pause()
         self._broadcast_to_active_workers("pause_generation")
+        self._log_dispatch_diagnostics("pause_sent", raise_on_warning=True)
 
     @ray.method(concurrency_group=ROLLOUT_CONCURRENCY_GROUP_CONTROL)
     def continue_generation(self):
         self.health_checker.resume()
         self._broadcast_to_active_workers("continue_generation")
+
+    def _collect_dispatch_diagnostics(
+        self,
+        fetch_engine_metrics: bool = True,
+        raise_on_warning: bool = True,
+    ) -> dict[str, Any]:
+        if self.dispatch_diag_config is None or self.dispatch_counter is None:
+            return {
+                "enabled": False,
+                "controller": None,
+                "router": self.router.snapshot(),
+                "workers": [],
+                "engine": None,
+                "summary": {},
+                "warnings": [],
+            }
+
+        controller_snapshot = self.dispatch_counter.snapshot()
+        router_snapshot = self.router.snapshot()
+        with self.worker_info_lock:
+            active_infos = [info for info in self.rank2info.values() if info.is_active]
+        worker_snapshots = []
+        if active_infos:
+            worker_snapshots = ray.get(
+                [info.actor.get_dispatch_diagnostics.remote() for info in active_infos],  # type: ignore[attr-defined]
+                timeout=ROLLOUT_RAY_GET_TIMEOUT,
+            )
+
+        engine_snapshot = None
+        if fetch_engine_metrics and self.dispatch_diag_config.enabled and self.config.rollout_backend == "lmdeploy":
+            assert self.engine_metrics_reader is not None
+            engine_snapshot = self.engine_metrics_reader.fetch_lmdeploy([info.url for info in active_infos])
+
+        summary = summarize_dispatch_diagnostics(
+            controller=controller_snapshot,
+            router=router_snapshot,
+            workers=worker_snapshots,
+            engine=engine_snapshot,
+        )
+        warnings = analyze_dispatch_summary(summary, self.dispatch_diag_config)
+        diagnostics = {
+            "enabled": self.dispatch_diag_config.enabled,
+            "controller": controller_snapshot,
+            "router": router_snapshot,
+            "workers": worker_snapshots,
+            "engine": engine_snapshot,
+            "summary": summary,
+            "warnings": warnings,
+        }
+        if raise_on_warning and warnings:
+            raise RuntimeError(format_dispatch_summary(summary, warnings))
+        return diagnostics
+
+    def _log_dispatch_diagnostics(
+        self,
+        reason: str,
+        *,
+        force: bool = True,
+        raise_on_warning: bool = True,
+    ) -> None:
+        if self.dispatch_diag_config is None:
+            return
+        now = time.perf_counter()
+        if not force and now - self._last_dispatch_diag_log_time < self.dispatch_diag_config.log_interval_seconds:
+            return
+        diagnostics = self._collect_dispatch_diagnostics(
+            fetch_engine_metrics=True,
+            raise_on_warning=raise_on_warning,
+        )
+        self._last_dispatch_diag_log_time = now
+        self.logger.info(f"[{reason}] {format_dispatch_summary(diagnostics['summary'], diagnostics['warnings'])}")
 
     @ray.method(concurrency_group=ROLLOUT_CONCURRENCY_GROUP_CONTROL)
     def offload(self):
