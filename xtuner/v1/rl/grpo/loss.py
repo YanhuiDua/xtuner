@@ -152,7 +152,8 @@ class GRPOLossContext(BaseLossContext[RLLossContextInputItem]):
 
         ratio = (logprobs - old_logprobs.detach()).exp()
         ratio = ratio * (shifted_labels != self.loss_cfg.ignore_idx).float()
-        extra_info = {"max_ratio": ratio.max()}
+        # extra_info = {"max_ratio": ratio.squeeze().max()}
+        extra_info = {}
 
         if self.loss_cfg.use_kl_loss:
             ref_logprobs = loss_kwargs.ref_logprobs

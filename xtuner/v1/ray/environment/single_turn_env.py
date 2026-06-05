@@ -66,6 +66,9 @@ class SingleTurnEnvironment(BaseEnvironment):
                 for sample in group_data_items
             ]
             rollout_responses = await asyncio.gather(*response_future)  # RLRolloutResponseItem
+            for sample in group_data_items:
+                if sample.env.rollout.response_ids is not None or sample.env.rollout.response is not None:
+                    self.logger.info(f"rollout response_ids exist: {sample.env.rollout.response_ids is not None}, rollout response exist {sample.env.rollout.response} \n")
             group_data_items = update_dataflow_item(group_data_items, "env.rollout", rollout_responses)
         return group_data_items
 
