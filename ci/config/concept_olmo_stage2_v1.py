@@ -1,11 +1,18 @@
-# Smoke SFT config for Concept OLMo Stage-2 V1.
+# SFT config for Concept OLMo Stage-2 V1, based on qwen3_moe_30BA3.py.
 #
-# Usage (single node, 8 GPUs):
+# Required environment variables:
 #
 #   export CONCEPT_OLMO_STAGE2_V1_PATH=/path/to/concept_olmo_stage_2_V1
-#   export ALPACA_PATH=/path/to/alpaca
-#   torchrun --nproc-per-node=8 -m xtuner.v1.train.cli.sft \
-#       --config ci/config/concept_olmo_stage2_v1.py
+#   export ALPACA_PATH=/path/to/openai_sft.jsonl
+#
+# Optional environment variables:
+#
+#   TOTAL_STEP=50 SP_SIZE=2 WORK_DIR=/tmp/concept_olmo_stage2_v1_sft
+#
+# Launch from the XTuner repository root with:
+#
+#   torchrun --nproc-per-node=8 xtuner/v1/train/cli/sft.py \
+#     --config ci/config/concept_olmo_stage2_v1.py
 import os
 
 from xtuner.v1.config import AdamWConfig, FSDPConfig, LRConfig
@@ -18,6 +25,9 @@ from xtuner.v1.train import TrainerConfig
 
 CONCEPT_OLMO_STAGE2_V1_PATH = os.environ["CONCEPT_OLMO_STAGE2_V1_PATH"]
 ALPACA_PATH = os.environ["ALPACA_PATH"]
+TOTAL_STEP = int(os.getenv("TOTAL_STEP", "50"))
+SP_SIZE = int(os.getenv("SP_SIZE", "2"))
+WORK_DIR = os.getenv("WORK_DIR", "/tmp/concept_olmo_stage2_v1_sft")
 
 model_cfg = ConceptOlmoStage2V1Config()
 optim_cfg = AdamWConfig(lr=6e-5)
@@ -29,7 +39,7 @@ fsdp_cfg = FSDPConfig(
 dataset_config = [
     {
         "dataset": DatasetConfig(name="alpaca", anno_path=ALPACA_PATH, sample_ratio=1.0),
-        "tokenize_fn": FTDPTokenizeFnConfig(max_length=8192),
+        "tokenize_fn": FTDPTokenizeFnConfig(chat_template="qwen", max_length=8192),
     },
 ]
 dataloader_config = DataloaderConfig(pack_max_length=8192)
@@ -46,8 +56,8 @@ trainer = TrainerConfig(
     loss_cfg=loss_cfg,
     tokenizer_path=CONCEPT_OLMO_STAGE2_V1_PATH,
     global_batch_size=16,
-    sp_size=2,
-    total_epoch=1,
-    work_dir="/tmp/concept_olmo_stage2_v1",
+    sp_size=SP_SIZE,
+    total_step=TOTAL_STEP,
+    work_dir=WORK_DIR,
     seed=0,
 )
