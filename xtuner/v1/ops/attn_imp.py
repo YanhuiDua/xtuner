@@ -111,7 +111,11 @@ def _create_windowed_grouped_causal_mask(document_ids, window_size):
 
     positions = torch.arange(seq_len, device=document_ids.device)
     rel_pos = positions.unsqueeze(1) - positions.unsqueeze(0)  # (seq_len, seq_len)
-    window_mask = (rel_pos >= 0) & (rel_pos < window_size)
+    # FlashAttention defines ``window_size_left`` as an inclusive distance:
+    # query i attends keys in [i - window_size_left, i]. Mirror that contract
+    # in eager/flex so switching attention implementations does not change the
+    # model's receptive field.
+    window_mask = (rel_pos >= 0) & (rel_pos <= window_size)
     doc_mask = document_ids.unsqueeze(2) == document_ids.unsqueeze(1)
 
     final_mask = doc_mask & window_mask
@@ -134,7 +138,7 @@ def create_packing_block_causal_mask(seq_lens: torch.Tensor, window_size=(-1, -1
             document_causal_mask = document_mask
 
         if window_size != (-1, -1):
-            window_mask = q_idx - kv_idx < window_size[0]
+            window_mask = q_idx - kv_idx <= window_size[0]
             document_causal_mask = document_causal_mask & window_mask
         return document_causal_mask
 
