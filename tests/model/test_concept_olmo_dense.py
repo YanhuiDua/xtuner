@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from xtuner._testing import DeterministicDDPTestCase
+from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.model import (
     ConceptLMV22VQConfig,
@@ -98,6 +100,38 @@ def test_packed_documents_match_separate_forwards(monkeypatch):
         packed_logits = model(packed_ctx).logits
         separate_logits = torch.cat([model(context).logits for context in separate_contexts], dim=1)
     torch.testing.assert_close(packed_logits, separate_logits, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for FSDP")
+class TestConceptOlmoFSDP(DeterministicDDPTestCase):
+    @property
+    def world_size(self) -> int:
+        return 1
+
+    def test_forward_backward_with_recompute(self):
+        self.create_pg("cuda")
+        config = _tiny_config()
+        baseline = config.build().cuda().eval()
+        _initialize(baseline)
+        state = {key: value.detach().clone() for key, value in baseline.state_dict().items()}
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]], device="cuda")
+        with torch.no_grad():
+            expected = baseline(SequenceContext.from_input_ids((input_ids,), device="cuda")).logits
+        del baseline
+
+        model = config.build().cuda()
+        model.load_state_dict(state)
+        model.fully_shard(
+            FSDPConfig(
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+                recompute_ratio=1.0,
+            )
+        )
+        output = model(SequenceContext.from_input_ids((input_ids,), device="cuda")).logits
+        torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+        output.sum().backward()
+        assert any(parameter.grad is not None for parameter in model.parameters())
 
 
 @pytest.mark.skipif(MODEL_PATH is None, reason="CONCEPT_OLMO_STAGE2_V1_PATH is not set")

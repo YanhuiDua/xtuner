@@ -6,12 +6,21 @@ from pathlib import Path
 from typing import Literal, Self, cast
 
 import torch
+import torch.distributed as dist
 from pydantic import Field, model_validator
 from torch import nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+from tqdm import tqdm
+from typing_extensions import override
 
+from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
+from xtuner.v1.float8.float8_handler import Float8Handler
 from xtuner.v1.loss import BaseLossContext
 from xtuner.v1.model.base import BaseModel, ModelOutputs, TransformerConfig
+from xtuner.v1.model.utils import checkpoint_wrapper
 from xtuner.v1.module import (
     CheckpointRMSNorm,
     ConceptQuantizer,
@@ -27,6 +36,10 @@ from xtuner.v1.module import (
 from xtuner.v1.module.decoder_layer import ConceptOlmoDecoderLayer
 from xtuner.v1.module.linear import build_linear
 from xtuner.v1.module.rope import RopeParametersConfig
+from xtuner.v1.utils import get_device, log_rank0
+
+
+DEVICE = get_device()
 
 
 class ConceptLMV22VQ(BaseModel):
@@ -113,7 +126,7 @@ class ConceptLMV22VQ(BaseModel):
 
         self.fusion_tok_norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.fusion_hl_norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.fusion_norm_alpha = nn.Parameter(torch.tensor(config.concept_fusion_norm_alpha_init))
+        self.fusion_norm_alpha = nn.Parameter(torch.tensor([config.concept_fusion_norm_alpha_init]))
         self.decoder_read_encoder_shared_source_norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.decoder_read_concept_shared_source_norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.final_read_concept_gate_logits = nn.Parameter(torch.zeros(config.concept_decoder_layers, 2))
@@ -179,6 +192,33 @@ class ConceptLMV22VQ(BaseModel):
             if re.search(pattern, key):
                 return [re.sub(pattern, replacement, key)]
         return [key]
+
+    @override
+    def safetensors_to_params(
+        self,
+        safetensors: list[torch.Tensor],
+        local_tensor: torch.Tensor,
+        param_name: str,
+        start: int | None,
+        end: int | None,
+        dim: int | None,
+    ) -> None:
+        if param_name == "fusion_norm_alpha":
+            safetensors = [safetensors[0].reshape(1)]
+        super().safetensors_to_params(
+            safetensors=safetensors,
+            local_tensor=local_tensor,
+            param_name=param_name,
+            start=start,
+            end=end,
+            dim=dim,
+        )
+
+    @override
+    def param_to_safetensor(self, safetensor: torch.Tensor, hf_param_name: str) -> torch.Tensor:
+        if hf_param_name == "fusion_norm_alpha":
+            return safetensor.squeeze(0)
+        return safetensor
 
     @staticmethod
     def _lengths(seq_ctx: SequenceContext) -> list[int]:
@@ -301,7 +341,7 @@ class ConceptLMV22VQ(BaseModel):
         token_lengths = self._lengths(seq_ctx)
         token_position_embeddings = self.rotary_emb(hidden_states, seq_ctx.position_ids)
 
-        encoder_history = [hidden_states]
+        encoder_history = hidden_states.unsqueeze(2)
         encoder_raw_states: list[torch.Tensor] = []
         for stage in self.encoder_stages:
             hidden_states, raw = stage(
@@ -311,7 +351,7 @@ class ConceptLMV22VQ(BaseModel):
                 encoder_history,
             )
             encoder_raw_states.append(raw)
-            encoder_history.append(raw)
+            encoder_history = torch.cat((encoder_history, raw.unsqueeze(2)), dim=2)
 
         concept_hidden, concept_lengths = self._merge_chunks(hidden_states, token_lengths)
         concept_hidden = self.concept_vq_input_norm(concept_hidden)
@@ -327,7 +367,7 @@ class ConceptLMV22VQ(BaseModel):
         assert concept_ctx.position_ids is not None
         concept_position_embeddings = self.rotary_emb(concept_hidden, concept_ctx.position_ids)
 
-        concept_history = [concept_hidden]
+        concept_history = concept_hidden.unsqueeze(2)
         concept_raw_states: list[torch.Tensor] = []
         for stage in self.concept_stages:
             concept_hidden, raw = stage(
@@ -338,7 +378,7 @@ class ConceptLMV22VQ(BaseModel):
                 encoder_concept_states,
             )
             concept_raw_states.append(raw)
-            concept_history.append(raw)
+            concept_history = torch.cat((concept_history, raw.unsqueeze(2)), dim=2)
         concept_hidden = self.concept_final_norm(concept_hidden)
         concept_logits = torch.stack([head(concept_hidden) for head in self.prediction_heads], dim=2)
         codebook = self.concept_quantizer.transformed_codebook().to(concept_logits.dtype)
@@ -363,7 +403,7 @@ class ConceptLMV22VQ(BaseModel):
             prepend_zero=False,
         )
 
-        decoder_history = [hidden_states]
+        decoder_history = hidden_states.unsqueeze(2)
         for layer_idx, stage in enumerate(self.decoder_stages):
             gate = self.final_read_concept_gate_logits[layer_idx].float().softmax(dim=-1)
             hidden_states, raw = stage(
@@ -376,7 +416,7 @@ class ConceptLMV22VQ(BaseModel):
                 decoder_concept_states,
                 gate,
             )
-            decoder_history.append(raw)
+            decoder_history = torch.cat((decoder_history, raw.unsqueeze(2)), dim=2)
         hidden_states = self.final_norm(hidden_states)
 
         output: dict = {}
@@ -391,6 +431,128 @@ class ConceptLMV22VQ(BaseModel):
             output["logits"] = logits
             output["extra_info"] = extra_info
         return ModelOutputs(**output)
+
+    @override
+    def fully_shard(self, fsdp_config: FSDPConfig) -> Self:
+        self.fsdp_config = fsdp_config
+        self._init_device_mesh(fsdp_config)
+        assert self.fsdp_mesh is not None
+
+        if self.config.float8_cfg is not None:
+            Float8Handler.pad_for_fsdp(self, self.fsdp_mesh, callback_after_pad=self._init_load_spec)
+
+        checkpoint_preserve_rng_state = fsdp_config.checkpoint_preserve_rng_state
+        if not checkpoint_preserve_rng_state and self.config.attention.dropout > 0.0:
+            checkpoint_preserve_rng_state = True
+            log_rank0.warning("checkpoint_preserve_rng_state was enabled because attention dropout is nonzero")
+
+        if fsdp_config.requires_grad:
+            for module in self.modules():
+                for parameter_name, parameter in module.named_parameters(recurse=False):
+                    if parameter.requires_grad:
+                        setattr(module, parameter_name, nn.Parameter(parameter.to(dtype=torch.float32)))
+        else:
+            for parameter in self.parameters():
+                parameter.requires_grad = False
+
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=fsdp_config.param_dtype,
+            reduce_dtype=fsdp_config.reduce_dtype,
+        )
+        lm_head_policy = (
+            MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
+            if fsdp_config.fp32_lm_head
+            else mp_policy
+        )
+        shard_mesh = self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh
+        offload_policy = CPUOffloadPolicy() if fsdp_config.cpu_offload else None
+
+        stage_groups = (self.encoder_stages, self.concept_stages, self.decoder_stages)
+        stage_locations = [(group, stage_idx) for group in stage_groups for stage_idx in range(len(group))]
+        num_recompute_stages = int(len(stage_locations) * fsdp_config.recompute_ratio)
+        generator = torch.Generator()
+        generator.manual_seed(dist.get_rank())
+        shuffled_indices = torch.randperm(len(stage_locations), generator=generator)
+        for global_idx_tensor in tqdm(shuffled_indices, desc="[Concept OLMo FSDP Sharding]"):
+            global_idx = int(global_idx_tensor)
+            group, stage_idx = stage_locations[global_idx]
+            stage = group[stage_idx]
+            if global_idx < num_recompute_stages:
+                stage = checkpoint_wrapper(
+                    stage,
+                    preserve_rng_state=checkpoint_preserve_rng_state,
+                    checkpoint_impl=CheckpointImpl.REENTRANT,
+                )
+            group[stage_idx] = stage
+            self._fully_shard(
+                mesh=shard_mesh,
+                mp_policy=mp_policy,
+                reshard_after_forward=fsdp_config.reshard_after_forward,
+                offload_policy=offload_policy,
+                module=stage,
+            )
+
+        ordered_stages = [stage for group in stage_groups for stage in group]
+        for current_stage, next_stage in zip(ordered_stages[:-1], ordered_stages[1:], strict=True):
+            current_stage.set_modules_to_forward_prefetch([next_stage])  # type: ignore[attr-defined]
+
+        shared_modules: tuple[nn.Module, ...] = (
+            self.embed_tokens,
+            self.concept_vq_input_norm,
+            self.concept_final_norm,
+            *self.prediction_heads,
+            self.concept_read_encoder_shared_source_norm,
+            self.fusion_tok_norm,
+            self.fusion_hl_norm,
+            self.decoder_read_encoder_shared_source_norm,
+            self.decoder_read_concept_shared_source_norm,
+            self.final_norm,
+        )
+        for module in shared_modules:
+            self._fully_shard(
+                mesh=shard_mesh,
+                mp_policy=mp_policy,
+                reshard_after_forward=fsdp_config.reshard_after_forward,
+                offload_policy=offload_policy,
+                module=module,
+            )
+        self._fully_shard(
+            mesh=shard_mesh,
+            mp_policy=lm_head_policy,
+            reshard_after_forward=fsdp_config.reshard_after_forward,
+            offload_policy=offload_policy,
+            module=self.lm_head,
+        )
+        self._fully_shard(
+            mesh=shard_mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=fsdp_config.reshard_after_forward,
+            offload_policy=offload_policy,
+        )
+        self.set_modules_to_forward_prefetch([self.embed_tokens, self.encoder_stages[0]])  # type: ignore[operator]
+        self._to_empty_meta()
+        return self
+
+    def _init_device_mesh(self, fsdp_config: FSDPConfig) -> None:
+        world_size = dist.get_world_size()
+        prefix = self.config.mesh_prefix
+        if fsdp_config.hsdp_sharding_size is None:
+            model_mesh = init_device_mesh(
+                DEVICE,
+                (world_size, 1),
+                mesh_dim_names=(f"{prefix}.fsdp", f"{prefix}.others"),
+            )
+            self.fsdp_mesh = model_mesh[f"{prefix}.fsdp"]
+        else:
+            self.hsdp_mesh = init_device_mesh(
+                DEVICE,
+                (
+                    world_size // fsdp_config.hsdp_sharding_size,
+                    fsdp_config.hsdp_sharding_size,
+                ),
+                mesh_dim_names=(f"{prefix}.hsdp_replicate", f"{prefix}.hsdp_shard"),
+            )
+            self.fsdp_mesh = self.hsdp_mesh[f"{prefix}.hsdp_shard"]
 
 
 class ConceptLMV22VQConfig(TransformerConfig):
