@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed.nn.functional as distF
+from torch.distributed.device_mesh import init_device_mesh
 
 from xtuner._testing import DeterministicDDPTestCase
 from xtuner.v1.config import FSDPConfig
@@ -132,6 +134,36 @@ class TestConceptOlmoFSDP(DeterministicDDPTestCase):
         torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
         output.sum().backward()
         assert any(parameter.grad is not None for parameter in model.parameters())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA devices are required for SP")
+class TestConceptOlmoSequenceParallel(DeterministicDDPTestCase):
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    def test_packed_forward_backward(self):
+        self.create_pg("cuda")
+        sp_mesh = init_device_mesh("cuda", (self.world_size,), mesh_dim_names=("sp",))
+        with self.hf_impl():
+            model = _tiny_config().build().cuda().eval()
+            _initialize(model)
+            document_a = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9]], device="cuda")
+            document_b = torch.tensor([[10, 11, 12, 13, 14]], device="cuda")
+
+            full_ctx = SequenceContext.from_input_ids((document_a, document_b), device="cuda")
+            with torch.no_grad():
+                expected = model(full_ctx).logits
+
+            sp_ctx = SequenceContext.from_input_ids((document_a, document_b), device="cuda").split(sp_mesh)
+            actual_shard = model(sp_ctx).logits
+            actual = torch.cat(
+                distF.all_gather(actual_shard.contiguous(), group=sp_mesh.get_group()),
+                dim=1,
+            )
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+            actual_shard.sum().backward()
+            assert any(parameter.grad is not None for parameter in model.parameters())
 
 
 @pytest.mark.skipif(MODEL_PATH is None, reason="CONCEPT_OLMO_STAGE2_V1_PATH is not set")

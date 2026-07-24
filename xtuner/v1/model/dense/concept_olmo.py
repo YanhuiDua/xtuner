@@ -7,10 +7,11 @@ from typing import Literal, Self, cast
 
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as distF
 from pydantic import Field, model_validator
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from tqdm import tqdm
 from typing_extensions import override
@@ -225,6 +226,57 @@ class ConceptLMV22VQ(BaseModel):
         lengths = seq_ctx.cu_seq_lens_q[1:] - seq_ctx.cu_seq_lens_q[:-1]
         return [int(length) for length in lengths.detach().cpu().tolist()]
 
+    @staticmethod
+    def _gather_sequence(hidden_states: torch.Tensor, sp_mesh: DeviceMesh | None) -> torch.Tensor:
+        if sp_mesh is None or sp_mesh.size() == 1:
+            return hidden_states
+        gathered = distF.all_gather(hidden_states.contiguous(), group=sp_mesh.get_group())
+        return torch.cat(gathered, dim=1).contiguous()
+
+    @staticmethod
+    def _pad_and_split_sequence(
+        hidden_states: torch.Tensor,
+        sp_mesh: DeviceMesh | None,
+    ) -> tuple[torch.Tensor, int]:
+        if sp_mesh is None or sp_mesh.size() == 1:
+            return hidden_states, 0
+        pad_size = (-hidden_states.shape[1]) % sp_mesh.size()
+        if pad_size:
+            padding = hidden_states.new_zeros(hidden_states.shape[0], pad_size, *hidden_states.shape[2:])
+            hidden_states = torch.cat((hidden_states, padding), dim=1)
+        shard_size = hidden_states.shape[1] // sp_mesh.size()
+        shard_start = sp_mesh.get_local_rank() * shard_size
+        return hidden_states[:, shard_start : shard_start + shard_size].contiguous(), pad_size
+
+    @classmethod
+    def _apply_sequence_module(
+        cls,
+        hidden_states: torch.Tensor,
+        module: nn.Module,
+        sp_mesh: DeviceMesh | None,
+    ) -> torch.Tensor:
+        """Apply a token-wise module once across SP ranks and restore the full
+        sequence."""
+        valid_length = hidden_states.shape[1]
+        local_states, _ = cls._pad_and_split_sequence(hidden_states, sp_mesh)
+        local_states = module(local_states)
+        return cls._gather_sequence(local_states, sp_mesh)[:, :valid_length]
+
+    @staticmethod
+    def _local_token_shard(
+        hidden_states: torch.Tensor,
+        seq_ctx: SequenceContext,
+        shard_size: int,
+    ) -> torch.Tensor:
+        sp_mesh = seq_ctx.sequence_parallel_mesh
+        if sp_mesh is None or sp_mesh.size() == 1:
+            return hidden_states
+        if seq_ctx._shard_size:
+            shard_start = seq_ctx._shard_start
+        else:
+            shard_start = seq_ctx.sp_rank * shard_size
+        return hidden_states[:, shard_start : shard_start + shard_size].contiguous()
+
     def _merge_chunks(
         self,
         hidden_states: torch.Tensor,
@@ -300,6 +352,8 @@ class ConceptLMV22VQ(BaseModel):
         concept_hidden: torch.Tensor,
         concept_lengths: list[int],
         chunk_size: int,
+        sp_mesh: DeviceMesh | None = None,
+        concept_padding: int = 0,
     ) -> SequenceContext:
         device = concept_hidden.device
         cu_seq_lens = torch.tensor(
@@ -310,6 +364,14 @@ class ConceptLMV22VQ(BaseModel):
         position_ids = torch.cat(
             [torch.arange(length, device=device) * chunk_size for length in concept_lengths]
         ).unsqueeze(0)
+        shard_start = 0
+        shard_size = concept_hidden.shape[1]
+        num_padding = 0
+        if sp_mesh is not None and sp_mesh.size() > 1:
+            shard_start = sp_mesh.get_local_rank() * shard_size
+            position_ids = position_ids[:, shard_start : shard_start + shard_size].contiguous()
+            valid_length = int(cu_seq_lens[-1]) - concept_padding
+            num_padding = max(0, min(shard_size, shard_start + shard_size - valid_length))
         return SequenceContext(
             input_ids=None,
             inputs_embeds=cast(torch.FloatTensor, concept_hidden),
@@ -319,6 +381,10 @@ class ConceptLMV22VQ(BaseModel):
             max_length_k=max(concept_lengths),
             position_ids=cast(torch.LongTensor, position_ids),
             device=device,
+            num_padding=num_padding,
+            sequence_parallel_mesh=sp_mesh,
+            shard_start=shard_start,
+            shard_size=shard_size,
         )
 
     def forward(
@@ -353,16 +419,31 @@ class ConceptLMV22VQ(BaseModel):
             encoder_raw_states.append(raw)
             encoder_history = torch.cat((encoder_history, raw.unsqueeze(2)), dim=2)
 
-        concept_hidden, concept_lengths = self._merge_chunks(hidden_states, token_lengths)
+        sp_mesh = seq_ctx.sequence_parallel_mesh
+        full_encoder_hidden = self._gather_sequence(hidden_states, sp_mesh)
+        full_encoder_raw_states = [self._gather_sequence(state, sp_mesh) for state in encoder_raw_states]
+        concept_hidden, concept_lengths = self._merge_chunks(full_encoder_hidden, token_lengths)
+        valid_concept_length = concept_hidden.shape[1]
+        concept_hidden, concept_padding = self._pad_and_split_sequence(concept_hidden, sp_mesh)
         concept_hidden = self.concept_vq_input_norm(concept_hidden)
-        merged_encoder_states = [self._merge_chunks(state, token_lengths)[0] for state in encoder_raw_states[:-1]]
-        encoder_concept_states = self.concept_read_encoder_shared_source_norm(
-            torch.stack(merged_encoder_states, dim=2)
+        merged_encoder_state_list = [
+            self._merge_chunks(state, token_lengths)[0] for state in full_encoder_raw_states[:-1]
+        ]
+        merged_encoder_states = torch.stack(merged_encoder_state_list, dim=2)
+        merged_encoder_states, encoder_concept_padding = self._pad_and_split_sequence(
+            merged_encoder_states,
+            sp_mesh,
         )
+        if encoder_concept_padding != concept_padding:
+            raise RuntimeError("Concept hidden states and encoder sources received different SP padding")
+        encoder_concept_states = self.concept_read_encoder_shared_source_norm(merged_encoder_states)
+        padded_concept_lengths = [*concept_lengths, concept_padding] if concept_padding else concept_lengths
         concept_ctx = self._build_concept_context(
             concept_hidden,
-            concept_lengths,
+            padded_concept_lengths,
             self.config.concept_chunk_size,
+            sp_mesh,
+            concept_padding,
         )
         assert concept_ctx.position_ids is not None
         concept_position_embeddings = self.rotary_emb(concept_hidden, concept_ctx.position_ids)
@@ -385,23 +466,33 @@ class ConceptLMV22VQ(BaseModel):
         predicted_vectors = torch.einsum("bsck,ckd->bscd", concept_logits, codebook).reshape(
             concept_logits.shape[0], concept_logits.shape[1], self.config.hidden_size
         )
+        predicted_vectors = self._gather_sequence(predicted_vectors, sp_mesh)[:, :valid_concept_length]
         repeated_concepts = self._repeat_shift(predicted_vectors, concept_lengths, token_lengths)
+        repeated_concepts = self._local_token_shard(repeated_concepts, seq_ctx, hidden_states.shape[1])
 
         hidden_states = self.fusion_tok_norm(hidden_states) + self.fusion_norm_alpha.to(
             hidden_states.dtype
         ) * self.fusion_hl_norm(repeated_concepts.to(hidden_states.dtype))
         decoder_encoder_states = self.decoder_read_encoder_shared_source_norm(torch.stack(encoder_raw_states, dim=2))
+        full_concept_raw_states = [
+            self._gather_sequence(state, sp_mesh)[:, :valid_concept_length] for state in concept_raw_states
+        ]
         packed_concept_states, decoder_concept_lengths = self._prepend_zero_chunks(
-            torch.stack(concept_raw_states, dim=2),
+            torch.stack(full_concept_raw_states, dim=2),
             concept_lengths,
         )
-        packed_concept_states = self.decoder_read_concept_shared_source_norm(packed_concept_states)
+        packed_concept_states = self._apply_sequence_module(
+            packed_concept_states,
+            self.decoder_read_concept_shared_source_norm,
+            sp_mesh,
+        )
         decoder_concept_states = self._repeat_shift(
             packed_concept_states,
             decoder_concept_lengths,
             token_lengths,
             prepend_zero=False,
         )
+        decoder_concept_states = self._local_token_shard(decoder_concept_states, seq_ctx, hidden_states.shape[1])
 
         decoder_history = hidden_states.unsqueeze(2)
         for layer_idx, stage in enumerate(self.decoder_stages):
