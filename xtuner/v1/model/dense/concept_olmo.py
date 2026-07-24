@@ -1,6 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
+import os
 import re
+from contextlib import AbstractContextManager, nullcontext
 from itertools import accumulate
 from pathlib import Path
 from typing import Literal, Self, cast
@@ -20,7 +22,13 @@ from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.float8_handler import Float8Handler
 from xtuner.v1.loss import BaseLossContext
-from xtuner.v1.model.base import BaseModel, ModelOutputs, TransformerConfig
+from xtuner.v1.model.base import (
+    DEFAULT_FLOAT8_CFG,
+    BaseModel,
+    ModelOutputs,
+    TorchCompileOption,
+    TransformerConfig,
+)
 from xtuner.v1.model.utils import checkpoint_wrapper
 from xtuner.v1.module import (
     CheckpointRMSNorm,
@@ -38,9 +46,16 @@ from xtuner.v1.module.decoder_layer import ConceptOlmoDecoderLayer
 from xtuner.v1.module.linear import build_linear
 from xtuner.v1.module.rope import RopeParametersConfig
 from xtuner.v1.utils import get_device, log_rank0
+from xtuner.v1.utils.activation_offload import async_save_on_cpu
 
 
 DEVICE = get_device()
+CONCEPT_OLMO_COMPILE_CFG: dict[str, TorchCompileOption] = {
+    "xtuner.v1.module.concept_olmo.EncoderStage.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.module.concept_olmo.ConceptStage.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.module.concept_olmo.DecoderStage.forward": TorchCompileOption(fullgraph=True),
+    **DEFAULT_FLOAT8_CFG,
+}
 
 
 class ConceptLMV22VQ(BaseModel):
@@ -57,7 +72,7 @@ class ConceptLMV22VQ(BaseModel):
             [
                 EncoderStage(
                     self._build_transformer(layer_idx),
-                    DepthDD(config.hidden_size, layer_idx, use_softmax=False, float8_cfg=config.float8_cfg),
+                    DepthDD(config.hidden_size, layer_idx, use_softmax=False),
                 )
                 for layer_idx in range(config.concept_encoder_layers)
             ]
@@ -66,12 +81,11 @@ class ConceptLMV22VQ(BaseModel):
             [
                 ConceptStage(
                     self._build_transformer(layer_idx),
-                    DepthDD(config.hidden_size, layer_idx, use_softmax=False, float8_cfg=config.float8_cfg),
+                    DepthDD(config.hidden_size, layer_idx, use_softmax=False),
                     ResidualRoute(
                         config.hidden_size,
                         config.concept_encoder_layers - 1,
                         use_softmax=True,
-                        float8_cfg=config.float8_cfg,
                     ),
                 )
                 for layer_idx in range(config.concept_special_layers)
@@ -85,20 +99,17 @@ class ConceptLMV22VQ(BaseModel):
                         config.hidden_size,
                         layer_idx,
                         use_softmax=config.concept_dd_two_route_add_decoder_use_softmax,
-                        float8_cfg=config.float8_cfg,
                     ),
                     ConceptRoute(config.hidden_size, config.rms_norm_eps),
                     ResidualRoute(
                         config.hidden_size,
                         config.concept_encoder_layers,
                         use_softmax=True,
-                        float8_cfg=config.float8_cfg,
                     ),
                     ResidualRoute(
                         config.hidden_size,
                         config.concept_special_layers,
                         use_softmax=True,
-                        float8_cfg=config.float8_cfg,
                     ),
                 )
                 for layer_idx in range(config.concept_decoder_layers)
@@ -136,6 +147,7 @@ class ConceptLMV22VQ(BaseModel):
 
         self._init_load_spec()
         self._maybe_enable_compile(self.compile_cfg)
+        self.offload_stream: torch.cuda.Stream | None = None
 
     def _build_transformer(self, layer_idx: int) -> ConceptOlmoDecoderLayer:
         config = self.config
@@ -277,6 +289,28 @@ class ConceptLMV22VQ(BaseModel):
             shard_start = seq_ctx.sp_rank * shard_size
         return hidden_states[:, shard_start : shard_start + shard_size].contiguous()
 
+    def _activation_offload_context(
+        self,
+        hidden_states: torch.Tensor,
+        block_idx: int,
+        group: str,
+    ) -> AbstractContextManager:
+        if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) != 1:
+            return nullcontext()
+        if hidden_states.device.type != "cuda":
+            raise RuntimeError("XTUNER_ACTIVATION_OFFLOAD=1 requires CUDA activations")
+        if self.offload_stream is None:
+            self.offload_stream = torch.cuda.Stream()
+        return async_save_on_cpu(
+            h2d_stream=self.offload_stream,
+            d2h_stream=self.offload_stream,
+            block_idx=block_idx,
+            group=f"concept_olmo_{group}",
+            custom_check_fn=lambda tensor: tensor.data_ptr() == hidden_states.data_ptr(),
+            prefetch=True,
+            reserve_pin_memory=True,
+        )
+
     def _merge_chunks(
         self,
         hidden_states: torch.Tensor,
@@ -409,13 +443,14 @@ class ConceptLMV22VQ(BaseModel):
 
         encoder_history = hidden_states.unsqueeze(2)
         encoder_raw_states: list[torch.Tensor] = []
-        for stage in self.encoder_stages:
-            hidden_states, raw = stage(
-                hidden_states,
-                token_position_embeddings,
-                seq_ctx,
-                encoder_history,
-            )
+        for stage_idx, stage in enumerate(self.encoder_stages):
+            with self._activation_offload_context(hidden_states, stage_idx, "encoder"):
+                hidden_states, raw = stage(
+                    hidden_states,
+                    token_position_embeddings,
+                    seq_ctx,
+                    encoder_history,
+                )
             encoder_raw_states.append(raw)
             encoder_history = torch.cat((encoder_history, raw.unsqueeze(2)), dim=2)
 
@@ -450,14 +485,15 @@ class ConceptLMV22VQ(BaseModel):
 
         concept_history = concept_hidden.unsqueeze(2)
         concept_raw_states: list[torch.Tensor] = []
-        for stage in self.concept_stages:
-            concept_hidden, raw = stage(
-                concept_hidden,
-                concept_position_embeddings,
-                concept_ctx,
-                concept_history,
-                encoder_concept_states,
-            )
+        for stage_idx, stage in enumerate(self.concept_stages):
+            with self._activation_offload_context(concept_hidden, stage_idx, "concept"):
+                concept_hidden, raw = stage(
+                    concept_hidden,
+                    concept_position_embeddings,
+                    concept_ctx,
+                    concept_history,
+                    encoder_concept_states,
+                )
             concept_raw_states.append(raw)
             concept_history = torch.cat((concept_history, raw.unsqueeze(2)), dim=2)
         concept_hidden = self.concept_final_norm(concept_hidden)
@@ -496,17 +532,18 @@ class ConceptLMV22VQ(BaseModel):
 
         decoder_history = hidden_states.unsqueeze(2)
         for layer_idx, stage in enumerate(self.decoder_stages):
-            gate = self.final_read_concept_gate_logits[layer_idx].float().softmax(dim=-1)
-            hidden_states, raw = stage(
-                hidden_states,
-                token_position_embeddings,
-                seq_ctx,
-                decoder_history,
-                repeated_concepts,
-                decoder_encoder_states,
-                decoder_concept_states,
-                gate,
-            )
+            with self._activation_offload_context(hidden_states, layer_idx, "decoder"):
+                gate = self.final_read_concept_gate_logits[layer_idx].float().softmax(dim=-1)
+                hidden_states, raw = stage(
+                    hidden_states,
+                    token_position_embeddings,
+                    seq_ctx,
+                    decoder_history,
+                    repeated_concepts,
+                    decoder_encoder_states,
+                    decoder_concept_states,
+                    gate,
+                )
             decoder_history = torch.cat((decoder_history, raw.unsqueeze(2)), dim=2)
         hidden_states = self.final_norm(hidden_states)
 
@@ -522,6 +559,11 @@ class ConceptLMV22VQ(BaseModel):
             output["logits"] = logits
             output["extra_info"] = extra_info
         return ModelOutputs(**output)
+
+    @property
+    @override
+    def default_compile_cfg(self) -> dict[str, TorchCompileOption]:
+        return CONCEPT_OLMO_COMPILE_CFG
 
     @override
     def fully_shard(self, fsdp_config: FSDPConfig) -> Self:

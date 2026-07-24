@@ -86,7 +86,10 @@ Add:
 All trainable matrix operations use `build_linear`. With FP8 disabled it is the
 same `nn.Linear` numerical path as the remote reference; with FP8 enabled the
 same modules participate in XTuner's Float8 handler instead of growing a second
-implementation.
+implementation. Depth-DD and residual-route control projections deliberately
+remain BF16: their output widths are only 1--16, below the 16-element matrix
+tile required by the FP8 kernels. The large QKV, SwiGLU, attention output, and
+VQ prediction-head GEMMs use FP8.
 
 Stage units group one transformer layer with the routing modules executed next
 to it. This provides a correct activation-checkpoint/FSDP boundary and avoids
@@ -142,8 +145,8 @@ boundary performs an SP all-gather only for the encoder states being reduced,
 builds the per-document concept sequence, then repartitions it with its derived
 concept context. Concept outputs required by the token decoder are gathered and
 expanded back to the local token offsets. This favors a simple correct baseline
-over a model-specific fused collective; SP `{1, 2, 4, 8}` is compared against
-the single-rank BF16 baseline.
+over a model-specific fused collective; SP size 2 is compared against the
+single-rank BF16 baseline.
 
 ## 5. FSDP, compilation, FP8, and offload
 
@@ -156,12 +159,13 @@ the single-rank BF16 baseline.
 - `torch.compile` is applied per stage after the eager baseline passes. Any
   graph breaks are localized to packed-context construction outside stage
   kernels.
-- FP8 covers the large fused QKV, fused SwiGLU, output projections, prediction
-  heads, and route linears through `build_linear`; norms, gates, and codebook
-  parameters stay at their required precision.
+- FP8 covers the large fused QKV, fused SwiGLU, output projections, and
+  prediction heads through `build_linear`; the low-dimensional routing
+  projections, norms, gates, and codebook parameters stay at their required precision.
 - `XTUNER_ACTIVATION_OFFLOAD=1` wraps each stage with a separate
-  encoder/concept/decoder offload group, including the cross-depth state tensors
-  that dominate this architecture's retained activation memory.
+  encoder/concept/decoder offload group. The stage input activation is offloaded;
+  cross-depth histories remain resident because subsequent forward stages still
+  consume them.
 - Expert parallelism and EP-only intra-layer micro-batching are not applicable:
   this checkpoint has no experts or router. Sequence parallelism is the dense
   parallel feature exercised instead.
@@ -188,20 +192,18 @@ No path is hard-coded in tests or runnable configs.
 Baseline tests in `tests/model/test_concept_olmo_dense.py` cover:
 
 1. config parsing, alias, and `model_type` dispatch;
-2. meta construction and selective HF loading;
-3. bitwise forward/backward parity for one global and one sliding transformer
-   layer (`output`, CE loss, and `dL/dx`);
-4. route, chunk, VQ, and fusion helper parity against the remote implementation;
-5. whole-model 8.94B forward/logit parity (medium-model rule: forward only);
-6. packed-document isolation;
-7. FSDP forward parity;
-8. full `save_hf` byte round trip, including the two U8 entries and remote-code
-   side files;
-9. SP, compiled/eager, FP8/BF16, and activation-offload comparisons.
+2. meta construction and exact 724-key checkpoint coverage;
+3. whole-model 8.94B bitwise forward/logit parity (medium-model rule: forward only);
+4. packed-document isolation;
+5. FSDP forward parity, full stage recomputation, and activation-offload backward;
+6. two-rank SP forward parity and backward through token/concept collectives;
+7. compiled BF16 stage forward/backward;
+8. tensor-wise FP8/FSDP forward/backward against BF16 (observed maximum absolute
+   logits error: `2.29e-4`).
 
-The drop-in CI config is run for approximately 50 real optimization steps. The
-loss trajectory and every optimization's residual error are recorded in the
-handoff/PR notes.
+The drop-in CI config enables stage compilation and SP size 2 for an 8-GPU
+training smoke run. `XTUNER_ACTIVATION_OFFLOAD=1` can be added without changing
+the config.
 
 ## 8. Commit plan
 

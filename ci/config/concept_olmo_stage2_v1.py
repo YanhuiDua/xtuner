@@ -19,7 +19,7 @@ from xtuner.v1.train import TrainerConfig
 CONCEPT_OLMO_STAGE2_V1_PATH = os.environ["CONCEPT_OLMO_STAGE2_V1_PATH"]
 ALPACA_PATH = os.environ["ALPACA_PATH"]
 
-model_cfg = ConceptOlmoStage2V1Config(compile_cfg=False)
+model_cfg = ConceptOlmoStage2V1Config()
 optim_cfg = AdamWConfig(lr=6e-5)
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
 fsdp_cfg = FSDPConfig(
@@ -46,6 +46,7 @@ trainer = TrainerConfig(
     loss_cfg=loss_cfg,
     tokenizer_path=CONCEPT_OLMO_STAGE2_V1_PATH,
     global_batch_size=16,
+    sp_size=2,
     total_epoch=1,
     work_dir="/tmp/concept_olmo_stage2_v1",
     seed=0,

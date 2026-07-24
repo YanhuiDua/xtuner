@@ -10,6 +10,7 @@ The following table lists the **base config classes** that define each model fam
 |---|---|---|---|
 | `Qwen2DenseConfig` | Qwen2 Dense | Dense | `Qwen2ForCausalLM` |
 | `Qwen3DenseConfig` | Qwen3 Dense | Dense | `Qwen3ForCausalLM` |
+| `ConceptLMV22VQConfig` | Concept OLMo / ConceptLM V2.2 | Dense | `ConceptLMV22VQForCausalLM` (remote code) |
 | `DeepSeekV3Config` | DeepSeek-V3 | MoE | `DeepseekV3ForCausalLM` |
 | `GptOssConfig` | GPT-OSS | MoE | `GptOssForCausalLM` |
 | `Qwen3MoEConfig` | Qwen3 MoE | MoE | `Qwen3MoeForCausalLM` |
@@ -23,6 +24,7 @@ The following table lists the **concrete model configs** that inherit from the b
 | `Qwen2Dense7BConfig` | `Qwen2DenseConfig` | Dense | ~7B parameters |
 | `Qwen3Dense8BConfig` | `Qwen3DenseConfig` | Dense | ~8B parameters |
 | `Qwen3Dense4BConfig` | `Qwen3DenseConfig` | Dense | ~4B parameters |
+| `ConceptOlmoStage2V1Config` | `ConceptLMV22VQConfig` | Dense | ~8.94B parameters, Stage-2 V1 |
 | `Qwen3Dense0P6BConfig` | `Qwen3DenseConfig` | Dense | ~0.6B parameters |
 | `Qwen3VLTextDense4BConfig` | `Qwen3DenseConfig` | Dense (VL backbone) | ~4B parameters, for multimodal |
 | `Qwen3VLTextDense8BConfig` | `Qwen3DenseConfig` | Dense (VL backbone) | ~8B parameters, for multimodal |
@@ -73,6 +75,8 @@ XTunerBaseModelConfig
 │   ├── Dense Models
 │   │   ├── Qwen2DenseConfig
 │   │   │   └── Qwen2Dense7BConfig
+│   │   ├── ConceptLMV22VQConfig
+│   │   │   └── ConceptOlmoStage2V1Config
 │   │   └── Qwen3DenseConfig
 │   │       ├── Qwen3Dense8BConfig
 │   │       │   └── Qwen3VLTextDense8BConfig

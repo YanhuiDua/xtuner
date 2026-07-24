@@ -10,6 +10,7 @@ XTuner v1 的 `TrainEngine` 通过不同的 `TransformerConfig` 子类支持多�
 |---|---|---|---|
 | `Qwen2DenseConfig` | Qwen2 Dense | Dense | `Qwen2ForCausalLM` |
 | `Qwen3DenseConfig` | Qwen3 Dense | Dense | `Qwen3ForCausalLM` |
+| `ConceptLMV22VQConfig` | Concept OLMo / ConceptLM V2.2 | Dense | `ConceptLMV22VQForCausalLM`（remote code） |
 | `DeepSeekV3Config` | DeepSeek-V3 | MoE | `DeepseekV3ForCausalLM` |
 | `GptOssConfig` | GPT-OSS | MoE | `GptOssForCausalLM` |
 | `Qwen3MoEConfig` | Qwen3 MoE | MoE | `Qwen3MoeForCausalLM` |
@@ -23,6 +24,7 @@ XTuner v1 的 `TrainEngine` 通过不同的 `TransformerConfig` 子类支持多�
 | `Qwen2Dense7BConfig` | `Qwen2DenseConfig` | Dense | 约 7B 参数 |
 | `Qwen3Dense8BConfig` | `Qwen3DenseConfig` | Dense | 约 8B 参数 |
 | `Qwen3Dense4BConfig` | `Qwen3DenseConfig` | Dense | 约 4B 参数 |
+| `ConceptOlmoStage2V1Config` | `ConceptLMV22VQConfig` | Dense | 约 8.94B 参数，Stage-2 V1 |
 | `Qwen3Dense0P6BConfig` | `Qwen3DenseConfig` | Dense | 约 0.6B 参数 |
 | `Qwen3VLTextDense4BConfig` | `Qwen3DenseConfig` | Dense（VL 文本主干） | 约 4B 参数，用于多模态 |
 | `Qwen3VLTextDense8BConfig` | `Qwen3DenseConfig` | Dense（VL 文本主干） | 约 8B 参数，用于多模态 |
@@ -73,6 +75,8 @@ XTunerBaseModelConfig
 │   ├── Dense 模型
 │   │   ├── Qwen2DenseConfig
 │   │   │   └── Qwen2Dense7BConfig
+│   │   ├── ConceptLMV22VQConfig
+│   │   │   └── ConceptOlmoStage2V1Config
 │   │   └── Qwen3DenseConfig
 │   │       ├── Qwen3Dense8BConfig
 │   │       │   └── Qwen3VLTextDense8BConfig

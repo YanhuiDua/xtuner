@@ -10,13 +10,14 @@ from torch.distributed.device_mesh import init_device_mesh
 from xtuner._testing import DeterministicDDPTestCase
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
+from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.model import (
     ConceptLMV22VQConfig,
     ConceptOlmoStage2V1Config,
     get_model_config,
     get_model_config_from_hf,
 )
-from xtuner.v1.module import MHAConfig
+from xtuner.v1.module import ConceptStage, DecoderStage, EncoderStage, MHAConfig
 from xtuner.v1.module.rope import RopeParametersConfig
 
 
@@ -61,6 +62,30 @@ def _tiny_config() -> ConceptLMV22VQConfig:
     )
 
 
+def _fp8_tiny_config() -> ConceptLMV22VQConfig:
+    return _tiny_config().model_copy(
+        update={
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "max_position_embeddings": 128,
+            "concept_v22_vq_codebook_size": 128,
+            "attention": MHAConfig(
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                head_dim=32,
+                qk_norm=True,
+                rms_norm_eps=1e-6,
+                sliding_window=4,
+                attn_impl="flash_attention",
+            ),
+            "float8_cfg": Float8Config(
+                scaling_granularity_gemm=ScalingGranularity.TENSORWISE,
+            ),
+            "compile_cfg": False,
+        }
+    )
+
+
 def _initialize(model: torch.nn.Module) -> None:
     generator = torch.Generator().manual_seed(7)
     with torch.no_grad():
@@ -71,6 +96,7 @@ def _initialize(model: torch.nn.Module) -> None:
 def test_config_alias_and_meta_layout():
     config = get_model_config("concept-olmo-stage2-v1")
     assert isinstance(config, ConceptOlmoStage2V1Config)
+    config.compile_cfg = False
     with torch.device("meta"):
         model = config.build()
     assert sum(parameter.numel() for parameter in model.parameters()) == 8_938_363_793
@@ -130,14 +156,67 @@ class TestConceptOlmoFSDP(DeterministicDDPTestCase):
                 recompute_ratio=1.0,
             )
         )
+        previous_offload = os.environ.get("XTUNER_ACTIVATION_OFFLOAD")
+        os.environ["XTUNER_ACTIVATION_OFFLOAD"] = "1"
+        try:
+            output = model(SequenceContext.from_input_ids((input_ids,), device="cuda")).logits
+            torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+            output.sum().backward()
+            assert any(parameter.grad is not None for parameter in model.parameters())
+        finally:
+            if previous_offload is None:
+                os.environ.pop("XTUNER_ACTIVATION_OFFLOAD", None)
+            else:
+                os.environ["XTUNER_ACTIVATION_OFFLOAD"] = previous_offload
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for optimization tests")
+class TestConceptOlmoOptimizations(DeterministicDDPTestCase):
+    @property
+    def world_size(self) -> int:
+        return 1
+
+    def test_torch_compile_forward_backward(self):
+        self.create_pg("cuda")
+        config = _tiny_config()
+        config.compile_cfg = None
+        config.attention.attn_impl = "flash_attention"
+        model = config.build().cuda().bfloat16()
+        _initialize(model)
+        input_ids = torch.arange(1, 9, device="cuda").unsqueeze(0)
         output = model(SequenceContext.from_input_ids((input_ids,), device="cuda")).logits
-        torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
-        output.sum().backward()
+        output.float().sum().backward()
+        assert output.shape == (1, 8, config.vocab_size)
+        for stage_type in (EncoderStage, ConceptStage, DecoderStage):
+            assert hasattr(stage_type.forward, "_torchdynamo_orig_callable")
+
+    def test_tensorwise_fp8_forward_backward(self):
+        self.create_pg("cuda")
+        config = _fp8_tiny_config()
+        baseline_config = config.model_copy(update={"float8_cfg": None})
+        baseline = baseline_config.build().cuda().bfloat16()
+        _initialize(baseline)
+        state = {key: value.detach().clone() for key, value in baseline.state_dict().items()}
+        input_ids = (torch.arange(64, device="cuda") % config.vocab_size).unsqueeze(0)
+        with torch.no_grad():
+            expected = baseline(SequenceContext.from_input_ids((input_ids,), device="cuda")).logits.float()
+        del baseline
+
+        model = config.build().cuda().bfloat16()
+        model.load_state_dict(state)
+        model.fully_shard(FSDPConfig(param_dtype=torch.bfloat16, reduce_dtype=torch.float32))
+        assert model.float8_handler is not None
+        model.float8_handler.precompute_float8_dynamic_scale_for_fsdp(model)
+        actual = model(SequenceContext.from_input_ids((input_ids,), device="cuda")).logits
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
+        actual.float().sum().backward()
         assert any(parameter.grad is not None for parameter in model.parameters())
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA devices are required for SP")
 class TestConceptOlmoSequenceParallel(DeterministicDDPTestCase):
+
     @property
     def world_size(self) -> int:
         return 2
@@ -171,6 +250,7 @@ def test_checkpoint_config_and_key_coverage():
     assert MODEL_PATH is not None
     path = Path(MODEL_PATH)
     config = ConceptLMV22VQConfig.from_hf(path)
+    config.compile_cfg = False
     assert config.rope_theta == 500000.0
     assert config.window_size == (4096, 0)
     assert isinstance(get_model_config_from_hf(path), ConceptLMV22VQConfig)

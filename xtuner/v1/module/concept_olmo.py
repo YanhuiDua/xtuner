@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from xtuner.v1.data_proto import SequenceContext
-from xtuner.v1.float8.config import Float8Config
 from xtuner.v1.module.attention.concept_olmo import ConceptOlmoRMSNorm
 from xtuner.v1.module.decoder_layer.concept_olmo_decoder_layer import ConceptOlmoDecoderLayer
 from xtuner.v1.module.linear import build_linear
@@ -32,12 +31,11 @@ class DepthDD(nn.Module):
         hidden_size: int,
         layer_idx: int,
         use_softmax: bool,
-        float8_cfg: Float8Config | None = None,
     ):
         super().__init__()
         num_prev = layer_idx + 2
-        self.w1 = build_linear(hidden_size, num_prev, bias=False, float8_cfg=float8_cfg)
-        self.w2 = build_linear(num_prev, num_prev, bias=False, float8_cfg=float8_cfg)
+        self.w1 = build_linear(hidden_size, num_prev, bias=False)
+        self.w2 = build_linear(num_prev, num_prev, bias=False)
         self.static_a = nn.Parameter(torch.zeros(num_prev))
         self.use_softmax = use_softmax
 
@@ -56,12 +54,11 @@ class ResidualRoute(nn.Module):
         hidden_size: int,
         num_source_states: int,
         use_softmax: bool = True,
-        float8_cfg: Float8Config | None = None,
     ):
         super().__init__()
         route_hidden_size = max(1, num_source_states)
-        self.w1 = build_linear(hidden_size, route_hidden_size, bias=False, float8_cfg=float8_cfg)
-        self.w2 = build_linear(route_hidden_size, num_source_states, bias=False, float8_cfg=float8_cfg)
+        self.w1 = build_linear(hidden_size, route_hidden_size, bias=False)
+        self.w2 = build_linear(route_hidden_size, num_source_states, bias=False)
         self.residual_diag = nn.Parameter(torch.zeros(hidden_size))
         self.use_softmax = use_softmax
 
