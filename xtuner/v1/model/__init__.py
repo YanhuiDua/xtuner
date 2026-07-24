@@ -18,6 +18,11 @@ from .compose.qwen3_vl import (
     Qwen3VLMoE30BA3Config,
     Qwen3VLMoE235BA22Config,
 )
+from .dense.concept_olmo import (
+    ConceptLMV22VQ,
+    ConceptLMV22VQConfig,
+    ConceptOlmoStage2V1Config,
+)
 from .dense.dense import Dense
 from .dense.qwen2 import Qwen2Dense7BConfig, Qwen2DenseConfig
 from .dense.qwen3 import Qwen3Dense0P6BConfig, Qwen3Dense4BConfig, Qwen3Dense8BConfig, Qwen3DenseConfig
@@ -41,6 +46,7 @@ model_mapping = {
     "internvl-3.5-30b-a3b-hf": InternVL3P5MoE30BA3Config(),
     "qwen3.5-vl-4b": Qwen3_5_VLDense4BConfig(),
     "glm-5.2": Glm52MoEConfig(),
+    "concept-olmo-stage2-v1": ConceptOlmoStage2V1Config(),
 }
 
 
@@ -67,6 +73,8 @@ def get_model_config_from_hf(model_path: Path):
         return DeepSeekV3Config.from_hf(model_path)
     elif cfg.model_type == "glm_moe_dsa":
         return Glm52MoEConfig.from_hf(model_path)
+    elif cfg.model_type == "conceptlm_v22_vq":
+        return ConceptLMV22VQConfig.from_hf(model_path)
     else:
         raise ValueError(f"Unsupported model type: {cfg.model_type}")
 
@@ -108,4 +116,7 @@ __all__ = [
     "XTunerBaseModelConfig",
     "Qwen3_5_VLMoE35BA3Config",
     "Qwen3_5_VLDense4BConfig",
+    "ConceptLMV22VQ",
+    "ConceptLMV22VQConfig",
+    "ConceptOlmoStage2V1Config",
 ]

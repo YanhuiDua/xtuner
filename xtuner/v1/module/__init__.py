@@ -7,6 +7,16 @@ from .attention import (
     MultiHeadAttention,
     MultiLatentAttention,
 )
+from .concept_olmo import (
+    CheckpointRMSNorm,
+    ConceptQuantizer,
+    ConceptRoute,
+    ConceptStage,
+    DecoderStage,
+    DepthDD,
+    EncoderStage,
+    ResidualRoute,
+)
 from .dispatcher import NaiveDispatcher, TorchAll2AllDispatcher, build_dispatcher
 from .lm_head import LMHead
 from .rms_norm import RMSNorm
@@ -45,4 +55,12 @@ __all__ = [
     "Qwen3VLTextRotaryEmbedding",
     "get_rope_embedding",
     "RotaryEmbeddingProtocol",
+    "CheckpointRMSNorm",
+    "ConceptQuantizer",
+    "ConceptRoute",
+    "ConceptStage",
+    "DecoderStage",
+    "DepthDD",
+    "EncoderStage",
+    "ResidualRoute",
 ]
