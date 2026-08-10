@@ -568,6 +568,7 @@ class RolloutWorker(SingleAcceleratorWorker):
         self.serverl_url: str = ""
         self.partial_rollout_handler = PartialRolloutHandler()
         self.enable_partial_rollout: bool = False
+        self.mask_offpolicy_in_partial_rollout: bool = False
 
     @classmethod
     @abstractmethod
@@ -579,8 +580,15 @@ class RolloutWorker(SingleAcceleratorWorker):
     ) -> RolloutTopology:
         raise NotImplementedError("Concrete rollout worker classes must implement build_rollout_topology().")
 
-    def set_enable_partial_rollout(self, enable: bool) -> None:
+    def set_enable_partial_rollout(
+        self,
+        enable: bool,
+        mask_offpolicy_in_partial_rollout: bool = False,
+    ) -> None:
+        if mask_offpolicy_in_partial_rollout and not enable:
+            raise ValueError("mask_offpolicy_in_partial_rollout=True requires enable_partial_rollout=True")
         self.enable_partial_rollout = enable
+        self.mask_offpolicy_in_partial_rollout = mask_offpolicy_in_partial_rollout
 
     def _bind_server_launch_spec(self, server_launch_spec: ServerLaunchSpec) -> None:
         if server_launch_spec.worker_rank != self.rank:
@@ -832,10 +840,19 @@ class RolloutWorker(SingleAcceleratorWorker):
                     f"No generation needed for request {uid}: max_tokens={payload_max_tokens} or last input_id={last_id} is in eos_token."
                 )
                 finish_reason = "stop" if is_eos_reached else "length"
-                # 对于是否开 partial rollout 的情况都直接标记为完成并返回，因为本轮 rollout 未开始，也不需要拼接
-                rollout_state.finish_reason = finish_reason
-                rollout_state.status = Status.COMPLETED
-                return rollout_state
+                if self.enable_partial_rollout:
+                    return await self.partial_rollout_handler.postprocess(
+                        rollout_state,
+                        response="",
+                        response_ids=[],
+                        logprobs=[],
+                        routed_experts=None,
+                        finish_reason=finish_reason,
+                        status=Status.COMPLETED,
+                        prompt_tokens=len(input_ids),
+                        completion_tokens=0,
+                        mask_offpolicy_in_partial_rollout=self.mask_offpolicy_in_partial_rollout,
+                    )
 
             for attempt in range(max_retries + 1):
                 is_last_attempt = attempt == max_retries
@@ -1205,6 +1222,7 @@ class RolloutWorker(SingleAcceleratorWorker):
                         status=rollout_status,
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
+                        mask_offpolicy_in_partial_rollout=self.mask_offpolicy_in_partial_rollout,
                     )
                 else:
                     rollout_state.response = returned_response

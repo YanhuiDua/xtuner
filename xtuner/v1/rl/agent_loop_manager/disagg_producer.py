@@ -247,6 +247,7 @@ class DisaggAsyncProduceStrategyConfig(DisaggProduceStrategyConfig):
 
     over_sample_threshold: float = 0.0
     enable_partial_rollout: bool = False
+    mask_offpolicy_in_partial_rollout: bool = False
     max_staleness: int = Field(default=0, ge=0)
     tail_batch_trigger_size: int = 0
 
@@ -256,10 +257,17 @@ class DisaggAsyncProduceStrategyConfig(DisaggProduceStrategyConfig):
         sync_weights_interval: int = 1,
         rollout_controller: "Optional[RolloutControllerProxy]" = None,
     ) -> "DisaggAsyncProduceStrategy":
+        if self.mask_offpolicy_in_partial_rollout and not self.enable_partial_rollout:
+            raise ValueError("mask_offpolicy_in_partial_rollout=True requires enable_partial_rollout=True")
         if rollout_controller is not None:
             import ray
 
-            ray.get(rollout_controller.set_enable_partial_rollout.remote(self.enable_partial_rollout))
+            ray.get(
+                rollout_controller.set_enable_partial_rollout.remote(
+                    self.enable_partial_rollout,
+                    self.mask_offpolicy_in_partial_rollout,
+                )
+            )
         return DisaggAsyncProduceStrategy(
             over_sample_threshold=self.over_sample_threshold,
             enable_partial_rollout=self.enable_partial_rollout,

@@ -121,12 +121,19 @@ class RolloutController:
             )
             return rollout_state
 
-    def set_enable_partial_rollout(self, enable: bool) -> None:
-        """Propagate enable_partial_rollout flag to all active workers."""
+    def set_enable_partial_rollout(
+        self,
+        enable: bool,
+        mask_offpolicy_in_partial_rollout: bool = False,
+    ) -> None:
+        """Propagate partial-rollout settings to all active workers."""
         active_workers = self.registry.active_workers()
         ray.get(
             [
-                worker.actor.set_enable_partial_rollout.remote(enable)  # type: ignore[attr-defined]
+                worker.actor.set_enable_partial_rollout.remote(  # type: ignore[attr-defined]
+                    enable,
+                    mask_offpolicy_in_partial_rollout,
+                )
                 for worker in active_workers
             ]
         )

@@ -115,8 +115,8 @@ class PartialRolloutHandler:
     request.
 
     This handler only knows how to continue a single interrupted generation by reusing the previous response as the
-    next engine input. Agent-loop level multi-turn rollout, including tool messages and response masks, must be handled
-    by the agent loop itself.
+    next engine input. Agent-loop level multi-turn rollout, including tool messages, must be handled by the agent loop
+    itself.
     """
 
     def __init__(self) -> None:
@@ -150,7 +150,47 @@ class PartialRolloutHandler:
         status: Status,
         prompt_tokens: int,
         completion_tokens: int,
+        mask_offpolicy_in_partial_rollout: bool = False,
     ) -> RolloutState:
+        if not mask_offpolicy_in_partial_rollout:
+            return await self._postprocess(
+                rollout_state,
+                response=response,
+                response_ids=response_ids,
+                logprobs=logprobs,
+                routed_experts=routed_experts,
+                finish_reason=finish_reason,
+                status=status,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
+
+        return await self._postprocess_with_offpolicy_mask(
+            rollout_state,
+            response=response,
+            response_ids=response_ids,
+            logprobs=logprobs,
+            routed_experts=routed_experts,
+            finish_reason=finish_reason,
+            status=status,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+    async def _postprocess(
+        self,
+        rollout_state: RolloutState,
+        *,
+        response: str,
+        response_ids: list[int],
+        logprobs: list[float],
+        routed_experts: np.ndarray | RayObjectRef | None,
+        finish_reason: str,
+        status: Status,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> RolloutState:
+        """Postprocess a partial rollout using the default semantics."""
         rollout_state.finish_reason = finish_reason
         rollout_state.status = status
         history_response = rollout_state.response or ""
@@ -228,4 +268,72 @@ class PartialRolloutHandler:
                 f"current_logprobs_len={len(current_logprobs)}, "
             )
             rollout_state.routed_experts = history_routed_experts
+        return rollout_state
+
+    async def _postprocess_with_offpolicy_mask(
+        self,
+        rollout_state: RolloutState,
+        *,
+        response: str,
+        response_ids: list[int],
+        logprobs: list[float],
+        routed_experts: np.ndarray | RayObjectRef | None,
+        finish_reason: str,
+        status: Status,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> RolloutState:
+        # Snapshot historical response fields before constructing the next state.
+        history_response = rollout_state.response or ""
+        history_response_ids = list(rollout_state.response_ids or [])
+        current_response_ids = list(response_ids or [])
+        history_logprobs = list(rollout_state.logprobs or [])
+        current_logprobs = list(logprobs or [])
+        history_routed_experts = rollout_state.routed_experts
+
+        next_response = history_response + response
+        next_response_ids = history_response_ids + current_response_ids
+        next_logprobs = history_logprobs + current_logprobs
+        next_response_mask = [0] * len(history_response_ids) + [1] * len(current_response_ids)
+        assert len(next_response_mask) == len(next_response_ids) == len(next_logprobs), (
+            "Partial rollout response fields have inconsistent lengths before off-policy masking: "
+            f"next_response_mask_len={len(next_response_mask)}, "
+            f"next_response_ids_len={len(next_response_ids)}, "
+            f"next_logprobs_len={len(next_logprobs)}, "
+            f"history_response_ids_len={len(history_response_ids)}, "
+            f"current_response_ids_len={len(current_response_ids)}, "
+            f"history_logprobs_len={len(history_logprobs)}, "
+            f"current_logprobs_len={len(current_logprobs)}, "
+            f"prompt_tokens={prompt_tokens}, completion_tokens={completion_tokens}"
+        )
+
+        old_routed_experts_to_free: RayObjectRef | None = None
+        if history_routed_experts is not None and routed_experts is not None:
+            # case 1: history_routed_experts and routed_experts both exist.
+            # The latest backend return covers the complete final sequence, so
+            # routed_experts replaces history_routed_experts.
+            next_routed_experts = routed_experts
+            if isinstance(history_routed_experts, RayObjectRef):
+                old_routed_experts_to_free = history_routed_experts
+        elif history_routed_experts is None and routed_experts is not None:
+            # case 2: only routed_experts exists. Use routed_experts directly.
+            next_routed_experts = routed_experts
+        elif history_routed_experts is not None and routed_experts is None:
+            # case 3: only history_routed_experts exists. Keep
+            # history_routed_experts directly.
+            next_routed_experts = history_routed_experts
+        else:
+            # case 4: neither history_routed_experts nor routed_experts exists.
+            next_routed_experts = None
+
+        rollout_state.response = next_response
+        rollout_state.response_ids = next_response_ids
+        rollout_state.logprobs = next_logprobs
+        rollout_state.response_mask = next_response_mask
+        rollout_state.routed_experts = next_routed_experts
+        rollout_state.finish_reason = finish_reason
+        rollout_state.status = status
+
+        if old_routed_experts_to_free is not None:
+            free_object_refs([old_routed_experts_to_free])
         return rollout_state

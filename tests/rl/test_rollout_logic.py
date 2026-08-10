@@ -4,7 +4,7 @@
 - SGLangWorker pause/continue 对 abort flag 和 server request 的控制。
 - RolloutWorker abort、abort request timeout 和 in-flight request 取消语义。
 - RolloutHealthManager 对 inactive/unhealthy worker 的生命周期标记逻辑。
-- PartialRolloutHandler 拼接 routed_experts 后释放旧 Ray ObjectRef 的逻辑。
+- PartialRolloutHandler 默认/启用 off-policy mask 两种配置下的 response 与 routed_experts 语义。
 
 旧 test_rollout_utils.py 中的 TestRolloutControllerRecover 需要真实 Ray controller / lmdeploy backend，
 不属于 PR-fast，后续应放到 PR-real smoke 或 nightly。
@@ -739,10 +739,16 @@ class TestSGLangWorker(unittest.TestCase):
 
 
 class TestRolloutWorker(unittest.IsolatedAsyncioTestCase):
-    def _build_partial_rollout_worker(self, *, eos_token: list[int] | None = None):
+    def _build_partial_rollout_worker(
+        self,
+        *,
+        eos_token: list[int] | None = None,
+        mask_offpolicy_in_partial_rollout: bool = False,
+    ):
         worker = RolloutWorker.__new__(RolloutWorker)
         worker.receive_abort_request = threading.Event()
         worker.enable_partial_rollout = True
+        worker.mask_offpolicy_in_partial_rollout = mask_offpolicy_in_partial_rollout
         worker.partial_rollout_handler = PartialRolloutHandler()
         worker.server_url = "http://test"
         worker.endpoints = {"generate": "generate", "v1/chat/completions": "v1/chat/completions"}
@@ -903,12 +909,17 @@ class TestRolloutWorker(unittest.IsolatedAsyncioTestCase):
 
     async def test_partial_rollout_eos_response_completes_without_backend_request(self):
         # partial rollout 已以 EOS 结束时，应直接完成，不再请求推理后端。
-        worker = self._build_partial_rollout_worker(eos_token=[999])
+        worker = self._build_partial_rollout_worker(
+            eos_token=[999],
+            mask_offpolicy_in_partial_rollout=True,
+        )
         rollout_state = RolloutState(
             rollout_id=1,
             message=[],
             prompt_ids=[10, 11],
             response_ids=[101, 999],
+            logprobs=[0.1, 0.2],
+            response_mask=[1, 1],
             sample_params=SampleParams(max_tokens=8, return_token_ids=True),
             status=Status.ABORTED,
         )
@@ -920,16 +931,19 @@ class TestRolloutWorker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.finish_reason, "stop")
         self.assertEqual(result.status, Status.COMPLETED)
         self.assertEqual(result.response_ids, [101, 999])
+        self.assertEqual(result.response_mask, [0, 0])
         worker._safe_post_request.assert_not_awaited()
 
     async def test_partial_rollout_max_tokens_exhausted_completes_without_backend_request(self):
         # partial rollout 已用完 max_tokens 时，应直接 length 完成，不再继续生成。
-        worker = self._build_partial_rollout_worker()
+        worker = self._build_partial_rollout_worker(mask_offpolicy_in_partial_rollout=True)
         rollout_state = RolloutState(
             rollout_id=2,
             message=[],
             prompt_ids=[10, 11],
             response_ids=[201, 202, 203],
+            logprobs=[0.1, 0.2, 0.3],
+            response_mask=[1, 1, 1],
             sample_params=SampleParams(max_tokens=3, return_token_ids=True),
             status=Status.ABORTED,
         )
@@ -942,6 +956,7 @@ class TestRolloutWorker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.finish_reason, "length")
         self.assertEqual(result.status, Status.COMPLETED)
         self.assertEqual(result.response_ids, [201, 202, 203])
+        self.assertEqual(result.response_mask, [0, 0, 0])
         worker._safe_post_request.assert_not_awaited()
 
     async def test_parallel_mock_rollout_errors_return_failed_status_and_messages(self):
@@ -1461,6 +1476,31 @@ class TestRolloutHealthManager(unittest.TestCase):
 
 
 class TestPartialRolloutHandler(unittest.IsolatedAsyncioTestCase):
+    async def test_postprocess_first_segment_is_trainable_when_masking_is_enabled(self):
+        rollout_state = RolloutState(
+            message=[],
+            prompt_ids=[10, 11],
+            sample_params=SampleParams(return_logprob=True),
+            status=Status.INIT,
+        )
+
+        out = await PartialRolloutHandler().postprocess(
+            rollout_state,
+            response="new",
+            response_ids=[101, 102],
+            logprobs=[0.1, 0.2],
+            routed_experts=None,
+            finish_reason="stop",
+            status=Status.COMPLETED,
+            prompt_tokens=2,
+            completion_tokens=2,
+            mask_offpolicy_in_partial_rollout=True,
+        )
+
+        self.assertEqual(out.response, "new")
+        self.assertEqual(out.response_ids, [101, 102])
+        self.assertEqual(out.response_mask, [1, 1])
+
     async def test_preprocess_and_postprocess_preserve_response_prefix(self):
         # partial rollout 续写时应复用 prompt+历史 response，并把新 response token 追加到历史后面。
         rollout_state = RolloutState(
@@ -1494,6 +1534,7 @@ class TestPartialRolloutHandler(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out.response, "oldnew")
         self.assertEqual(out.response_ids, [101, 102, 201, 202])
         self.assertEqual(out.logprobs, [0.1, 0.2, 0.3, 0.4])
+        self.assertIsNone(out.response_mask)
         self.assertEqual(out.finish_reason, "stop")
         self.assertEqual(out.status, Status.COMPLETED)
 
@@ -1524,8 +1565,10 @@ class TestPartialRolloutHandler(unittest.IsolatedAsyncioTestCase):
             status=Status.ABORTED,
             prompt_tokens=3,
             completion_tokens=2,
+            mask_offpolicy_in_partial_rollout=True,
         )
         self.assertLessEqual(len(rollout_state.response_ids), max_tokens)
+        self.assertEqual(rollout_state.response_mask, [0, 0, 1, 1])
 
         rollout_state = handler.preprocess(rollout_state, max_tokens=max_tokens)
         self.assertEqual(rollout_state.sample_params.max_tokens, 1)
@@ -1539,13 +1582,15 @@ class TestPartialRolloutHandler(unittest.IsolatedAsyncioTestCase):
             status=Status.COMPLETED,
             prompt_tokens=5,
             completion_tokens=1,
+            mask_offpolicy_in_partial_rollout=True,
         )
 
         self.assertEqual(rollout_state.response_ids, [101, 102, 201, 202, 301])
+        self.assertEqual(rollout_state.response_mask, [0, 0, 0, 0, 1])
         self.assertLessEqual(len(rollout_state.response_ids), max_tokens)
 
-    async def test_postprocess_frees_old_routed_expert_refs_after_concat(self):
-        # partial rollout 拼接 routed_experts 后，应释放历史和当前 ObjectRef，避免长期占用对象存储。
+    async def test_postprocess_concatenates_routed_experts_when_masking_is_disabled(self):
+        # 开关关闭时保持原逻辑：解引用两次 routes、拼接并重新放回 object store。
         class FakeObjectRef:
             def __init__(self, value):
                 self.value = value
@@ -1564,6 +1609,7 @@ class TestPartialRolloutHandler(unittest.IsolatedAsyncioTestCase):
             response="old",
             response_ids=[1, 2],
             logprobs=[0.1, 0.2],
+            response_mask=[0, 1],
             routed_experts=history_ref,
             status=Status.ABORTED,
         )
@@ -1583,9 +1629,11 @@ class TestPartialRolloutHandler(unittest.IsolatedAsyncioTestCase):
                 status=Status.ABORTED,
                 prompt_tokens=3,
                 completion_tokens=1,
+                mask_offpolicy_in_partial_rollout=False,
             )
 
         self.assertIs(out.routed_experts, concat_ref)
+        self.assertEqual(out.response_mask, [0, 1])
         self.assertEqual(ray_put.call_args.args[0].tolist(), [[1], [2], [3]])
         free_object_refs.assert_any_call([history_ref])
         free_object_refs.assert_any_call([cur_ref])
