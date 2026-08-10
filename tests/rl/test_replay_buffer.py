@@ -6,8 +6,8 @@
 #    不应改变 buffer 状态，也不应报错。
 # 3. 写入生成结果时会补齐训练版本信息：put(..., model_step, current_train_step)
 #    会补齐 response_model_steps，并刷新 seq_staleness。
-# 4. 写入过期结果时会触发 rerollout：超过 stale_threshold 的 group 会被重置 response 相关字段，
-#    并保留 prompt/message 等重新 rollout 所需的输入字段。
+# 4. tail batch disabled 时将 EXPIRED 当作终态并 discard 整个状态；enabled 时保留
+#    prompt/mm_info，只重置 response 和 routed experts 以便重新 rollout。
 # 5. refresh_staleness 的公共契约：可以刷新 completed/aborted 记录，也要尊重显式传入的
 #    status 过滤条件。
 # 6. SyncReplayBufferConfig 的采样策略：按 FIFO 顺序返回 group。
@@ -50,6 +50,7 @@ def make_rollout_state(
     error_msg: str | None = None,
     tokens: list[int] | None = None,
     routed_experts=None,
+    mm_info: dict | None = None,
     extra_fields: dict | None = None,
 ) -> RolloutState:
     prompt_ids = list(prompt_ids) if prompt_ids is not None else [uid, uid + 1000]
@@ -72,6 +73,7 @@ def make_rollout_state(
         error_msg=error_msg,
         seq_staleness=seq_staleness,
         status=status,
+        mm_info=mm_info,
         extra_fields=dict(extra_fields or {}),
     )
 
@@ -177,11 +179,12 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 assert completed[0][0].response_model_steps == [3, 3]
                 assert completed[0][0].seq_staleness == 1
 
-    async def test_common_put_expires_stale_group_and_resets_response(self):
-        # 入库时超过 staleness 阈值的 group 会转入 EXPIRED，并清理旧 response 以便后续重新 rollout。
+    async def test_common_put_discards_expired_group_when_tail_batch_is_disabled(self):
+        # tail batch disabled 时 EXPIRED 是终态，释放 prompt 和 multimodal 重字段。
         for config_name, replay_buffer_config_cls in REPLAY_BUFFER_CONFIGS:
             with self.subTest(replay_buffer_config=config_name):
                 replay_buffer = replay_buffer_config_cls().build()
+                replay_buffer.bind_tail_batch_trigger_sizes({"task": 0})
                 stale = make_rollout_state(
                     1,
                     prompt_ids=[101, 102],
@@ -192,6 +195,8 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                     logprobs=[0.2, 0.3],
                     reward={"score": 1.0},
                     error_msg="old error",
+                    mm_info={"pixel_values": np.ones((2, 3), dtype=np.float32)},
+                    extra_fields={"train_prompt_ids": [101, 102]},
                 )
 
                 await replay_buffer.put(
@@ -202,25 +207,95 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 )
 
                 expired = await replay_buffer.get(1, "task", Status.EXPIRED)
-                restored = expired[0][0]
-                assert restored.status == Status.EXPIRED
-                assert restored.seq_staleness == 3
-                assert restored.tokens == [101, 102]
-                assert restored.response == ""
-                assert restored.response_ids == []
-                assert restored.response_model_steps == []
-                assert restored.logprobs == []
-                assert restored.reward is None
-                assert restored.error_msg is None
-                assert restored.routed_experts is None
-                assert restored.finish_reason is None
-                assert restored.response_mask == []
+                discarded = expired[0][0]
+                assert discarded.status == Status.EXPIRED
+                assert discarded.prompt_ids is None
+                assert discarded.tokens is None
+                assert discarded.mm_info is None
+                assert discarded.extra_fields == {}
+
+    async def test_common_put_keeps_rerollout_inputs_when_tail_batch_trigger_size_is_positive(self):
+        # tail batch 会重新采样 EXPIRED，只清理旧输出和 routed experts，保留 pixel_values。
+        for config_name, replay_buffer_config_cls in REPLAY_BUFFER_CONFIGS:
+            with self.subTest(replay_buffer_config=config_name):
+                replay_buffer = replay_buffer_config_cls().build()
+                replay_buffer.bind_tail_batch_trigger_sizes({"task": 1})
+                pixel_values = np.ones((2, 3), dtype=np.float32)
+                stale = make_rollout_state(
+                    1,
+                    prompt_ids=[101, 102],
+                    tokens=[999],
+                    response="stale response",
+                    response_ids=[11, 12],
+                    response_model_steps=[1, 1],
+                    logprobs=[0.2, 0.3],
+                    reward={"score": 1.0},
+                    error_msg="old error",
+                    routed_experts=np.ones((2, 2), dtype=np.int64),
+                    mm_info={"pixel_values": pixel_values},
+                    extra_fields={"train_prompt_ids": [101, 102]},
+                )
+
+                await replay_buffer.put(
+                    [stale],
+                    "task",
+                    current_train_step=5,
+                    stale_threshold=3,
+                )
+
+                expired = await replay_buffer.get(1, "task", Status.EXPIRED)
+                reusable = expired[0][0]
+                assert reusable.status == Status.EXPIRED
+                assert reusable.seq_staleness == 3
+                assert reusable.prompt_ids == [101, 102]
+                assert reusable.tokens == [101, 102]
+                assert reusable.response == ""
+                assert reusable.response_ids == []
+                assert reusable.response_model_steps == []
+                assert reusable.logprobs == []
+                assert reusable.reward is None
+                assert reusable.error_msg is None
+                assert reusable.routed_experts is None
+                assert reusable.finish_reason is None
+                assert reusable.response_mask == []
+                assert reusable.mm_info is not None
+                assert reusable.mm_info["pixel_values"] is pixel_values
+                assert reusable.extra_fields == {"train_prompt_ids": [101, 102]}
+
+    async def test_common_refresh_staleness_discards_expired_group_when_tail_batch_is_disabled(self):
+        # refresh_staleness 翻转出的 EXPIRED 同样遵循 tail batch disabled 的 discard 行为。
+        for config_name, replay_buffer_config_cls in REPLAY_BUFFER_CONFIGS:
+            with self.subTest(replay_buffer_config=config_name):
+                replay_buffer = replay_buffer_config_cls().build()
+                replay_buffer.bind_tail_batch_trigger_sizes({"task": 0})
+                await replay_buffer.put(
+                    [
+                        make_rollout_state(
+                            1,
+                            response_model_steps=[1],
+                            mm_info={"pixel_values": np.ones((2, 3), dtype=np.float32)},
+                        )
+                    ],
+                    "task",
+                )
+
+                await replay_buffer.refresh_staleness(
+                    task_stale_thresholds={"task": 2},
+                    current_train_step=4,
+                )
+
+                expired = await replay_buffer.get(1, "task", Status.EXPIRED)
+                discarded = expired[0][0]
+                assert discarded.status == Status.EXPIRED
+                assert discarded.prompt_ids is None
+                assert discarded.mm_info is None
 
     async def test_common_refresh_staleness_contract(self):
         # refresh_staleness 同时覆盖默认刷新 completed/aborted，以及 status filter 只刷新指定状态。
         for config_name, replay_buffer_config_cls in REPLAY_BUFFER_CONFIGS:
             with self.subTest(replay_buffer_config=config_name):
                 replay_buffer = replay_buffer_config_cls().build()
+                replay_buffer.bind_tail_batch_trigger_sizes({"task": 1})
                 await replay_buffer.put([make_rollout_state(1, response_model_steps=[1])], "task")
                 await replay_buffer.put(
                     [make_rollout_state(2, status=Status.ABORTED, response_model_steps=[1])], "task"
@@ -239,6 +314,7 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 assert {state.rollout_id for group in expired for state in group} == {1, 2}
 
                 filtered_buffer = replay_buffer_config_cls().build()
+                filtered_buffer.bind_tail_batch_trigger_sizes({"task": 1})
                 await filtered_buffer.put([make_rollout_state(3, response_model_steps=[1])], "task")
                 await filtered_buffer.put(
                     [make_rollout_state(4, status=Status.ABORTED, response_model_steps=[1])], "task"

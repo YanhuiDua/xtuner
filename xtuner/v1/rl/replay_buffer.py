@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict
 from xtuner.v1.data_proto.rl_data import (
     RolloutState,
     Status,
+    discard_rollout_state,
     get_group_status,
     refresh_seq_staleness,
     reset_rollout_response,
@@ -449,6 +450,35 @@ class ReplayBuffer:
         self._policy = policy
         self._storage = storage_backend
         self._lock = asyncio.Lock()
+        self._tail_batch_trigger_size_by_task: dict[str, int] = {}
+
+    def bind_tail_batch_trigger_sizes(self, sizes_by_task: dict[str, int]) -> None:
+        """Bind each task's immutable tail-batch setting before buffer use.
+
+        The producer owns the exact scheduling threshold. ReplayBuffer only uses whether the value is positive to
+        decide if EXPIRED groups may be rerolled and therefore must retain their prompt and multimodal inputs.
+        """
+
+        for task_name, tail_batch_trigger_size in sizes_by_task.items():
+            existing_size = self._tail_batch_trigger_size_by_task.get(task_name)
+            if existing_size is not None and existing_size != tail_batch_trigger_size:
+                raise ValueError(
+                    f"Conflicting tail_batch_trigger_size values for task {task_name!r}: "
+                    f"existing={existing_size}, new={tail_batch_trigger_size}."
+                )
+        self._tail_batch_trigger_size_by_task.update(sizes_by_task)
+
+    def _cleanup_expired_group(self, task_name: str, group: list[RolloutState]) -> None:
+        tail_batch_trigger_size = self._tail_batch_trigger_size_by_task[task_name]
+        for item in group:
+            if tail_batch_trigger_size > 0:
+                # Tail batch may reroll this sample. Keep prompt and multimodal
+                # training inputs, but release the stale response and routed experts.
+                reset_rollout_response(item)
+            else:
+                # Terminal EXPIRED groups are kept only for buffer accounting.
+                discard_rollout_state(item)
+            item.status = Status.EXPIRED
 
     async def put(
         self,
@@ -470,16 +500,16 @@ class ReplayBuffer:
             maybe_expire_group(items, stale_threshold)
 
         status = get_group_status(items)
+        staleness = max(item.seq_staleness for item in items)
         if status == Status.EXPIRED:
-            for item in items:
-                reset_rollout_response(item)
+            self._cleanup_expired_group(task_name, items)
         storage_item = StorageItem(
             item=items,
             uid=0,
             timestamp_id=0,
             task_name=task_name,
             status=status,
-            staleness=max(item.seq_staleness for item in items),
+            staleness=staleness,
         )
         async with self._lock:
             await self._policy.put(storage_item, self._storage)
@@ -526,10 +556,9 @@ class ReplayBuffer:
                     staleness = max((getattr(item, "seq_staleness", 0) for item in record.item), default=0)
                     should_expire = any(getattr(item, "seq_staleness", 0) >= stale_threshold for item in record.item)
                     if should_expire:
-                        # completed / aborted 样本超过 step 级阈值时整组翻转，后续 sampler 可按 EXPIRED 重新取样。
-                        for item in record.item:
-                            reset_rollout_response(item)
-                            item.status = Status.EXPIRED
+                        # A tail-enabled task keeps enough state for rerollout;
+                        # otherwise EXPIRED is terminal and the whole state is discarded.
+                        self._cleanup_expired_group(task_name, record.item)
                         status = Status.EXPIRED
                         expired_count += 1
                     else:
