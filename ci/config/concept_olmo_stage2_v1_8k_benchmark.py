@@ -1,0 +1,82 @@
+# Single-node 8-GPU throughput benchmark for Concept OLMo Stage-2 V1.
+#
+# Each data-parallel rank receives one continuous 8192-token model sequence.
+# Sequence parallelism is disabled. Toggle torch.compile with:
+#
+#   TORCH_COMPILE=1  # compile on (default)
+#   TORCH_COMPILE=0  # compile off
+#
+# Required environment variables:
+#
+#   CONCEPT_OLMO_STAGE2_V1_PATH=/path/to/concept_olmo_stage_2_V1
+#   ALPACA_PATH=/path/to/alpaca
+import os
+
+from xtuner.v1.config import AdamWConfig, FSDPConfig, LRConfig
+from xtuner.v1.datasets import FTDPTokenizeFnConfig
+from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
+from xtuner.v1.loss.ce_loss import CELossConfig
+from xtuner.v1.model import ConceptOlmoStage2V1Config
+from xtuner.v1.train import MFUConfig, TrainerConfig
+
+
+CONCEPT_OLMO_STAGE2_V1_PATH = os.environ["CONCEPT_OLMO_STAGE2_V1_PATH"]
+ALPACA_PATH = os.environ["ALPACA_PATH"]
+TOTAL_STEP = int(os.getenv("TOTAL_STEP", "20"))
+SEQUENCE_LENGTH = 8192
+# The causal LM collator consumes one source token while shifting labels, so
+# 8193 source tokens produce an exact 8192-token model sequence.
+SOURCE_PACK_LENGTH = SEQUENCE_LENGTH + 1
+
+_compile_value = os.getenv("TORCH_COMPILE", "1").lower()
+if _compile_value not in {"0", "1", "false", "true", "off", "on"}:
+    raise ValueError("TORCH_COMPILE must be one of: 0, 1, false, true, off, on")
+TORCH_COMPILE = _compile_value in {"1", "true", "on"}
+
+_peak_tflops_override = os.getenv("PEAK_TFLOPS_PER_GPU")
+PEAK_TFLOPS_PER_GPU = float(_peak_tflops_override) if _peak_tflops_override else None
+WORK_DIR = os.getenv(
+    "WORK_DIR",
+    f"/tmp/concept_olmo_stage2_v1_8k_compile_{'on' if TORCH_COMPILE else 'off'}",
+)
+
+model_cfg = ConceptOlmoStage2V1Config(compile_cfg=None if TORCH_COMPILE else False)
+optim_cfg = AdamWConfig(lr=6e-5)
+lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
+fsdp_cfg = FSDPConfig(cpu_offload=False)
+
+dataset_config = [
+    {
+        "dataset": DatasetConfig(name="alpaca", anno_path=ALPACA_PATH, sample_ratio=1.0),
+        "tokenize_fn": FTDPTokenizeFnConfig(chat_template="qwen", max_length=SOURCE_PACK_LENGTH),
+    },
+]
+dataloader_config = DataloaderConfig(
+    collator="single_sequence_sft_llm_collator",
+    pack_level="hard",
+    pack_max_length=SOURCE_PACK_LENGTH,
+    pack_to_max_length=True,
+)
+
+trainer = TrainerConfig(
+    load_from=CONCEPT_OLMO_STAGE2_V1_PATH,
+    model_cfg=model_cfg,
+    optim_cfg=optim_cfg,
+    fsdp_cfg=fsdp_cfg,
+    dataset_cfg=dataset_config,
+    dataloader_cfg=dataloader_config,
+    lr_cfg=lr_cfg,
+    loss_cfg=CELossConfig(),
+    tokenizer_path=CONCEPT_OLMO_STAGE2_V1_PATH,
+    # With 8 GPUs, SP=1 and one sequence per rank, global batch size is 8.
+    global_batch_size=None,
+    intra_layer_micro_batch=1,
+    sp_size=1,
+    total_step=TOTAL_STEP,
+    work_dir=WORK_DIR,
+    seed=0,
+    mfu_cfg=MFUConfig(
+        sequence_length=SEQUENCE_LENGTH,
+        peak_tflops_per_gpu=PEAK_TFLOPS_PER_GPU,
+    ),
+)
