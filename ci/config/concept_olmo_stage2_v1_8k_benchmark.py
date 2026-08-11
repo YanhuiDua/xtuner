@@ -5,6 +5,8 @@
 #
 #   TORCH_COMPILE=1  # compile on (default)
 #   TORCH_COMPILE=0  # compile off
+#   RECOMPUTE_RATIO=1.0  # full activation recompute (default)
+#   RECOMPUTE_RATIO=0.0  # disable activation recompute
 #
 # Required environment variables:
 #
@@ -23,6 +25,9 @@ from xtuner.v1.train import MFUConfig, TrainerConfig
 CONCEPT_OLMO_STAGE2_V1_PATH = os.environ["CONCEPT_OLMO_STAGE2_V1_PATH"]
 ALPACA_PATH = os.environ["ALPACA_PATH"]
 TOTAL_STEP = int(os.getenv("TOTAL_STEP", "20"))
+RECOMPUTE_RATIO = float(os.getenv("RECOMPUTE_RATIO", "1.0"))
+if not 0.0 <= RECOMPUTE_RATIO <= 1.0:
+    raise ValueError("RECOMPUTE_RATIO must be between 0.0 and 1.0")
 SEQUENCE_LENGTH = 8192
 # The causal LM collator consumes one source token while shifting labels, so
 # 8193 source tokens produce an exact 8192-token model sequence.
@@ -43,7 +48,10 @@ WORK_DIR = os.getenv(
 model_cfg = ConceptOlmoStage2V1Config(compile_cfg=None if TORCH_COMPILE else False)
 optim_cfg = AdamWConfig(lr=6e-5)
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
-fsdp_cfg = FSDPConfig(cpu_offload=False)
+fsdp_cfg = FSDPConfig(
+    cpu_offload=False,
+    recompute_ratio=RECOMPUTE_RATIO,
+)
 
 dataset_config = [
     {
