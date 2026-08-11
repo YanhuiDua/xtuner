@@ -46,6 +46,8 @@ from xtuner.v1.engine import TrainEngine
 from xtuner.v1.engine.train_engine import TrainStepInfo
 from xtuner.v1.loss import CELossConfig
 from xtuner.v1.model.base import ModelItem, XTunerBaseModelConfig
+from xtuner.v1.model.dense.concept_olmo import ConceptLMV22VQConfig
+from xtuner.v1.model.dense.concept_olmo_flops import ConceptOlmoMFUCalculator, MFUConfig
 from xtuner.v1.model.moe.moe import MoEConfig
 from xtuner.v1.patch import (
     patch_dcp_async_daemon_port,
@@ -115,6 +117,9 @@ class PerformanceStatistics(TypedDict):
     eta_seconds: float
     eta_hms: str
     e2e_train_time: float
+    model_flops_per_step: NotRequired[int]
+    tflops_per_gpu: NotRequired[float]
+    mfu: NotRequired[float]
 
 
 class ExpInfo(BaseModel):
@@ -442,6 +447,7 @@ class TrainerConfig(BaseModel):
     grad_norm_dtype: torch.dtype = torch.float32
     hooks_config: HooksConfig = HooksConfig()
     internal_metrics_cfg: InternalMetricsConfig | None = None
+    mfu_cfg: MFUConfig | None = None
 
     @model_validator(mode="after")
     def _convert_work_dir(self):
@@ -568,6 +574,7 @@ class Trainer:
         trainer_cfg: TrainerConfig | None = None,
         hooks_config: HooksConfig = HooksConfig(),
         internal_metrics_cfg: InternalMetricsConfig | None = None,
+        mfu_cfg: MFUConfig | None = None,
     ):
         self._do_clip = do_clip
         self._grad_norm_dtype = grad_norm_dtype
@@ -674,6 +681,7 @@ class Trainer:
         if global_batch_size is None:
             global_batch_size = self.data_mesh["dp"].size() * intra_layer_micro_batch
         self._global_batch_size = global_batch_size
+        self._mfu_calculator = self._build_mfu_calculator(model_cfg, mfu_cfg)
 
         self._resolve_model_loss_cfg(model_cfg, loss_cfg)
 
@@ -838,6 +846,7 @@ class Trainer:
             hooks_config=config.hooks_config,
             trainer_cfg=config,
             internal_metrics_cfg=config.internal_metrics_cfg,
+            mfu_cfg=config.mfu_cfg,
         )
         self._config = config
         self._print_training_config()
@@ -1689,7 +1698,7 @@ class Trainer:
         eta_seconds = remaining_tokens / max(tgs, 1)
         eta_hms = str(timedelta(seconds=int(eta_seconds)))
 
-        return PerformanceStatistics(
+        metrics = PerformanceStatistics(
             local_step_consumed_tokens=local_step_consumed_tokens,
             local_step_seqlen_tokens=local_step_seqlen_tokens,
             local_step_consumed_img_tokens=local_step_consumed_img_tokens,
@@ -1702,6 +1711,64 @@ class Trainer:
             eta_hms=eta_hms,
             e2e_train_time=e2e_train_time,
         )
+        if self._mfu_calculator is not None:
+            mfu_metrics = self._mfu_calculator.compute(step_time)
+            metrics["model_flops_per_step"] = mfu_metrics.model_flops_per_step
+            metrics["tflops_per_gpu"] = mfu_metrics.tflops_per_gpu
+            metrics["mfu"] = mfu_metrics.mfu
+        return metrics
+
+    def _build_mfu_calculator(
+        self,
+        model_cfg: XTunerBaseModelConfig,
+        mfu_cfg: MFUConfig | None,
+    ) -> ConceptOlmoMFUCalculator | None:
+        if mfu_cfg is None:
+            return None
+        if not isinstance(model_cfg, ConceptLMV22VQConfig):
+            raise ValueError(
+                "MFUConfig currently supports ConceptLMV22VQConfig models only"
+            )
+
+        device_name = None
+        if mfu_cfg.peak_tflops_per_gpu is None:
+            if model_cfg.float8_cfg is not None and model_cfg.float8_cfg.enable_float8:
+                raise ValueError(
+                    "Automatic MFU peak detection uses BF16/FP16 throughput; "
+                    "set MFUConfig.peak_tflops_per_gpu for FP8 training"
+                )
+            if self._fsdp_config.param_dtype not in (torch.bfloat16, torch.float16):
+                raise ValueError(
+                    "Automatic MFU peak detection supports BF16/FP16 training; "
+                    f"got {self._fsdp_config.param_dtype}. Set "
+                    "MFUConfig.peak_tflops_per_gpu explicitly"
+                )
+            get_device_name = getattr(DEVICE_MODULE, "get_device_name", None)
+            if get_device_name is None:
+                raise ValueError(
+                    "The current accelerator cannot report its device name; "
+                    "set MFUConfig.peak_tflops_per_gpu explicitly"
+                )
+            device_name = str(get_device_name())
+
+        calculator = ConceptOlmoMFUCalculator(
+            model_config=model_cfg,
+            mfu_config=mfu_cfg,
+            global_batch_size=self.global_batch_size,
+            world_size=self.world_size,
+            device_name=device_name,
+        )
+        device_info = (
+            f", device={calculator.device_name!r}" if calculator.device_name else ""
+        )
+        log_rank0.info(
+            f"Concept OLMo MFU logging enabled: sequence_length={mfu_cfg.sequence_length}, "
+            f"global_batch_size={self.global_batch_size}, world_size={self.world_size}, "
+            f"model_flops_per_step={calculator.model_flops_per_step / 1e15:.3f} PF, "
+            f"peak_tflops_per_gpu={calculator.peak_tflops_per_gpu:.2f} "
+            f"({calculator.peak_tflops_source}){device_info}"
+        )
+        return calculator
 
     def _log_step(
         self,
@@ -1747,6 +1814,14 @@ class Trainer:
         else:
             img_tokens_str = ""
 
+        mfu_str = ""
+        if "mfu" in training_metrics:
+            mfu_str = (
+                f"model_flops_per_step: {training_metrics['model_flops_per_step'] / 1e15:.3f} PF "
+                f"tflops_per_gpu: {training_metrics['tflops_per_gpu']:.1f} "
+                f"mfu: {training_metrics['mfu'] * 100:.2f}% "
+            )
+
         self.logger.info(
             f"Epoch {self._cur_epoch} Step {self.cur_step}/{self.total_step} "
             f"data_time: {data_time:.4f} lr: {lr:.6e} time: {step_time:.4f} "
@@ -1762,6 +1837,7 @@ class Trainer:
             f"tgs: {training_metrics['tgs']:.1f} "
             f"seqlen_tgs: {training_metrics['seqlen_tgs']:.1f} "
             f"exp_tgs: {training_metrics['exp_tgs']:.1f} "
+            f"{mfu_str}"
             f"eta: {training_metrics['eta_hms']} "
         )
 
@@ -1785,6 +1861,16 @@ class Trainer:
             **flattened_internal_metrics,
         }
         log_scalars.update({f"loss/{k}": v for k, v in loss_logs_info.items()})
+        if "mfu" in training_metrics:
+            log_scalars.update(
+                {
+                    "runtime_info/model_flops_per_step": training_metrics[
+                        "model_flops_per_step"
+                    ],
+                    "runtime_info/tflops_per_gpu": training_metrics["tflops_per_gpu"],
+                    "runtime_info/mfu": training_metrics["mfu"],
+                }
+            )
         self._exp_tracker.add_scalars(tag_scalar_dict=log_scalars, global_step=self.cur_step)
 
         DEVICE_MODULE.reset_peak_memory_stats()  # type: ignore[attr-defined]

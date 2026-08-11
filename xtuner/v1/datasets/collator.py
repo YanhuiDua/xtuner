@@ -132,6 +132,74 @@ def sft_llm_collator(
     return ret
 
 
+def single_sequence_sft_llm_collator(
+    instances: list[list[DataItem]],
+    pack_max_length: int,
+    padding_token_idx: int,
+    pack_to_max_length: bool = True,
+) -> list[ColateItem]:
+    """Collate each exact-length hard pack as one continuous sequence.
+
+    The regular SFT collator preserves source-sample boundaries in
+    ``cu_seq_lens``. This opt-in collator removes those boundaries and resets
+    position IDs only once, so attention sees one document per packed item.
+
+    Causal shifting consumes one source token. Therefore a model sequence of
+    length ``L`` requires ``pack_max_length=L+1`` source tokens. Hard packing is
+    required so no padding is introduced after the shift.
+    """
+
+    if not pack_to_max_length:
+        raise ValueError(
+            "single_sequence_sft_llm_collator requires pack_to_max_length=True"
+        )
+
+    ret: list[ColateItem] = []
+    for instance in instances:
+        source_length = sum(item["num_tokens"] for item in instance)
+        if source_length != pack_max_length:
+            raise ValueError(
+                "single_sequence_sft_llm_collator requires exact-length packs; "
+                f"expected {pack_max_length} source tokens, got {source_length}. "
+                "Use DataloaderConfig(pack_level='hard')."
+            )
+
+        # The hard pack is already exact. Padding it back to pack_max_length
+        # after causal shifting would turn an L+1 source pack into L+1 model
+        # tokens, instead of the intended L model tokens.
+        seq_ctx, shifted_labels, _ = build_text_ctx_labels(
+            instance,
+            pack_max_length,
+            padding_token_idx,
+            pack_to_max_length=False,
+            pad_chunk_size=pack_max_length,
+        )
+        assert seq_ctx.input_ids is not None
+        sequence_length = seq_ctx.input_ids.shape[-1]
+        expected_sequence_length = pack_max_length - 1
+        if sequence_length != expected_sequence_length:
+            raise RuntimeError(
+                "Unexpected sequence length after causal shift: "
+                f"expected {expected_sequence_length}, got {sequence_length}"
+            )
+        cu_seq_lens = seq_ctx.cu_seq_lens_q.new_tensor([0, sequence_length])
+        position_ids = torch.arange(
+            sequence_length,
+            dtype=torch.long,
+            device=seq_ctx.input_ids.device,
+        ).unsqueeze(0)
+        seq_ctx = seq_ctx.copy(
+            cu_seq_lens_q=cu_seq_lens,
+            cu_seq_lens_k=cu_seq_lens,
+            max_length_q=sequence_length,
+            max_length_k=sequence_length,
+            position_ids=position_ids,
+        )
+        ret.append({"seq_ctx": seq_ctx, "shifted_labels": shifted_labels})
+
+    return ret
+
+
 def intern_s1_vl_sft_collator(
     instances: list[list[InternS1DataItem]],
     pack_max_length: int,

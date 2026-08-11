@@ -23,6 +23,7 @@ from .collator import (
     fake_collator,
     intern_s1_vl_sft_collator,
     qwen3_vl_sft_collator,
+    single_sequence_sft_llm_collator,
     sft_llm_collator,
 )
 from .dataloader import BaseDataloader, Dataloader
@@ -280,7 +281,14 @@ class DataloaderConfig(BaseDataloaderConfig):
     dataset_config_list: DatasetConfigList | None = None
 
     collator: Annotated[
-        Literal["sft_llm_collator", "intern_s1_vl_sft_collator", "qwen3_vl_sft_collator", "fake_collator"] | str,
+        Literal[
+            "sft_llm_collator",
+            "single_sequence_sft_llm_collator",
+            "intern_s1_vl_sft_collator",
+            "qwen3_vl_sft_collator",
+            "fake_collator",
+        ]
+        | str,
         Parameter(help="collator func name"),
     ] = "sft_llm_collator"
     pack_to_max_length: Annotated[bool, Parameter(help="whether to pack to max length")] = True
@@ -350,6 +358,8 @@ class DataloaderConfig(BaseDataloaderConfig):
     def build_collator(self):
         if self.collator == "sft_llm_collator":
             return sft_llm_collator
+        elif self.collator == "single_sequence_sft_llm_collator":
+            return single_sequence_sft_llm_collator
         elif self.collator == "intern_s1_vl_sft_collator":
             return intern_s1_vl_sft_collator
         elif self.collator == "qwen3_vl_sft_collator":
