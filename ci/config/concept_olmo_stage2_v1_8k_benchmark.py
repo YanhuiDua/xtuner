@@ -7,6 +7,9 @@
 #   TORCH_COMPILE=0  # compile off
 #   RECOMPUTE_RATIO=1.0  # full activation recompute (default)
 #   RECOMPUTE_RATIO=0.0  # disable activation recompute
+#   PROFILE_STEP=18  # profile one training step (disabled by default)
+#   PROFILE_TIME=1  # enable the time profiler (default)
+#   PROFILE_MEMORY=0  # disable the memory profiler (default)
 #
 # Required environment variables:
 #
@@ -28,6 +31,13 @@ TOTAL_STEP = int(os.getenv("TOTAL_STEP", "20"))
 RECOMPUTE_RATIO = float(os.getenv("RECOMPUTE_RATIO", "1.0"))
 if not 0.0 <= RECOMPUTE_RATIO <= 1.0:
     raise ValueError("RECOMPUTE_RATIO must be between 0.0 and 1.0")
+_profile_step_value = os.getenv("PROFILE_STEP")
+PROFILE_STEP = int(_profile_step_value) if _profile_step_value else None
+if PROFILE_STEP is not None and PROFILE_STEP <= 0:
+    raise ValueError("PROFILE_STEP must be positive")
+# Trainer checks its zero-based current-step counter before incrementing it for
+# logging, so convert the user-facing one-based step here.
+TRAINER_PROFILE_STEP = PROFILE_STEP - 1 if PROFILE_STEP is not None else None
 SEQUENCE_LENGTH = 8192
 # The causal LM collator consumes one source token while shifting labels, so
 # 8193 source tokens produce an exact 8192-token model sequence.
@@ -37,6 +47,16 @@ _compile_value = os.getenv("TORCH_COMPILE", "1").lower()
 if _compile_value not in {"0", "1", "false", "true", "off", "on"}:
     raise ValueError("TORCH_COMPILE must be one of: 0, 1, false, true, off, on")
 TORCH_COMPILE = _compile_value in {"1", "true", "on"}
+
+_profile_time_value = os.getenv("PROFILE_TIME", "1").lower()
+if _profile_time_value not in {"0", "1", "false", "true", "off", "on"}:
+    raise ValueError("PROFILE_TIME must be one of: 0, 1, false, true, off, on")
+PROFILE_TIME = _profile_time_value in {"1", "true", "on"}
+
+_profile_memory_value = os.getenv("PROFILE_MEMORY", "0").lower()
+if _profile_memory_value not in {"0", "1", "false", "true", "off", "on"}:
+    raise ValueError("PROFILE_MEMORY must be one of: 0, 1, false, true, off, on")
+PROFILE_MEMORY = _profile_memory_value in {"1", "true", "on"}
 
 _peak_tflops_override = os.getenv("PEAK_TFLOPS_PER_GPU")
 PEAK_TFLOPS_PER_GPU = float(_peak_tflops_override) if _peak_tflops_override else None
@@ -82,6 +102,9 @@ trainer = TrainerConfig(
     sp_size=1,
     total_step=TOTAL_STEP,
     work_dir=WORK_DIR,
+    profile_step=TRAINER_PROFILE_STEP,
+    profile_time=PROFILE_TIME,
+    profile_memory=PROFILE_MEMORY,
     seed=0,
     mfu_cfg=MFUConfig(
         sequence_length=SEQUENCE_LENGTH,
