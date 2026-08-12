@@ -106,6 +106,8 @@ def test_config_alias_and_meta_layout():
     assert model.to_hf_key_list("concept_quantizer.codebook") == [
         f"concept_quantizer.codebook.{index}" for index in range(32)
     ]
+    assert model.lm_head.weight.shape == (config.vocab_size, 4096)
+    assert model.lm_head.logical_out_features == config.vocab_size
     assert model.to_hf_key_list("encoder_stages.3.transformer.self_attention.linear_qkv.weight") == [
         "encoder.layers.3.self_attention.linear_qkv.weight"
     ]
@@ -116,6 +118,40 @@ def test_config_alias_and_meta_layout():
         "concept_final_norm._extra_state",
         "final_norm._extra_state",
     }
+
+
+def test_lm_head_vocab_padding_checkpoint_conversion():
+    config = _tiny_config().model_copy(
+        update={"vocab_size": 126, "lm_head_vocab_padding_multiple": 8}
+    )
+    model = config.build()
+    checkpoint_weight = torch.randn(config.vocab_size, config.hidden_size)
+    local_weight = torch.empty(128, config.hidden_size)
+
+    model.safetensors_to_params(
+        [checkpoint_weight],
+        local_weight,
+        param_name="lm_head.weight",
+        start=None,
+        end=None,
+        dim=None,
+    )
+    torch.testing.assert_close(local_weight[: config.vocab_size], checkpoint_weight)
+    torch.testing.assert_close(local_weight[config.vocab_size :], torch.zeros_like(local_weight[-2:]))
+    saved_weight = model.param_to_safetensor(local_weight, "output_layer.weight")
+    torch.testing.assert_close(saved_weight, checkpoint_weight)
+
+    local_shard = torch.empty(16, config.hidden_size)
+    model.safetensors_to_params(
+        [checkpoint_weight],
+        local_shard,
+        param_name="lm_head.weight",
+        start=112,
+        end=128,
+        dim=None,
+    )
+    torch.testing.assert_close(local_shard[:14], checkpoint_weight[112:126])
+    torch.testing.assert_close(local_shard[14:], torch.zeros_like(local_shard[14:]))
 
 
 def test_packed_documents_match_separate_forwards(monkeypatch):

@@ -143,7 +143,17 @@ class ConceptLMV22VQ(BaseModel):
         self.decoder_read_concept_shared_source_norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.final_read_concept_gate_logits = nn.Parameter(torch.zeros(config.concept_decoder_layers, 2))
         self.final_norm = CheckpointRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
+        lm_head_vocab_size = (
+            (config.vocab_size + config.lm_head_vocab_padding_multiple - 1)
+            // config.lm_head_vocab_padding_multiple
+            * config.lm_head_vocab_padding_multiple
+        )
+        self.lm_head = LMHead(
+            config.hidden_size,
+            lm_head_vocab_size,
+            bias=False,
+            logical_out_features=config.vocab_size,
+        )
 
         self._init_load_spec()
         self._maybe_enable_compile(self.compile_cfg)
@@ -220,6 +230,26 @@ class ConceptLMV22VQ(BaseModel):
     ) -> None:
         if param_name == "fusion_norm_alpha":
             safetensors = [safetensors[0].reshape(1)]
+        if param_name == "lm_head.weight" and self.lm_head.out_features > self.config.vocab_size:
+            if len(safetensors) != 1:
+                raise ValueError("The padded LM head must map to exactly one HuggingFace tensor")
+            loaded_tensor = safetensors[0]
+            if loaded_tensor.shape[0] != self.config.vocab_size:
+                raise ValueError(
+                    f"Expected an LM head with {self.config.vocab_size} rows, got {loaded_tensor.shape[0]}"
+                )
+            if loaded_tensor.shape[1:] != local_tensor.shape[1:]:
+                raise ValueError(
+                    f"LM head shape mismatch: checkpoint {loaded_tensor.shape}, local {local_tensor.shape}"
+                )
+            local_tensor.zero_()
+            if start is None or end is None:
+                local_tensor[: self.config.vocab_size].copy_(loaded_tensor)
+            else:
+                loaded_end = min(end, self.config.vocab_size)
+                if start < loaded_end:
+                    local_tensor[: loaded_end - start].copy_(loaded_tensor[start:loaded_end])
+            return
         super().safetensors_to_params(
             safetensors=safetensors,
             local_tensor=local_tensor,
@@ -233,6 +263,8 @@ class ConceptLMV22VQ(BaseModel):
     def param_to_safetensor(self, safetensor: torch.Tensor, hf_param_name: str) -> torch.Tensor:
         if hf_param_name == "fusion_norm_alpha":
             return safetensor.squeeze(0)
+        if hf_param_name == "output_layer.weight" and safetensor.shape[0] > self.config.vocab_size:
+            return safetensor[: self.config.vocab_size]
         return safetensor
 
     @staticmethod
@@ -707,6 +739,7 @@ class ConceptLMV22VQConfig(TransformerConfig):
     concept_dd_two_route_add_decoder_use_softmax: bool
     window_size: tuple[int, int]
     window_attn_skip_freq: int
+    lm_head_vocab_padding_multiple: int = 1
 
     @model_validator(mode="after")
     def _validate_supported_variant(self) -> Self:
@@ -718,6 +751,8 @@ class ConceptLMV22VQConfig(TransformerConfig):
             raise ValueError("Concept OLMo requires a full hidden-sized Q/K/V projection")
         if self.window_size[1] != 0:
             raise ValueError("Concept OLMo only supports a left causal attention window")
+        if self.lm_head_vocab_padding_multiple <= 0:
+            raise ValueError("lm_head_vocab_padding_multiple must be positive")
         return self
 
     def build(self) -> ConceptLMV22VQ:
