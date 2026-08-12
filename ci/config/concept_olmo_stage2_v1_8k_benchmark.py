@@ -7,9 +7,12 @@
 #   TORCH_COMPILE=0  # compile off
 #   RECOMPUTE_RATIO=1.0  # full activation recompute (default)
 #   RECOMPUTE_RATIO=0.0  # disable activation recompute
+#   RESHARD_AFTER_FORWARD=0  # retain full parameters through backward
 #   PROFILE_STEP=18  # profile one training step (disabled by default)
 #   PROFILE_TIME=1  # enable the time profiler (default)
 #   PROFILE_MEMORY=0  # disable the memory profiler (default)
+#   SKIP_SAVE=1  # skip both HuggingFace and DCP checkpoint exports
+#   LM_HEAD_VOCAB_PADDING_MULTIPLE=8  # align the physical LM-head vocabulary (default)
 #
 # Required environment variables:
 #
@@ -23,6 +26,13 @@ from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
 from xtuner.v1.loss.ce_loss import CELossConfig
 from xtuner.v1.model import ConceptOlmoStage2V1Config
 from xtuner.v1.train import MFUConfig, TrainerConfig
+
+
+def _parse_bool_env(name: str, default: str) -> bool:
+    value = os.getenv(name, default).lower()
+    if value not in {"0", "1", "false", "true", "off", "on"}:
+        raise ValueError(f"{name} must be one of: 0, 1, false, true, off, on")
+    return value in {"1", "true", "on"}
 
 
 CONCEPT_OLMO_STAGE2_V1_PATH = os.environ["CONCEPT_OLMO_STAGE2_V1_PATH"]
@@ -43,20 +53,14 @@ SEQUENCE_LENGTH = 8192
 # 8193 source tokens produce an exact 8192-token model sequence.
 SOURCE_PACK_LENGTH = SEQUENCE_LENGTH + 1
 
-_compile_value = os.getenv("TORCH_COMPILE", "1").lower()
-if _compile_value not in {"0", "1", "false", "true", "off", "on"}:
-    raise ValueError("TORCH_COMPILE must be one of: 0, 1, false, true, off, on")
-TORCH_COMPILE = _compile_value in {"1", "true", "on"}
-
-_profile_time_value = os.getenv("PROFILE_TIME", "1").lower()
-if _profile_time_value not in {"0", "1", "false", "true", "off", "on"}:
-    raise ValueError("PROFILE_TIME must be one of: 0, 1, false, true, off, on")
-PROFILE_TIME = _profile_time_value in {"1", "true", "on"}
-
-_profile_memory_value = os.getenv("PROFILE_MEMORY", "0").lower()
-if _profile_memory_value not in {"0", "1", "false", "true", "off", "on"}:
-    raise ValueError("PROFILE_MEMORY must be one of: 0, 1, false, true, off, on")
-PROFILE_MEMORY = _profile_memory_value in {"1", "true", "on"}
+TORCH_COMPILE = _parse_bool_env("TORCH_COMPILE", "1")
+RESHARD_AFTER_FORWARD = _parse_bool_env("RESHARD_AFTER_FORWARD", "1")
+PROFILE_TIME = _parse_bool_env("PROFILE_TIME", "1")
+PROFILE_MEMORY = _parse_bool_env("PROFILE_MEMORY", "0")
+SKIP_SAVE = _parse_bool_env("SKIP_SAVE", "0")
+LM_HEAD_VOCAB_PADDING_MULTIPLE = int(os.getenv("LM_HEAD_VOCAB_PADDING_MULTIPLE", "8"))
+if LM_HEAD_VOCAB_PADDING_MULTIPLE <= 0:
+    raise ValueError("LM_HEAD_VOCAB_PADDING_MULTIPLE must be positive")
 
 _peak_tflops_override = os.getenv("PEAK_TFLOPS_PER_GPU")
 PEAK_TFLOPS_PER_GPU = float(_peak_tflops_override) if _peak_tflops_override else None
@@ -65,12 +69,16 @@ WORK_DIR = os.getenv(
     f"/tmp/concept_olmo_stage2_v1_8k_compile_{'on' if TORCH_COMPILE else 'off'}",
 )
 
-model_cfg = ConceptOlmoStage2V1Config(compile_cfg=None if TORCH_COMPILE else False)
+model_cfg = ConceptOlmoStage2V1Config(
+    compile_cfg=None if TORCH_COMPILE else False,
+    lm_head_vocab_padding_multiple=LM_HEAD_VOCAB_PADDING_MULTIPLE,
+)
 optim_cfg = AdamWConfig(lr=6e-5)
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
 fsdp_cfg = FSDPConfig(
     cpu_offload=False,
     recompute_ratio=RECOMPUTE_RATIO,
+    reshard_after_forward=RESHARD_AFTER_FORWARD,
 )
 
 dataset_config = [
@@ -105,6 +113,7 @@ trainer = TrainerConfig(
     profile_step=TRAINER_PROFILE_STEP,
     profile_time=PROFILE_TIME,
     profile_memory=PROFILE_MEMORY,
+    debug_skip_save=SKIP_SAVE,
     seed=0,
     mfu_cfg=MFUConfig(
         sequence_length=SEQUENCE_LENGTH,
