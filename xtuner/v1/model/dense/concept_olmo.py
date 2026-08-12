@@ -171,6 +171,8 @@ class ConceptLMV22VQ(BaseModel):
         )
 
     def to_hf_key_list(self, key: str) -> list[str]:
+        if key == "concept_quantizer.codebook":
+            return [f"concept_quantizer.codebook.{index}" for index in range(self.config.concept_v22_vq_num_codebooks)]
         mappings = (
             (r"^embed_tokens\.", "embedding.word_embeddings."),
             (r"^encoder_stages\.(\d+)\.transformer\.", r"encoder.layers.\1."),

@@ -105,13 +105,17 @@ class ConceptQuantizer(nn.Module):
         super().__init__()
         if hidden_size % num_codebooks != 0:
             raise ValueError("hidden_size must be divisible by num_codebooks")
-        code_dim = hidden_size // num_codebooks
-        self.codebook = nn.ParameterList(
-            [nn.Parameter(torch.empty(codebook_size, code_dim)) for _ in range(num_codebooks)]
-        )
+        self.num_codebooks = num_codebooks
+        self.codebook_size = codebook_size
+        self.code_dim = hidden_size // num_codebooks
+        # Keep the codebooks in one FSDP-friendly parameter. HuggingFace stores
+        # one [codebook_size, code_dim] tensor per codebook, so flattening the
+        # first two dimensions also makes checkpoint loading/saving a direct
+        # concatenate/split along dim 0.
+        self.codebook = nn.Parameter(torch.empty(num_codebooks * codebook_size, self.code_dim))
 
     def transformed_codebook(self) -> torch.Tensor:
-        return torch.stack(tuple(self.codebook), dim=0)
+        return self.codebook.view(self.num_codebooks, self.codebook_size, self.code_dim)
 
 
 class EncoderStage(nn.Module):

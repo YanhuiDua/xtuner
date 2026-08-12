@@ -100,7 +100,12 @@ def test_config_alias_and_meta_layout():
     with torch.device("meta"):
         model = config.build()
     assert sum(parameter.numel() for parameter in model.parameters()) == 8_938_363_793
-    assert len(model.state_dict()) == 724
+    assert len(model.state_dict()) == 693
+    assert model.concept_quantizer.codebook.shape == (32 * 128, 128)
+    assert model.concept_quantizer.transformed_codebook().shape == (32, 128, 128)
+    assert model.to_hf_key_list("concept_quantizer.codebook") == [
+        f"concept_quantizer.codebook.{index}" for index in range(32)
+    ]
     assert model.to_hf_key_list("encoder_stages.3.transformer.self_attention.linear_qkv.weight") == [
         "encoder.layers.3.self_attention.linear_qkv.weight"
     ]
@@ -272,7 +277,7 @@ def test_full_checkpoint_forward_bitwise(monkeypatch):
     with torch.device("meta"):
         model = config.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
     loaded, unloaded, missing = model.from_hf(MODEL_PATH)
-    assert len(loaded) == 724
+    assert len(loaded) == 693
     assert not unloaded
     assert not missing
 
