@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from functools import partial
 from typing import Annotated, Any, Literal, Sequence, cast
 
 import torch
@@ -190,9 +191,21 @@ class LMHeadLossContext(BaseLossContext):
         head_weight: torch.Tensor,
         head_bias: torch.Tensor | None,
         loss_kwargs: CELossKwargs,
+        valid_vocab_size: int | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, dict[str, Any]]]:
         # We do linear forward here to simplify the implementation of chunk loss (saving memory).
         logits = F.linear(hidden_states, head_weight, head_bias)
+        physical_vocab_size = logits.size(-1)
+        if valid_vocab_size is None:
+            valid_vocab_size = physical_vocab_size
+        if not 0 < valid_vocab_size <= physical_vocab_size:
+            raise ValueError("valid_vocab_size must be positive and no larger than the physical vocabulary")
+        if valid_vocab_size < physical_vocab_size:
+            # Keep the aligned physical GEMM shape, then exclude padded rows
+            # before the dtype conversion makes the logical logits contiguous.
+            # This preserves the exact logical softmax and gives padded rows a
+            # gradient of zero without copying the BF16 tensor separately.
+            logits = logits[..., :valid_vocab_size]
         logits = logits.float()  # (bs, seq_len, vocab_size)
 
         shifted_labels = loss_kwargs.shifted_labels  # (bs, seq_len)
@@ -219,8 +232,15 @@ class LMHeadLossContext(BaseLossContext):
         head_weight: torch.Tensor,
         head_bias: torch.Tensor | None,
         loss_kwargs: CELossKwargs,
+        valid_vocab_size: int | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, dict[str, Any]]]:
-        return self.loss_fn(hidden_states, head_weight, head_bias, loss_kwargs)
+        return self.loss_fn(
+            hidden_states,
+            head_weight,
+            head_bias,
+            loss_kwargs,
+            valid_vocab_size=valid_vocab_size,
+        )
 
     def chunk_mode(
         self,
@@ -228,17 +248,21 @@ class LMHeadLossContext(BaseLossContext):
         head_weight: torch.Tensor,
         head_bias: torch.Tensor | None,
         loss_kwargs: CELossKwargs,
+        valid_vocab_size: int | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, dict[str, Any]]]:
         if self.loss_cfg.mode == "chunk":
             assert self.loss_cfg.chunk_size is not None, "chunk_size must be set in chunk mode"
 
             chunks = loss_kwargs.chunk(self.loss_cfg.chunk_size)
+            loss_forward = partial(self.loss_fn, valid_vocab_size=valid_vocab_size)
             loss, extra_info = ChunkLoss.apply(
-                hidden_states, head_weight, head_bias, self.loss_fn, chunks, self.loss_cfg.chunk_size
+                hidden_states, head_weight, head_bias, loss_forward, chunks, self.loss_cfg.chunk_size
             )
             return loss, (None, extra_info)
         else:
             assert self.liger_loss_fct is not None, "liger_loss_fct must be initialized in liger mode"
+            if valid_vocab_size is not None and valid_vocab_size < head_weight.size(0):
+                raise NotImplementedError("Padded LM heads are not supported by the liger CE loss")
             shifted_labels = loss_kwargs.shifted_labels  # (bs, seq_len)
             loss_weight = loss_kwargs.loss_weight  # (bs, seq_len)
             assert loss_weight is not None, "loss_weight can not be None"
@@ -264,6 +288,7 @@ class LMHeadLossContext(BaseLossContext):
         hidden_states: torch.Tensor,
         head_weight: torch.Tensor,
         head_bias: torch.Tensor | None = None,
+        valid_vocab_size: int | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, dict[str, Any]]]:
         from xtuner.v1.model.utils.misc import ModelForwardExtraLogInfo
 
@@ -272,9 +297,21 @@ class LMHeadLossContext(BaseLossContext):
             raise NotImplementedError("Loss does not support head_bias yet.")
 
         if self.loss_cfg.mode == "eager":
-            loss, (logits, extra_info) = self.eager_mode(hidden_states, head_weight, head_bias, self.loss_kwargs)
+            loss, (logits, extra_info) = self.eager_mode(
+                hidden_states,
+                head_weight,
+                head_bias,
+                self.loss_kwargs,
+                valid_vocab_size=valid_vocab_size,
+            )
         else:
-            loss, (logits, extra_info) = self.chunk_mode(hidden_states, head_weight, head_bias, self.loss_kwargs)
+            loss, (logits, extra_info) = self.chunk_mode(
+                hidden_states,
+                head_weight,
+                head_bias,
+                self.loss_kwargs,
+                valid_vocab_size=valid_vocab_size,
+            )
 
         # TODO: yanhuida, should be removed
         if not isinstance(extra_info, ModelForwardExtraLogInfo):

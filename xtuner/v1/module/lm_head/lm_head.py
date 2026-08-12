@@ -18,6 +18,23 @@ Labels: TypeAlias = torch.Tensor
 
 
 class LMHead(nn.Linear):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+        *,
+        logical_out_features: int | None = None,
+    ) -> None:
+        super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
+        if logical_out_features is None:
+            logical_out_features = out_features
+        if not 0 < logical_out_features <= out_features:
+            raise ValueError("logical_out_features must be positive and no larger than out_features")
+        self.logical_out_features = logical_out_features
+
     @overload  # type: ignore[override]
     def forward(
         self, hidden_states: HiddenStates, loss_ctx: None = None
@@ -44,7 +61,19 @@ class LMHead(nn.Linear):
             b = self.bias
         if loss_ctx is None:
             logits = F.linear(hidden_states, w, b)
+            logits = logits[..., : self.logical_out_features]
             return None, (logits.float(), {})
+        elif self.logical_out_features < self.out_features:
+            if loss_ctx.__class__ is not LMHeadLossContext:
+                raise NotImplementedError(
+                    "Padded LM heads currently support only the plain CE loss context"
+                )
+            return loss_ctx.forward(
+                hidden_states,
+                w,
+                b,
+                valid_vocab_size=self.logical_out_features,
+            )
         else:
             return loss_ctx.forward(hidden_states, w, b)
 
