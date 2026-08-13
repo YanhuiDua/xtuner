@@ -13,6 +13,8 @@
 #   PROFILE_MEMORY=0  # disable the memory profiler (default)
 #   SKIP_SAVE=1  # skip both HuggingFace and DCP checkpoint exports
 #   LM_HEAD_VOCAB_PADDING_MULTIPLE=8  # align the physical LM-head vocabulary (default)
+#   FUSED_ADAMW=1  # use torch's fused AdamW implementation
+#   LOSS_MODE=eager  # eager, chunk, or liger; liger requires LM_HEAD_VOCAB_PADDING_MULTIPLE=1
 #
 # Required environment variables:
 #
@@ -58,6 +60,8 @@ RESHARD_AFTER_FORWARD = _parse_bool_env("RESHARD_AFTER_FORWARD", "1")
 PROFILE_TIME = _parse_bool_env("PROFILE_TIME", "1")
 PROFILE_MEMORY = _parse_bool_env("PROFILE_MEMORY", "0")
 SKIP_SAVE = _parse_bool_env("SKIP_SAVE", "0")
+FUSED_ADAMW = _parse_bool_env("FUSED_ADAMW", "0")
+LOSS_MODE = os.getenv("LOSS_MODE", "eager")
 LM_HEAD_VOCAB_PADDING_MULTIPLE = int(os.getenv("LM_HEAD_VOCAB_PADDING_MULTIPLE", "8"))
 if LM_HEAD_VOCAB_PADDING_MULTIPLE <= 0:
     raise ValueError("LM_HEAD_VOCAB_PADDING_MULTIPLE must be positive")
@@ -73,7 +77,7 @@ model_cfg = ConceptOlmoStage2V1Config(
     compile_cfg=None if TORCH_COMPILE else False,
     lm_head_vocab_padding_multiple=LM_HEAD_VOCAB_PADDING_MULTIPLE,
 )
-optim_cfg = AdamWConfig(lr=6e-5)
+optim_cfg = AdamWConfig(lr=6e-5, fused=True if FUSED_ADAMW else None)
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
 fsdp_cfg = FSDPConfig(
     cpu_offload=False,
@@ -102,7 +106,7 @@ trainer = TrainerConfig(
     dataset_cfg=dataset_config,
     dataloader_cfg=dataloader_config,
     lr_cfg=lr_cfg,
-    loss_cfg=CELossConfig(),
+    loss_cfg=CELossConfig(mode=LOSS_MODE),
     tokenizer_path=CONCEPT_OLMO_STAGE2_V1_PATH,
     # With 8 GPUs, SP=1 and one sequence per rank, global batch size is 8.
     global_batch_size=None,
