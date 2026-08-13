@@ -4,6 +4,11 @@ This test intentionally runs a real two-step ``RLColocateTrainer.fit()`` with
 LMDeploy, Qwen3.5 35B-A3B VLM MoE, Geometry3K multimodal data, async replay
 buffer, and async produce strategy.
 
+The default rollout layout remains TP=1, DP=1, EP=2. Set
+``QWEN35_ROLLOUT_TP_SIZE``, ``QWEN35_ROLLOUT_DP_SIZE``, and
+``QWEN35_ROLLOUT_EP_SIZE`` to exercise another LMDeploy layout. For example,
+TP=8, DP=2, EP=1 validates two dense data-parallel replicas on eight GPUs.
+
 Checks:
 - train/infer mismatch metrics stay finite and below PR thresholds;
 - each train step produces timing, batch-size, and async failure metrics;
@@ -74,6 +79,9 @@ MODEL_PATH = Path(os.environ["QWEN3_5_MOE_PATH"])
 MEDIA_ROOT = Path(os.environ["GEO3K_MEDIA_ROOT"])
 DATA_PATH = Path(os.environ["GEO3K_LONGTAIL_DATA_PATH"])
 BACKEND_LMDEPLOY = os.environ["XTUNER_USE_LMDEPLOY"]
+ROLLOUT_TP_SIZE = int(os.environ.get("QWEN35_ROLLOUT_TP_SIZE", "1"))
+ROLLOUT_DP_SIZE = int(os.environ.get("QWEN35_ROLLOUT_DP_SIZE", "1"))
+ROLLOUT_EP_SIZE = int(os.environ.get("QWEN35_ROLLOUT_EP_SIZE", "2"))
 
 EXPERIMENT_NAME = "qwen35_vl_moe_async_train_2step"
 
@@ -165,6 +173,11 @@ class TestQwen35VLMoEAsyncTrain2Step(unittest.TestCase):
 
         diagnostics = {
             "elapsed_s": round(elapsed_s, 3),
+            "rollout_parallelism": {
+                "tensor_parallel_size": ROLLOUT_TP_SIZE,
+                "data_parallel_size": ROLLOUT_DP_SIZE,
+                "expert_parallel_size": ROLLOUT_EP_SIZE,
+            },
             "steps": step_metrics,
             "produce_calls": self.produce_calls,
         }
@@ -183,8 +196,9 @@ class TestQwen35VLMoEAsyncTrain2Step(unittest.TestCase):
             model_path=str(MODEL_PATH),
             tokenizer_path=str(MODEL_PATH),
             dtype="bfloat16",
-            tensor_parallel_size=1,
-            expert_parallel_size=2,
+            tensor_parallel_size=ROLLOUT_TP_SIZE,
+            data_parallel_size=ROLLOUT_DP_SIZE,
+            expert_parallel_size=ROLLOUT_EP_SIZE,
             gpu_memory_utilization=0.8,
             context_length=MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH,
             rollout_max_batch_size_per_instance=128,

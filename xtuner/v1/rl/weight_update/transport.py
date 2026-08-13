@@ -447,8 +447,12 @@ class IPCWeightTransport(WeightTransport):
         elif self.backend == "sglang":
             return SGLangIPCBackendAdapter(rollout_tp=self.rollout_info.tp)
         elif self.backend == "pytorch" or self.backend == "turbomind":
+            rollout_parallel_size = self.rollout_info.ipc_engine_parallel_size
+            assert rollout_parallel_size is not None, (
+                "IPC rollout target size for the current train rank must be resolved before building the adapter."
+            )
             return LMDeployIPCBackendAdapter(
-                rollout_tp=self.rollout_info.tp,
+                rollout_tp=rollout_parallel_size,
                 backend=self.backend,
                 default_ipc_tensor_bytes=int(self.config.update_weight_bucket_size_in_gb * 1024**3),
             )

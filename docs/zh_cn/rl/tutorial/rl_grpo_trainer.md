@@ -43,6 +43,7 @@ rollout_config = RolloutConfig(
     model_path=model_path,
     dtype="bfloat16",
     tensor_parallel_size=1,
+    data_parallel_size=1,
     expert_parallel_size=1,
     gpu_memory_utilization=0.8,
     context_length=max_prompt_length + max_response_length,
@@ -52,7 +53,11 @@ rollout_config = RolloutConfig(
 常用自定义项：
 
 - `model_path`：rollout 使用的 HF 模型路径。
-- `tensor_parallel_size` / `expert_parallel_size`：推理并行度。
+- `tensor_parallel_size` / `data_parallel_size` / `expert_parallel_size`：推理并行度。使用 LMDeploy
+  PyTorch backend 且 `expert_parallel_size=1` 时，`tensor_parallel_size=16, data_parallel_size=4`
+  表示一个逻辑推理 engine 包含 4 个 DP replica，每个 replica 使用 4 张卡。为兼容已有配置，
+  `expert_parallel_size>1` 时 LMDeploy 仍自动使用 `effective_dp=expert_parallel_size`，此时
+  `data_parallel_size` 不改变原有 EP 行为。
 - `gpu_memory_utilization`：推理后端可使用的显存比例。
 - `context_length`：prompt 和 response 的最大总长度。
 

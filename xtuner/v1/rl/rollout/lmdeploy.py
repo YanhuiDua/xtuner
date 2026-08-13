@@ -1,5 +1,6 @@
 import os
 from argparse import Namespace
+from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping
 
 import numpy as np
@@ -9,6 +10,7 @@ from ray.util.placement_group import placement_group_table
 
 from transformers import AutoTokenizer
 from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams
+from xtuner.v1.utils import get_logger
 
 from .rollout_topology import RolloutEngine, RolloutServerProcess, RolloutTopology
 from .worker import RolloutConfig, RolloutWorker
@@ -16,6 +18,80 @@ from .worker import RolloutConfig, RolloutWorker
 
 SHARED_STORE = "shared_store"
 SHARED_STORE_NAMESPACE = "lmdeploy"
+
+
+@dataclass(frozen=True)
+class _LMDeployParallelLayout:
+    """Resolved LMDeploy parallel layout for one logical rollout engine."""
+
+    backend: str
+    tensor_parallel_size: int
+    data_parallel_size: int
+    expert_parallel_size: int
+    logical_engine_size: int
+    ranks_per_data_parallel_replica: int
+
+
+def _resolve_lmdeploy_parallel_layout(
+    config: RolloutConfig,
+    *,
+    warn_on_ignored_data_parallel_size: bool = False,
+) -> _LMDeployParallelLayout:
+    """Resolve LMDeploy parallel sizes while preserving legacy EP behavior."""
+
+    tp_size = config.tensor_parallel_size
+    configured_dp_size = getattr(config, "data_parallel_size", 1)
+    ep_size = config.expert_parallel_size
+    extra_config = config.extra_rollout_config or {}
+    backend = extra_config.get("lmdeploy_backend", "pytorch")
+
+    for name, size in (
+        ("tensor_parallel_size", tp_size),
+        ("data_parallel_size", configured_dp_size),
+        ("expert_parallel_size", ep_size),
+    ):
+        if size < 1:
+            raise ValueError(f"{name} must be greater than 0, but got {size}.")
+
+    if ep_size > 1:
+        if tp_size != 1:
+            raise ValueError(
+                "LMDeploy expert parallel rollout requires tensor_parallel_size=1, "
+                f"but got tensor_parallel_size={tp_size}, expert_parallel_size={ep_size}."
+            )
+        # Backward compatibility: current XTuner uses LMDeploy DP ranks to host EP ranks.
+        effective_dp_size = ep_size
+        if configured_dp_size not in (1, ep_size) and warn_on_ignored_data_parallel_size:
+            get_logger().warning(
+                "LMDeploy keeps legacy expert-parallel behavior when expert_parallel_size > 1: "
+                f"data_parallel_size={configured_dp_size} is ignored and effective data_parallel_size="
+                f"expert_parallel_size={ep_size}."
+            )
+        logical_engine_size = ep_size
+    else:
+        effective_dp_size = configured_dp_size
+        logical_engine_size = tp_size
+        if effective_dp_size > 1 and backend != "pytorch":
+            if warn_on_ignored_data_parallel_size:
+                get_logger().warning(
+                    "Explicit LMDeploy data parallelism is only supported by the PyTorch backend: "
+                    f"data_parallel_size={effective_dp_size} is ignored for lmdeploy_backend={backend!r}."
+                )
+            effective_dp_size = 1
+        if logical_engine_size % effective_dp_size != 0:
+            raise ValueError(
+                f"tensor_parallel_size={tp_size} must be divisible by data_parallel_size="
+                f"{effective_dp_size} for LMDeploy data parallel rollout."
+            )
+
+    return _LMDeployParallelLayout(
+        backend=backend,
+        tensor_parallel_size=tp_size,
+        data_parallel_size=effective_dp_size,
+        expert_parallel_size=ep_size,
+        logical_engine_size=logical_engine_size,
+        ranks_per_data_parallel_replica=logical_engine_size // effective_dp_size,
+    )
 
 
 def run_lmdeploy_server_wrapper(lmdeploy_config_namespace: Namespace):
@@ -92,6 +168,9 @@ class LMDeployWorker(RolloutWorker):
 
         ``rank_bundle_idx_list`` stores ``(worker_rank, bundle_idx)`` pairs.
 
+        With explicit LMDeploy data parallelism, ``engine_ranks`` still covers the full logical engine while each
+        server process owns one contiguous ``tensor_parallel_size / data_parallel_size`` rank group.
+
         Example with ranks [(0, 0), (1, 1), (2, 2), (3, 3)] and addrs
         {0: "addr0", 1: "addr1", 2: "addr2", 3: "addr3"}:
 
@@ -155,57 +234,39 @@ class LMDeployWorker(RolloutWorker):
         |      | )                                                                |
         +------+------------------------------------------------------------------+
         """
+        layout = _resolve_lmdeploy_parallel_layout(config, warn_on_ignored_data_parallel_size=True)
         engines: list[RolloutEngine] = []
         num_workers = len(rank_bundle_idx_list)
-        if config.expert_parallel_size <= 1:
-            num_gpus_per_engine = config.num_gpus_per_engine
-            if num_workers % num_gpus_per_engine != 0:
-                raise ValueError(
-                    f"num_rollout_workers={num_workers} must be divisible by "
-                    f"num_gpus_per_engine={num_gpus_per_engine}."
-                )
-            for engine_start in range(0, num_workers, num_gpus_per_engine):
-                engine_meta = rank_bundle_idx_list[engine_start : engine_start + num_gpus_per_engine]
-                engine_ranks = tuple(rank for rank, _ in engine_meta)
-                engine_bundle_idxs = tuple(bundle_idx for _, bundle_idx in engine_meta)
-                dist_init_addr_owner_rank = engine_ranks[0]
-                engines.append(
-                    RolloutEngine(
-                        engine_ranks=engine_ranks,
-                        dist_init_addr=rank_to_dist_init_addr[dist_init_addr_owner_rank],
-                        server_processes=(
-                            RolloutServerProcess(
-                                worker_rank=engine_ranks[0],
-                                placement_group_bundle_idxs=engine_bundle_idxs,
-                                weight_update_ranks=engine_ranks,
-                            ),
-                        ),
+        logical_engine_size = layout.logical_engine_size
+        if num_workers % logical_engine_size != 0:
+            raise ValueError(
+                f"num_rollout_workers={num_workers} must be divisible by "
+                f"LMDeploy logical_engine_size={logical_engine_size}."
+            )
+
+        ranks_per_dp = layout.ranks_per_data_parallel_replica
+        for engine_start in range(0, num_workers, logical_engine_size):
+            engine_meta = rank_bundle_idx_list[engine_start : engine_start + logical_engine_size]
+            engine_ranks = tuple(rank for rank, _ in engine_meta)
+            server_processes = []
+            for replica_start in range(0, logical_engine_size, ranks_per_dp):
+                replica_meta = engine_meta[replica_start : replica_start + ranks_per_dp]
+                replica_ranks = tuple(rank for rank, _ in replica_meta)
+                replica_bundle_idxs = tuple(bundle_idx for _, bundle_idx in replica_meta)
+                server_processes.append(
+                    RolloutServerProcess(
+                        worker_rank=replica_ranks[0],
+                        placement_group_bundle_idxs=replica_bundle_idxs,
+                        weight_update_ranks=replica_ranks,
                     )
                 )
-        else:
-            ep_size = config.expert_parallel_size
-            if num_workers % ep_size != 0:
-                raise ValueError(
-                    f"num_rollout_workers={num_workers} must be divisible by expert_parallel_size={ep_size}."
+            engines.append(
+                RolloutEngine(
+                    engine_ranks=engine_ranks,
+                    dist_init_addr=rank_to_dist_init_addr[engine_ranks[0]],
+                    server_processes=tuple(server_processes),
                 )
-            for engine_start in range(0, num_workers, ep_size):
-                engine_meta = rank_bundle_idx_list[engine_start : engine_start + ep_size]
-                engine_ranks = tuple(rank for rank, _ in engine_meta)
-                dist_init_addr_owner_rank = engine_ranks[0]
-                engines.append(
-                    RolloutEngine(
-                        engine_ranks=engine_ranks,
-                        dist_init_addr=rank_to_dist_init_addr[dist_init_addr_owner_rank],
-                        server_processes=tuple(
-                            RolloutServerProcess(
-                                worker_rank=server_rank,
-                                placement_group_bundle_idxs=(bundle_idx,),
-                                weight_update_ranks=(server_rank,),
-                            )
-                            for server_rank, bundle_idx in engine_meta
-                        ),
-                    )
-                )
+            )
 
         return RolloutTopology(engines=tuple(engines))
 
@@ -364,10 +425,22 @@ class LMDeployWorker(RolloutWorker):
         }
 
         backend = lmdeploy_config_kwargs.get("backend", "pytorch")
-        tp_size = self.config.tensor_parallel_size
-        dp_size = ep_size = self.config.expert_parallel_size
+        layout = _resolve_lmdeploy_parallel_layout(self.config)
+        if backend != layout.backend:
+            raise ValueError(
+                f"LMDeploy backend changed while resolving rollout config: topology={layout.backend!r}, server={backend!r}."
+            )
+        tp_size = layout.tensor_parallel_size
+        dp_size = layout.data_parallel_size
+        ep_size = layout.expert_parallel_size
         # RolloutController plays the role of proxy server in LMDeploy, which balances dp requests.
         # Therefore, each server only needs to handle 1 / dp_size of the total requests
+        if self.config.rollout_max_batch_size_per_instance < dp_size:
+            raise ValueError(
+                "rollout_max_batch_size_per_instance must be greater than or equal to the effective LMDeploy "
+                f"data parallel size, but got max_batch_size={self.config.rollout_max_batch_size_per_instance}, "
+                f"data_parallel_size={dp_size}."
+            )
         max_batch_size = self.config.rollout_max_batch_size_per_instance // dp_size
         distributed_executor_backend = lmdeploy_config_kwargs.get("distributed_executor_backend", "ray")
         lmdeploy_config_kwargs["allow_terminate_by_client"] = True
@@ -400,12 +473,7 @@ class LMDeployWorker(RolloutWorker):
             extra_engine_config["max_prefill_token_num"] = self.config.max_prefill_token_num
 
         assert self.server_launch_spec is not None
-        dp_rank = 0
-        if backend == "pytorch":
-            # currently only support ep > 1 and tp == 1 / ep == 1 and tp > 1
-            assert ep_size == 1 or tp_size == 1
-            if ep_size > 1:
-                dp_rank = self.server_launch_spec.engine_rank
+        dp_rank = self.server_launch_spec.server_process_rank if dp_size > 1 else 0
 
         backend_config = (
             PytorchEngineConfig(
@@ -463,7 +531,15 @@ class LMDeployWorker(RolloutWorker):
                     }
                 )
 
-            if tp_size > 1:
+            if dp_size > 1:
+                dist_addr, dist_port = self.server_launch_spec.dist_init_addr.split(":")[:2]
+                env.update(
+                    {
+                        "LMDEPLOY_DP_MASTER_ADDR": dist_addr,
+                        "LMDEPLOY_DP_MASTER_PORT": dist_port,
+                    }
+                )
+            elif tp_size > 1:
                 dist_addr, dist_port = self.server_launch_spec.dist_init_addr.split(":")[:2]
                 env.update(
                     {
@@ -471,16 +547,14 @@ class LMDeployWorker(RolloutWorker):
                         "LMDEPLOY_DIST_MASTER_PORT": dist_port,
                     }
                 )
-            elif ep_size > 1:
-                dist_addr, dist_port = self.server_launch_spec.dist_init_addr.split(":")[:2]
+
+            if ep_size > 1:
                 if speculative_num_draft_tokens is not None:
                     deepep_max_tokens_per_rank = max_batch_size * (1 + speculative_num_draft_tokens)
                 else:
                     deepep_max_tokens_per_rank = max_batch_size
                 env.update(
                     {
-                        "LMDEPLOY_DP_MASTER_ADDR": dist_addr,
-                        "LMDEPLOY_DP_MASTER_PORT": dist_port,
                         # DEEPEP_MAX_TOKENS_PER_RANK is required by DLBlas's DeepEP
                         # token dispatcher used in lmdeploy EP mode. Without it,
                         # lmdeploy will fail during warmup.

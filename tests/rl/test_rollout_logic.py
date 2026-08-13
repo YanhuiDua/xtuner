@@ -11,10 +11,11 @@
 """
 
 import asyncio
+import sys
 import threading
 import unittest
 from dataclasses import FrozenInstanceError
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
@@ -24,7 +25,12 @@ from xtuner.v1.rl.agent_loop import AgentLoopConfig
 from xtuner.v1.rl.rollout.controller import RolloutController
 from xtuner.v1.rl.rollout.health_manager import RolloutHealthManager
 from xtuner.v1.rl.rollout.lmdeploy import LMDeployWorker
-from xtuner.v1.rl.rollout.rollout_topology import RolloutEngine, RolloutTopology, RolloutServerProcess
+from xtuner.v1.rl.rollout.rollout_topology import (
+    RolloutEngine,
+    RolloutServerProcess,
+    RolloutTopology,
+    ServerLaunchSpec,
+)
 from xtuner.v1.rl.rollout.proxy_manager import RolloutProxyManager
 from xtuner.v1.rl.rollout.worker_registry import (
     RolloutWorkerRegistry,
@@ -36,6 +42,7 @@ from xtuner.v1.rl.rollout.utils import PartialRolloutHandler, SessionRouter
 from xtuner.v1.rl.rollout.worker import RolloutWorker, RolloutWorkerInitResult
 from xtuner.v1.rl.utils.misc import delete_from_routedapiproxy
 from xtuner.v1.rl.weight_update.data import RolloutWeightUpdateInfo
+from xtuner.v1.rl.weight_update.transport import IPCWeightTransport
 from xtuner.v1.train.rl_trainer import BaseRLTrainer, _agent_loop_manager_requires_rollout_proxy
 from xtuner.v1.utils.httpx_utils import HttpRequestErrorType, HttpRequestResult
 
@@ -111,6 +118,11 @@ class _FakeRolloutWorker:
         self.generate = _FakeRolloutWorkerGenerate(returned_state)
 
 
+class _FakeLMDeployEngineConfig:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
 class _ProxyRequiredAgentLoopConfig(AgentLoopConfig):
     hf_checkpoint: str = "fake"
     requires_rollout_proxy: bool = True
@@ -164,15 +176,18 @@ class TestRolloutTopologyAPI(unittest.TestCase):
         tp: int,
         ep: int,
         num_gpus_per_engine: int,
+        dp: int = 1,
         gpus_per_node: int = 8,
+        lmdeploy_backend: str = "pytorch",
     ):
         return SimpleNamespace(
             api_key="test-key",
             tensor_parallel_size=tp,
+            data_parallel_size=dp,
             expert_parallel_size=ep,
             num_gpus_per_engine=num_gpus_per_engine,
             gpus_per_node=gpus_per_node,
-            extra_rollout_config={"lmdeploy_backend": "pytorch"},
+            extra_rollout_config={"lmdeploy_backend": lmdeploy_backend},
         )
 
     def _rank_bundle_idx_list(self, num_workers: int):
@@ -204,6 +219,14 @@ class TestRolloutTopologyAPI(unittest.TestCase):
             train_rank=train_rank,
             weight_transport_type="ipc",
         )
+
+    def test_server_launch_spec_keeps_legacy_positional_arguments(self):
+        launch_spec = ServerLaunchSpec(0, (3,), "host0:25000", 0, False, 2, 4)
+
+        self.assertFalse(launch_spec.accepts_rollout_requests)
+        self.assertEqual(launch_spec.node_rank, 2)
+        self.assertEqual(launch_spec.nnodes, 4)
+        self.assertEqual(launch_spec.server_process_rank, 0)
 
     def test_rollout_topology_resolves_engine_dist_init_addr_when_created(self):
         rank_to_dist_init_addr = {0: "host0:25000", 1: "host1:25004"}
@@ -238,6 +261,8 @@ class TestRolloutTopologyAPI(unittest.TestCase):
         self.assertEqual(rank_1_launch_spec.dist_init_addr, "host0:25000")
         self.assertEqual(rank_0_launch_spec.engine_rank, 0)
         self.assertEqual(rank_1_launch_spec.engine_rank, 1)
+        self.assertEqual(rank_0_launch_spec.server_process_rank, 0)
+        self.assertEqual(rank_1_launch_spec.server_process_rank, 1)
         self.assertEqual(rank_1_launch_spec.placement_group_bundle_idxs, (1,))
         self.assertTrue(topology.is_request_entrypoint_rank(0))
         self.assertFalse(topology.is_request_entrypoint_rank(1))
@@ -293,6 +318,124 @@ class TestRolloutTopologyAPI(unittest.TestCase):
             tuple((rank,) for rank in range(16)),
         )
 
+    def test_lmdeploy_tp16_dp4_builds_four_replica_servers_and_weight_update_groups(self):
+        config = self._rollout_config(tp=16, dp=4, ep=1, num_gpus_per_engine=16)
+        topology = LMDeployWorker.build_rollout_topology(
+            config,
+            self._rank_bundle_idx_list(16),
+            self._rank_to_dist_init_addr(16),
+        )
+
+        self.assertEqual(len(topology.engines), 1)
+        engine = topology.engines[0]
+        self.assertEqual(engine.engine_ranks, tuple(range(16)))
+        self.assertEqual(engine.dist_init_addr, "host0:25000")
+        self.assertEqual(
+            tuple(
+                (
+                    server.worker_rank,
+                    server.placement_group_bundle_idxs,
+                    server.weight_update_ranks,
+                    server.accepts_rollout_requests,
+                )
+                for server in engine.server_processes
+            ),
+            (
+                (0, (0, 1, 2, 3), (0, 1, 2, 3), True),
+                (4, (4, 5, 6, 7), (4, 5, 6, 7), True),
+                (8, (8, 9, 10, 11), (8, 9, 10, 11), True),
+                (12, (12, 13, 14, 15), (12, 13, 14, 15), True),
+            ),
+        )
+
+        launch_specs = topology.server_launch_specs()
+        self.assertEqual(tuple(spec.worker_rank for spec in launch_specs), (0, 4, 8, 12))
+        self.assertEqual(tuple(spec.engine_rank for spec in launch_specs), (0, 4, 8, 12))
+        self.assertEqual(tuple(spec.server_process_rank for spec in launch_specs), (0, 1, 2, 3))
+        self.assertEqual(tuple(spec.dist_init_addr for spec in launch_specs), ("host0:25000",) * 4)
+
+        targets = self._weight_update_targets(topology)
+        self.assertEqual(
+            tuple((target.endpoint_rank, target.update_ranks) for target in targets),
+            (
+                (0, (0, 1, 2, 3)),
+                (4, (4, 5, 6, 7)),
+                (8, (8, 9, 10, 11)),
+                (12, (12, 13, 14, 15)),
+            ),
+        )
+        rollout_info = self._rollout_info(config=config, targets=targets, train_rank=5)
+        self.assertEqual(rollout_info.ipc_engine_parallel_rank, 1)
+        self.assertEqual(rollout_info.ipc_engine_parallel_size, 4)
+
+        transport = IPCWeightTransport.__new__(IPCWeightTransport)
+        transport.backend = "pytorch"
+        transport.rollout_info = rollout_info
+        transport.config = SimpleNamespace(update_weight_bucket_size_in_gb=0.5)
+        adapter = transport._build_adapter()
+        self.assertEqual(adapter.rollout_tp, 4)
+
+    def test_lmdeploy_dp_rank_restarts_for_each_logical_engine(self):
+        config = self._rollout_config(tp=16, dp=4, ep=1, num_gpus_per_engine=16)
+        topology = LMDeployWorker.build_rollout_topology(
+            config,
+            self._rank_bundle_idx_list(32),
+            self._rank_to_dist_init_addr(32),
+        )
+
+        self.assertEqual(len(topology.engines), 2)
+        self.assertEqual(
+            tuple(tuple(spec.server_process_rank for spec in engine_specs) for engine_specs in (
+                topology.server_launch_specs()[:4],
+                topology.server_launch_specs()[4:],
+            )),
+            ((0, 1, 2, 3), (0, 1, 2, 3)),
+        )
+        self.assertEqual(
+            tuple(spec.dist_init_addr for spec in topology.server_launch_specs()),
+            ("host0:25000",) * 4 + ("host16:25016",) * 4,
+        )
+
+    def test_lmdeploy_ep_keeps_legacy_effective_dp_and_warns_for_conflicting_explicit_dp(self):
+        config = self._rollout_config(tp=1, dp=4, ep=8, num_gpus_per_engine=8)
+        logger = MagicMock()
+        with patch("xtuner.v1.rl.rollout.lmdeploy.get_logger", return_value=logger):
+            topology = LMDeployWorker.build_rollout_topology(
+                config,
+                self._rank_bundle_idx_list(8),
+                self._rank_to_dist_init_addr(8),
+            )
+
+        self.assertEqual(tuple(spec.worker_rank for spec in topology.server_launch_specs()), tuple(range(8)))
+        self.assertEqual(tuple(spec.server_process_rank for spec in topology.server_launch_specs()), tuple(range(8)))
+        logger.warning.assert_called_once()
+        self.assertIn("data_parallel_size=4 is ignored", logger.warning.call_args.args[0])
+
+    def test_lmdeploy_dp_rejects_non_divisible_tp_and_is_ignored_for_turbomind(self):
+        with self.assertRaisesRegex(ValueError, "must be divisible by data_parallel_size=4"):
+            LMDeployWorker.build_rollout_topology(
+                self._rollout_config(tp=6, dp=4, ep=1, num_gpus_per_engine=6),
+                self._rank_bundle_idx_list(6),
+                self._rank_to_dist_init_addr(6),
+            )
+
+        logger = MagicMock()
+        with patch("xtuner.v1.rl.rollout.lmdeploy.get_logger", return_value=logger):
+            topology = LMDeployWorker.build_rollout_topology(
+                self._rollout_config(
+                    tp=8,
+                    dp=2,
+                    ep=1,
+                    num_gpus_per_engine=8,
+                    lmdeploy_backend="turbomind",
+                ),
+                self._rank_bundle_idx_list(8),
+                self._rank_to_dist_init_addr(8),
+            )
+        self.assertEqual(tuple(spec.worker_rank for spec in topology.server_launch_specs()), (0,))
+        logger.warning.assert_called_once()
+        self.assertIn("data_parallel_size=2 is ignored", logger.warning.call_args.args[0])
+
     def test_sglang_tp16_cross_node_weight_update_targets_match_legacy_mesh_and_url_semantics(self):
         config = self._rollout_config(tp=16, ep=1, num_gpus_per_engine=16, gpus_per_node=8)
         topology = SGLangWorker.build_rollout_topology(
@@ -313,6 +456,93 @@ class TestRolloutTopologyAPI(unittest.TestCase):
             self._rollout_info(config=config, targets=targets, train_rank=8).ipc_rank_mesh,
             (tuple(range(16)),),
         )
+
+
+class TestLMDeployServerConfig(unittest.TestCase):
+    def _config(self, *, tp: int, dp: int, ep: int):
+        return SimpleNamespace(
+            tensor_parallel_size=tp,
+            data_parallel_size=dp,
+            expert_parallel_size=ep,
+            extra_rollout_config={"lmdeploy_backend": "pytorch"},
+            rollout_max_batch_size_per_instance=128,
+            enable_return_routed_experts=False,
+            router_n_groups=None,
+            fp32_lm_head=False,
+            max_prefill_token_num=None,
+            skip_load_weights=False,
+            context_length=4096,
+            enable_float8=False,
+            gpu_memory_utilization=0.8,
+            gpus_per_node=8,
+            model_path="/model",
+        )
+
+    def _server_config(self, config, launch_spec):
+        worker = LMDeployWorker.__new__(LMDeployWorker)
+        worker.config = config
+        worker.server_launch_spec = launch_spec
+        worker.accelerator = "GPU"
+        worker.api_keys = None
+        worker.model_name = "model"
+        worker.host = "127.0.0.1"
+        worker.server_port = 8000
+
+        lmdeploy_module = ModuleType("lmdeploy")
+        messages_module = ModuleType("lmdeploy.messages")
+        messages_module.PytorchEngineConfig = _FakeLMDeployEngineConfig
+        messages_module.SpeculativeConfig = _FakeLMDeployEngineConfig
+        messages_module.TurbomindEngineConfig = _FakeLMDeployEngineConfig
+        lmdeploy_module.messages = messages_module
+
+        with (
+            patch.dict(sys.modules, {"lmdeploy": lmdeploy_module, "lmdeploy.messages": messages_module}),
+            patch(
+                "xtuner.v1.rl.rollout.lmdeploy.ray.get_runtime_context",
+                return_value=SimpleNamespace(namespace="test-namespace"),
+            ),
+            patch("xtuner.v1.rl.rollout.lmdeploy.ray.util.get_current_placement_group", return_value=object()),
+            patch("xtuner.v1.rl.rollout.lmdeploy.placement_group_table", return_value={"name": "test-pg"}),
+        ):
+            return worker._transform_rollout_config_to_server_configs()
+
+    def test_explicit_dp_sets_dp_rank_replica_bundles_and_dp_rendezvous(self):
+        config = self._config(tp=16, dp=4, ep=1)
+        topology = LMDeployWorker.build_rollout_topology(
+            config,
+            [(rank, rank) for rank in range(16)],
+            {rank: f"host{rank}:25{rank:03d}" for rank in range(16)},
+        )
+
+        server_config = self._server_config(config, topology.server_launch_specs()[2])
+
+        self.assertEqual(server_config.backend_config.tp, 16)
+        self.assertEqual(server_config.backend_config.dp, 4)
+        self.assertEqual(server_config.backend_config.ep, 1)
+        self.assertEqual(server_config.backend_config.dp_rank, 2)
+        self.assertEqual(server_config.backend_config.max_batch_size, 32)
+        self.assertEqual(server_config.ray_runtime_env["env_vars"]["LMDEPLOY_RAY_EXTERNAL_PG_BUNDLES"], "8,9,10,11")
+        self.assertEqual(server_config.ray_runtime_env["env_vars"]["LMDEPLOY_DP_MASTER_ADDR"], "host0")
+        self.assertEqual(server_config.ray_runtime_env["env_vars"]["LMDEPLOY_DP_MASTER_PORT"], "25000")
+        self.assertNotIn("LMDEPLOY_DIST_MASTER_ADDR", server_config.ray_runtime_env["env_vars"])
+
+    def test_ep_keeps_effective_dp_equal_to_ep_in_server_config(self):
+        config = self._config(tp=1, dp=4, ep=8)
+        with patch("xtuner.v1.rl.rollout.lmdeploy.get_logger"):
+            topology = LMDeployWorker.build_rollout_topology(
+                config,
+                [(rank, rank) for rank in range(8)],
+                {rank: f"host{rank}:25{rank:03d}" for rank in range(8)},
+            )
+
+        server_config = self._server_config(config, topology.server_launch_specs()[3])
+
+        self.assertEqual(server_config.backend_config.tp, 1)
+        self.assertEqual(server_config.backend_config.dp, 8)
+        self.assertEqual(server_config.backend_config.ep, 8)
+        self.assertEqual(server_config.backend_config.dp_rank, 3)
+        self.assertEqual(server_config.backend_config.max_batch_size, 16)
+        self.assertEqual(server_config.ray_runtime_env["env_vars"]["DEEPEP_MAX_TOKENS_PER_RANK"], "16")
 
 
 class TestRolloutController(unittest.IsolatedAsyncioTestCase):

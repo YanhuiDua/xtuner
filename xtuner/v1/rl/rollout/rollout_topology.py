@@ -63,6 +63,9 @@ class ServerLaunchSpec:
     node_rank: int = 0
     # Number of nodes for multi-node backend launches.
     nnodes: int = 1
+    # Rank of this server process among the server processes of the logical inference engine.
+    # Keep this field last so existing positional construction remains compatible.
+    server_process_rank: int = 0
 
 
 @dataclass(frozen=True)
@@ -162,12 +165,13 @@ class RolloutTopology:
                 placement_group_bundle_idxs=server.placement_group_bundle_idxs,
                 dist_init_addr=engine.dist_init_addr,
                 engine_rank=engine.engine_ranks.index(server.worker_rank),
+                server_process_rank=server_process_rank,
                 accepts_rollout_requests=server.accepts_rollout_requests,
                 node_rank=server.node_rank,
                 nnodes=server.nnodes,
             )
             for engine in self.engines
-            for server in engine.server_processes
+            for server_process_rank, server in enumerate(engine.server_processes)
         )
 
     def lifecycle_groups(self) -> tuple[tuple[int, ...], ...]:

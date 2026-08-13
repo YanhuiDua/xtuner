@@ -112,7 +112,11 @@ class RolloutConfig(BaseModel):
             will be determined automatically based on `context_length`. Defaults to 512.
         allow_over_concurrency_ratio (float): Deprecated compatibility option. Rollout runtime concurrency is
             controlled by fixed caps in xtuner.v1.rl.rollout.constants. Defaults to 1.2.
-        tensor_parallel_size (int): GPUs per inference engine (tensor parallelism). Defaults to 1.
+        tensor_parallel_size (int): Total GPUs per logical inference engine. With explicit LMDeploy data parallelism,
+            each replica uses tensor_parallel_size / data_parallel_size GPUs. Defaults to 1.
+        data_parallel_size (int): Number of data-parallel replicas in a logical inference engine. For backward
+            compatibility, LMDeploy uses data_parallel_size=expert_parallel_size when expert_parallel_size > 1.
+            Defaults to 1.
         expert_parallel_size (int): Experts per inference engine (expert parallelism). Defaults to 1.
         enable_chunked_prefill (bool): Enable chunked prefill for memory efficiency. Defaults to False.
         chunked_prefill_size (int): Chunk size for prefill operations. Defaults to 128.
@@ -228,14 +232,14 @@ class RolloutConfig(BaseModel):
         int,
         Parameter(
             group=infer_group,
-            help="Number of GPUs allocated for each inference engine in the rollout worker.",
+            help="Total GPUs in each logical inference engine; LMDeploy DP divides them across replicas.",
         ),
     ] = 1
     data_parallel_size: Annotated[
         int,
         Parameter(
             group=infer_group,
-            help="Number of GPUs allocated for processing data batches in parallel (Data Parallelism).",
+            help="Number of data-parallel replicas in each logical inference engine.",
         ),
     ] = 1
     expert_parallel_size: Annotated[

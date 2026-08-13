@@ -99,8 +99,16 @@ rollout_config = RolloutConfig(
     model_path=model_path,           # Inference model path
     model_name="qwen3-8B",           # Model name
     tokenizer_path=model_path,       # Tokenizer path
+    tensor_parallel_size=1,
+    data_parallel_size=1,
+    expert_parallel_size=1,
 )
 ```
+
+With the LMDeploy PyTorch backend and `expert_parallel_size=1`, setting
+`tensor_parallel_size=16, data_parallel_size=4` creates four data-parallel replicas in one logical inference engine;
+each replica uses four GPUs. For backward compatibility, when `expert_parallel_size>1`, LMDeploy continues to use
+`effective_dp=expert_parallel_size`, so `data_parallel_size` does not change the existing expert-parallel behavior.
 
 
 ### 1.4 JudgerConfig
