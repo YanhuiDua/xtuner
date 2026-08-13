@@ -39,13 +39,28 @@ class DepthDD(nn.Module):
         self.static_a = nn.Parameter(torch.zeros(num_prev))
         self.use_softmax = use_softmax
 
-    def forward(self, hidden_states: torch.Tensor, history_states: torch.Tensor) -> torch.Tensor:
-        history = torch.cat((history_states, hidden_states.unsqueeze(2)), dim=2)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        history: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
         weights = self.w2(F.gelu(self.w1(hidden_states)))
         weights = weights + self.static_a.view(1, 1, -1)
         if self.use_softmax:
             weights = weights.softmax(dim=-1)
-        return (weights.unsqueeze(-1) * history).sum(dim=2)
+
+        # Preserve the eager/HuggingFace reduction order. Compiled stages can
+        # instead keep history as separate inputs and fuse this fixed-length
+        # multiply-add chain without materializing a growing [B, S, D, H]
+        # history tensor at every layer.
+        if not torch.compiler.is_compiling():
+            history_tensor = torch.stack(history, dim=2)
+            return (weights.unsqueeze(-1) * history_tensor).sum(dim=2)
+
+        mixed = history[0] * weights[..., 0:1]
+        for index, state in enumerate(history[1:], start=1):
+            mixed = torch.addcmul(mixed, state, weights[..., index : index + 1])
+        return mixed
 
 
 class ResidualRoute(nn.Module):
@@ -129,10 +144,11 @@ class EncoderStage(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         seq_ctx: SequenceContext,
-        history_states: torch.Tensor,
+        *history_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raw = self.transformer(hidden_states, position_embeddings, seq_ctx)
-        return self.depth_dd(raw, history_states), raw
+        history = (*history_states, raw)
+        return self.depth_dd(raw, history), raw
 
 
 class ConceptStage(nn.Module):
@@ -152,11 +168,12 @@ class ConceptStage(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         seq_ctx: SequenceContext,
-        history_states: torch.Tensor,
         encoder_concept_states: torch.Tensor,
+        *history_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raw = self.transformer(hidden_states, position_embeddings, seq_ctx)
-        hidden_states = self.depth_dd(raw, history_states)
+        history = (*history_states, raw)
+        hidden_states = self.depth_dd(raw, history)
         hidden_states = self.read_encoder_route(hidden_states, encoder_concept_states)
         return hidden_states, raw
 
@@ -182,14 +199,15 @@ class DecoderStage(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         seq_ctx: SequenceContext,
-        history_states: torch.Tensor,
         repeated_concepts: torch.Tensor,
         encoder_states: torch.Tensor,
         concept_states: torch.Tensor,
         gate: torch.Tensor,
+        *history_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raw = self.transformer(hidden_states, position_embeddings, seq_ctx)
-        hidden_states = self.decoder_dd(raw, history_states)
+        history = (*history_states, raw)
+        hidden_states = self.decoder_dd(raw, history)
         hidden_states = self.concept_route(hidden_states, repeated_concepts, gate[0])
         hidden_states = self.read_encoder_route(hidden_states, encoder_states)
         hidden_states = self.read_concept_route(hidden_states, concept_states, gate[1])

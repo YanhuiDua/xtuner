@@ -514,7 +514,7 @@ class ConceptLMV22VQ(BaseModel):
         token_lengths = self._lengths(seq_ctx)
         token_position_embeddings = self.rotary_emb(hidden_states, seq_ctx.position_ids)
 
-        encoder_history = hidden_states.unsqueeze(2)
+        encoder_history = (hidden_states,)
         encoder_raw_states: list[torch.Tensor] = []
         for stage_idx, stage in enumerate(self.encoder_stages):
             with self._activation_offload_context(hidden_states, stage_idx, "encoder"):
@@ -522,10 +522,10 @@ class ConceptLMV22VQ(BaseModel):
                     hidden_states,
                     token_position_embeddings,
                     seq_ctx,
-                    encoder_history,
+                    *encoder_history,
                 )
             encoder_raw_states.append(raw)
-            encoder_history = torch.cat((encoder_history, raw.unsqueeze(2)), dim=2)
+            encoder_history = (*encoder_history, raw)
 
         sp_mesh = seq_ctx.sequence_parallel_mesh
         full_encoder_hidden = self._gather_sequence(hidden_states, sp_mesh)
@@ -556,7 +556,7 @@ class ConceptLMV22VQ(BaseModel):
         assert concept_ctx.position_ids is not None
         concept_position_embeddings = self.rotary_emb(concept_hidden, concept_ctx.position_ids)
 
-        concept_history = concept_hidden.unsqueeze(2)
+        concept_history = (concept_hidden,)
         concept_raw_states: list[torch.Tensor] = []
         for stage_idx, stage in enumerate(self.concept_stages):
             with self._activation_offload_context(concept_hidden, stage_idx, "concept"):
@@ -564,11 +564,11 @@ class ConceptLMV22VQ(BaseModel):
                     concept_hidden,
                     concept_position_embeddings,
                     concept_ctx,
-                    concept_history,
                     encoder_concept_states,
+                    *concept_history,
                 )
             concept_raw_states.append(raw)
-            concept_history = torch.cat((concept_history, raw.unsqueeze(2)), dim=2)
+            concept_history = (*concept_history, raw)
         concept_hidden = self.concept_final_norm(concept_hidden)
         concept_logits = self._predict_concept_logits(concept_hidden)
         codebook = self.concept_quantizer.transformed_codebook().to(concept_logits.dtype)
@@ -603,7 +603,7 @@ class ConceptLMV22VQ(BaseModel):
         )
         decoder_concept_states = self._local_token_shard(decoder_concept_states, seq_ctx, hidden_states.shape[1])
 
-        decoder_history = hidden_states.unsqueeze(2)
+        decoder_history = (hidden_states,)
         for layer_idx, stage in enumerate(self.decoder_stages):
             with self._activation_offload_context(hidden_states, layer_idx, "decoder"):
                 gate = self.final_read_concept_gate_logits[layer_idx].float().softmax(dim=-1)
@@ -611,13 +611,13 @@ class ConceptLMV22VQ(BaseModel):
                     hidden_states,
                     token_position_embeddings,
                     seq_ctx,
-                    decoder_history,
                     repeated_concepts,
                     decoder_encoder_states,
                     decoder_concept_states,
                     gate,
+                    *decoder_history,
                 )
-            decoder_history = torch.cat((decoder_history, raw.unsqueeze(2)), dim=2)
+            decoder_history = (*decoder_history, raw)
         hidden_states = self.final_norm(hidden_states)
 
         output: dict = {}

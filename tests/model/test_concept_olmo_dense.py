@@ -18,7 +18,7 @@ from xtuner.v1.model import (
     get_model_config,
     get_model_config_from_hf,
 )
-from xtuner.v1.module import ConceptStage, DecoderStage, EncoderStage, MHAConfig
+from xtuner.v1.module import ConceptStage, DecoderStage, DepthDD, EncoderStage, MHAConfig
 from xtuner.v1.module.rope import RopeParametersConfig
 from xtuner.v1.utils.load_spec import LoadEnum
 
@@ -231,6 +231,38 @@ def test_fused_prediction_heads_checkpoint_conversion():
     )
     torch.testing.assert_close(fused_weight, torch.cat(weights))
     torch.testing.assert_close(fused_bias, torch.cat(biases))
+
+
+@pytest.mark.parametrize("use_softmax", [False, True])
+def test_depth_dd_tuple_history_matches_materialized_reference(monkeypatch, use_softmax):
+    hidden_size = 8
+    layer_idx = 3
+    generator = torch.Generator().manual_seed(19)
+    depth_dd = DepthDD(hidden_size, layer_idx, use_softmax).double()
+    _initialize(depth_dd)
+
+    history = tuple(
+        torch.randn(2, 3, hidden_size, generator=generator, dtype=torch.float64, requires_grad=True)
+        for _ in range(layer_idx + 2)
+    )
+    hidden_states = history[-1]
+    weights = depth_dd.w2(F.gelu(depth_dd.w1(hidden_states)))
+    weights = weights + depth_dd.static_a.view(1, 1, -1)
+    if use_softmax:
+        weights = weights.softmax(dim=-1)
+    expected = (weights.unsqueeze(-1) * torch.stack(history, dim=2)).sum(dim=2)
+
+    # Exercise the compiled-path reduction; ordinary eager execution keeps the
+    # materialized reference path to preserve HuggingFace reduction order.
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    actual = depth_dd(hidden_states, history)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-12)
+    output_grad = torch.randn(actual.shape, generator=generator, dtype=torch.float64)
+    actual_grads = torch.autograd.grad(actual, (*history, *depth_dd.parameters()), output_grad, retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, (*history, *depth_dd.parameters()), output_grad)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-10, atol=1e-12)
 
 
 def test_packed_documents_match_separate_forwards(monkeypatch):
