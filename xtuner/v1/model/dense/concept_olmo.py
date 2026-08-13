@@ -10,11 +10,13 @@ from typing import Literal, Self, cast
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as distF
+import torch.nn.functional as F
 from pydantic import Field, model_validator
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+from torch.distributed.tensor import DTensor
 from tqdm import tqdm
 from typing_extensions import override
 
@@ -124,16 +126,11 @@ class ConceptLMV22VQ(BaseModel):
             config.concept_v22_vq_codebook_size,
         )
         self.concept_final_norm = CheckpointRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.prediction_heads = nn.ModuleList(
-            [
-                build_linear(
-                    config.hidden_size,
-                    config.concept_v22_vq_codebook_size,
-                    bias=True,
-                    float8_cfg=config.float8_cfg,
-                )
-                for _ in range(config.concept_v22_vq_num_codebooks)
-            ]
+        self.prediction_heads = build_linear(
+            config.hidden_size,
+            config.concept_v22_vq_num_codebooks * config.concept_v22_vq_codebook_size,
+            bias=True,
+            float8_cfg=config.float8_cfg,
         )
         self.concept_read_encoder_shared_source_norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -181,9 +178,51 @@ class ConceptLMV22VQ(BaseModel):
             float8_cfg=config.float8_cfg,
         )
 
+    def _predict_concept_logits(self, concept_hidden: torch.Tensor) -> torch.Tensor:
+        num_codebooks = self.config.concept_v22_vq_num_codebooks
+        codebook_size = self.config.concept_v22_vq_codebook_size
+
+        # A single physical parameter keeps prediction-head FSDP communication
+        # in one collective. Use its single large GEMM in the optimized/FP8
+        # path; for eager BF16 inference, retain the 32 independent HF GEMMs so
+        # checkpoint parity keeps the original accumulation order.
+        if self._compile_cfg or self.config.float8_cfg is not None:
+            return self.prediction_heads(concept_hidden).reshape(
+                *concept_hidden.shape[:-1],
+                num_codebooks,
+                codebook_size,
+            )
+
+        projection = cast(nn.Linear, self.prediction_heads)
+        weight = projection.weight
+        bias = projection.bias
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+            if bias is not None:
+                assert isinstance(bias, DTensor)
+                bias = bias.to_local()
+        assert bias is not None
+        return torch.stack(
+            [
+                F.linear(concept_hidden, head_weight, head_bias)
+                for head_weight, head_bias in zip(
+                    weight.chunk(num_codebooks),
+                    bias.chunk(num_codebooks),
+                    strict=True,
+                )
+            ],
+            dim=2,
+        )
+
     def to_hf_key_list(self, key: str) -> list[str]:
         if key == "concept_quantizer.codebook":
             return [f"concept_quantizer.codebook.{index}" for index in range(self.config.concept_v22_vq_num_codebooks)]
+        if key in {"prediction_heads.weight", "prediction_heads.bias"}:
+            suffix = key.rsplit(".", 1)[-1]
+            return [
+                f"concept_predictor.prediction_heads.{index}.{suffix}"
+                for index in range(self.config.concept_v22_vq_num_codebooks)
+            ]
         mappings = (
             (r"^embed_tokens\.", "embedding.word_embeddings."),
             (r"^encoder_stages\.(\d+)\.transformer\.", r"encoder.layers.\1."),
@@ -206,7 +245,6 @@ class ConceptLMV22VQ(BaseModel):
                 r"decoder_read_concept_routes.\1.",
             ),
             (r"^concept_final_norm\.", "concept_predictor.hlm_block.final_layernorm."),
-            (r"^prediction_heads\.", "concept_predictor.prediction_heads."),
             (
                 r"^concept_read_encoder_shared_source_norm\.",
                 "concept_predictor.concept_read_encoder_shared_source_norm.",
@@ -532,7 +570,7 @@ class ConceptLMV22VQ(BaseModel):
             concept_raw_states.append(raw)
             concept_history = torch.cat((concept_history, raw.unsqueeze(2)), dim=2)
         concept_hidden = self.concept_final_norm(concept_hidden)
-        concept_logits = torch.stack([head(concept_hidden) for head in self.prediction_heads], dim=2)
+        concept_logits = self._predict_concept_logits(concept_hidden)
         codebook = self.concept_quantizer.transformed_codebook().to(concept_logits.dtype)
         predicted_vectors = torch.einsum("bsck,ckd->bscd", concept_logits, codebook).reshape(
             concept_logits.shape[0], concept_logits.shape[1], self.config.hidden_size
@@ -660,23 +698,14 @@ class ConceptLMV22VQ(BaseModel):
                 module=stage,
             )
 
-        ordered_stages = [stage for group in stage_groups for stage in group]
-        for current_stage, next_stage in zip(ordered_stages[:-1], ordered_stages[1:], strict=True):
-            current_stage.set_modules_to_forward_prefetch([next_stage])  # type: ignore[attr-defined]
-
-        shared_modules: tuple[nn.Module, ...] = (
+        # Keep large shared modules independently shardable/prefetchable. Tiny
+        # norms are intentionally left to the root FSDP group so their
+        # parameters share one collective instead of eight latency-bound ones.
+        separately_sharded_modules: tuple[nn.Module, ...] = (
             self.embed_tokens,
-            self.concept_vq_input_norm,
-            self.concept_final_norm,
-            *self.prediction_heads,
-            self.concept_read_encoder_shared_source_norm,
-            self.fusion_tok_norm,
-            self.fusion_hl_norm,
-            self.decoder_read_encoder_shared_source_norm,
-            self.decoder_read_concept_shared_source_norm,
-            self.final_norm,
+            self.prediction_heads,
         )
-        for module in shared_modules:
+        for module in separately_sharded_modules:
             self._fully_shard(
                 mesh=shard_mesh,
                 mp_policy=mp_policy,
@@ -697,6 +726,17 @@ class ConceptLMV22VQ(BaseModel):
             reshard_after_forward=fsdp_config.reshard_after_forward,
             offload_policy=offload_policy,
         )
+        ordered_forward_modules = [
+            *self.encoder_stages,
+            *self.concept_stages,
+            self.prediction_heads,
+            *self.decoder_stages,
+            self.lm_head,
+        ]
+        for current_module, next_module in zip(
+            ordered_forward_modules[:-1], ordered_forward_modules[1:], strict=True
+        ):
+            current_module.set_modules_to_forward_prefetch([next_module])  # type: ignore[attr-defined]
         self.set_modules_to_forward_prefetch([self.embed_tokens, self.encoder_stages[0]])  # type: ignore[operator]
         self._to_empty_meta()
         return self

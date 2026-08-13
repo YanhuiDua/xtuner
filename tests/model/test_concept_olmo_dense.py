@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 import torch.distributed.nn.functional as distF
+import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 
 from xtuner._testing import DeterministicDDPTestCase
@@ -19,6 +20,7 @@ from xtuner.v1.model import (
 )
 from xtuner.v1.module import ConceptStage, DecoderStage, EncoderStage, MHAConfig
 from xtuner.v1.module.rope import RopeParametersConfig
+from xtuner.v1.utils.load_spec import LoadEnum
 
 
 MODEL_PATH = os.getenv("CONCEPT_OLMO_STAGE2_V1_PATH")
@@ -100,12 +102,24 @@ def test_config_alias_and_meta_layout():
     with torch.device("meta"):
         model = config.build()
     assert sum(parameter.numel() for parameter in model.parameters()) == 8_938_363_793
-    assert len(model.state_dict()) == 693
+    assert len(model.state_dict()) == 631
     assert model.concept_quantizer.codebook.shape == (32 * 128, 128)
     assert model.concept_quantizer.transformed_codebook().shape == (32, 128, 128)
     assert model.to_hf_key_list("concept_quantizer.codebook") == [
         f"concept_quantizer.codebook.{index}" for index in range(32)
     ]
+    assert model.prediction_heads.weight.shape == (32 * 128, 4096)
+    assert model.prediction_heads.bias.shape == (32 * 128,)
+    assert model.to_hf_key_list("prediction_heads.weight") == [
+        f"concept_predictor.prediction_heads.{index}.weight" for index in range(32)
+    ]
+    assert model.to_hf_key_list("prediction_heads.bias") == [
+        f"concept_predictor.prediction_heads.{index}.bias" for index in range(32)
+    ]
+    assert model.load_spec_mapping["prediction_heads.weight"].load_enum is LoadEnum.FUSED
+    assert model.load_spec_mapping["prediction_heads.weight"].dim == 0
+    assert model.load_spec_mapping["prediction_heads.bias"].load_enum is LoadEnum.FUSED
+    assert model.load_spec_mapping["prediction_heads.bias"].dim == 0
     assert model.lm_head.weight.shape == (config.vocab_size, 4096)
     assert model.lm_head.logical_out_features == config.vocab_size
     assert model.to_hf_key_list("encoder_stages.3.transformer.self_attention.linear_qkv.weight") == [
@@ -152,6 +166,71 @@ def test_lm_head_vocab_padding_checkpoint_conversion():
     )
     torch.testing.assert_close(local_shard[:14], checkpoint_weight[112:126])
     torch.testing.assert_close(local_shard[14:], torch.zeros_like(local_shard[14:]))
+
+
+def test_fused_prediction_heads_match_independent_heads():
+    config = _tiny_config()
+    model = config.build()
+    fused_head = model.prediction_heads
+    num_codebooks = config.concept_v22_vq_num_codebooks
+    codebook_size = config.concept_v22_vq_codebook_size
+
+    generator = torch.Generator().manual_seed(11)
+    with torch.no_grad():
+        fused_head.weight.copy_(torch.randn(fused_head.weight.shape, generator=generator))
+        fused_head.bias.copy_(torch.randn(fused_head.bias.shape, generator=generator))
+
+    fused_input = torch.randn(2, 3, config.hidden_size, generator=generator, requires_grad=True)
+    reference_input = fused_input.detach().clone().requires_grad_()
+    reference_weights = [chunk.detach().clone().requires_grad_() for chunk in fused_head.weight.chunk(num_codebooks)]
+    reference_biases = [chunk.detach().clone().requires_grad_() for chunk in fused_head.bias.chunk(num_codebooks)]
+
+    actual = fused_head(fused_input).reshape(2, 3, num_codebooks, codebook_size)
+    expected = torch.stack(
+        [
+            F.linear(reference_input, weight, bias)
+            for weight, bias in zip(reference_weights, reference_biases, strict=True)
+        ],
+        dim=2,
+    )
+    torch.testing.assert_close(actual, expected)
+
+    output_grad = torch.randn(actual.shape, generator=generator)
+    actual.backward(output_grad)
+    expected.backward(output_grad)
+    torch.testing.assert_close(fused_input.grad, reference_input.grad)
+    torch.testing.assert_close(fused_head.weight.grad, torch.cat([weight.grad for weight in reference_weights]))
+    torch.testing.assert_close(fused_head.bias.grad, torch.cat([bias.grad for bias in reference_biases]))
+
+
+def test_fused_prediction_heads_checkpoint_conversion():
+    config = _tiny_config()
+    model = config.build()
+    num_codebooks = config.concept_v22_vq_num_codebooks
+    codebook_size = config.concept_v22_vq_codebook_size
+    weights = [torch.full((codebook_size, config.hidden_size), float(index)) for index in range(num_codebooks)]
+    biases = [torch.full((codebook_size,), float(index)) for index in range(num_codebooks)]
+    fused_weight = torch.empty(num_codebooks * codebook_size, config.hidden_size)
+    fused_bias = torch.empty(num_codebooks * codebook_size)
+
+    model.safetensors_to_params(
+        weights,
+        fused_weight,
+        param_name="prediction_heads.weight",
+        start=None,
+        end=None,
+        dim=0,
+    )
+    model.safetensors_to_params(
+        biases,
+        fused_bias,
+        param_name="prediction_heads.bias",
+        start=None,
+        end=None,
+        dim=0,
+    )
+    torch.testing.assert_close(fused_weight, torch.cat(weights))
+    torch.testing.assert_close(fused_bias, torch.cat(biases))
 
 
 def test_packed_documents_match_separate_forwards(monkeypatch):
@@ -313,7 +392,7 @@ def test_full_checkpoint_forward_bitwise(monkeypatch):
     with torch.device("meta"):
         model = config.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
     loaded, unloaded, missing = model.from_hf(MODEL_PATH)
-    assert len(loaded) == 693
+    assert len(loaded) == 631
     assert not unloaded
     assert not missing
 
