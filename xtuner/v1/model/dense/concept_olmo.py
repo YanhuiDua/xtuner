@@ -54,6 +54,7 @@ CONCEPT_OLMO_COMPILE_CFG: dict[str, TorchCompileOption] = {
     "xtuner.v1.module.concept_olmo.EncoderStage.forward": TorchCompileOption(fullgraph=True),
     "xtuner.v1.module.concept_olmo.ConceptStage.forward": TorchCompileOption(fullgraph=True),
     "xtuner.v1.module.concept_olmo.DecoderStage.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.loss.ce_loss.LMHeadLossContext.loss_fn": TorchCompileOption(fullgraph=True),
     **DEFAULT_FLOAT8_CFG,
 }
 
