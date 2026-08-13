@@ -32,6 +32,7 @@ class AdamWConfig(OptimConfig):
     betas: Annotated[Tuple[float, float], Parameter(help="Beta coefficients for Adam optimizer")] = (0.9, 0.95)
     eps: Annotated[float, Parameter(help="Epsilon value for numerical stability in Adam optimizer")] = 1e-8
     foreach: Annotated[Optional[bool], Parameter(help="Use foreach implementation for AdamW")] = None
+    fused: Annotated[Optional[bool], Parameter(help="Use fused implementation for AdamW")] = None
     swap_optimizer: Annotated[Optional[bool], Parameter(help="Swap optimizer states to host memory.")] = False
 
     def build(self, model):
@@ -54,6 +55,8 @@ class AdamWConfig(OptimConfig):
             )
             logger.info(f"Untrainable parameters names: {untrainable_names}")
         if self.swap_optimizer:
+            if self.fused:
+                raise ValueError("fused AdamW is not supported together with optimizer-state swapping")
             return SwapAdamW(
                 params,
                 lr=self.lr,
@@ -63,7 +66,13 @@ class AdamWConfig(OptimConfig):
                 foreach=self.foreach,
             )
         return torch.optim.AdamW(
-            params, lr=self.lr, betas=self.betas, eps=self.eps, weight_decay=self.weight_decay, foreach=self.foreach
+            params,
+            lr=self.lr,
+            betas=self.betas,
+            eps=self.eps,
+            weight_decay=self.weight_decay,
+            foreach=self.foreach,
+            fused=self.fused,
         )
 
 
