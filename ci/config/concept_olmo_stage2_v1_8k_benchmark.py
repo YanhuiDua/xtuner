@@ -14,7 +14,11 @@
 #   SKIP_SAVE=1  # skip both HuggingFace and DCP checkpoint exports
 #   LM_HEAD_VOCAB_PADDING_MULTIPLE=8  # align the physical LM-head vocabulary (default)
 #   FUSED_ADAMW=1  # use torch's fused AdamW implementation
+#   FUSED_ADAMW=1 FUSED_GRAD_CLIP=1  # fold clipping and finite checks into fused AdamW
+#   FUSED_ADAMW=1 LOCAL_DTENSOR_ADAMW=1  # bypass DTensor dispatch around fused AdamW
 #   LOSS_MODE=eager  # eager, chunk, or liger; liger requires LM_HEAD_VOCAB_PADDING_MULTIPLE=1
+#   STAGE_GROUP_SIZE=4 RECOMPUTE_RATIO=0 RESHARD_AFTER_FORWARD=0
+#       compile/shard four consecutive stages as one unit
 #
 # Required environment variables:
 #
@@ -61,10 +65,19 @@ PROFILE_TIME = _parse_bool_env("PROFILE_TIME", "1")
 PROFILE_MEMORY = _parse_bool_env("PROFILE_MEMORY", "0")
 SKIP_SAVE = _parse_bool_env("SKIP_SAVE", "0")
 FUSED_ADAMW = _parse_bool_env("FUSED_ADAMW", "0")
+FUSED_GRAD_CLIP = _parse_bool_env("FUSED_GRAD_CLIP", "0")
+LOCAL_DTENSOR_ADAMW = _parse_bool_env("LOCAL_DTENSOR_ADAMW", "0")
 LOSS_MODE = os.getenv("LOSS_MODE", "eager")
 LM_HEAD_VOCAB_PADDING_MULTIPLE = int(os.getenv("LM_HEAD_VOCAB_PADDING_MULTIPLE", "8"))
 if LM_HEAD_VOCAB_PADDING_MULTIPLE <= 0:
     raise ValueError("LM_HEAD_VOCAB_PADDING_MULTIPLE must be positive")
+STAGE_GROUP_SIZE = int(os.getenv("STAGE_GROUP_SIZE", "1"))
+if STAGE_GROUP_SIZE <= 0:
+    raise ValueError("STAGE_GROUP_SIZE must be positive")
+if STAGE_GROUP_SIZE > 1 and (RECOMPUTE_RATIO != 0 or RESHARD_AFTER_FORWARD):
+    raise ValueError("STAGE_GROUP_SIZE > 1 requires RECOMPUTE_RATIO=0 and RESHARD_AFTER_FORWARD=0")
+if (FUSED_GRAD_CLIP or LOCAL_DTENSOR_ADAMW) and not FUSED_ADAMW:
+    raise ValueError("FUSED_GRAD_CLIP and LOCAL_DTENSOR_ADAMW require FUSED_ADAMW=1")
 
 _peak_tflops_override = os.getenv("PEAK_TFLOPS_PER_GPU")
 PEAK_TFLOPS_PER_GPU = float(_peak_tflops_override) if _peak_tflops_override else None
@@ -76,8 +89,14 @@ WORK_DIR = os.getenv(
 model_cfg = ConceptOlmoStage2V1Config(
     compile_cfg=None if TORCH_COMPILE else False,
     lm_head_vocab_padding_multiple=LM_HEAD_VOCAB_PADDING_MULTIPLE,
+    stage_group_size=STAGE_GROUP_SIZE,
 )
-optim_cfg = AdamWConfig(lr=6e-5, fused=True if FUSED_ADAMW else None)
+optim_cfg = AdamWConfig(
+    lr=6e-5,
+    fused=True if FUSED_ADAMW else None,
+    fused_grad_clip=FUSED_GRAD_CLIP,
+    local_dtensor_step=LOCAL_DTENSOR_ADAMW,
+)
 lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
 fsdp_cfg = FSDPConfig(
     cpu_offload=False,
