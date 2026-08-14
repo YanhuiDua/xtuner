@@ -19,6 +19,7 @@
 #   LOSS_MODE=eager  # eager, chunk, or liger; liger requires LM_HEAD_VOCAB_PADDING_MULTIPLE=1
 #   STAGE_GROUP_SIZE=4 RECOMPUTE_RATIO=0 RESHARD_AFTER_FORWARD=0
 #       compile/shard four consecutive stages as one unit
+#   FLOAT8_MODE=tensorwise PEAK_TFLOPS_PER_GPU=1979  # H200 dense FP8 peak
 #
 # Required environment variables:
 #
@@ -29,6 +30,7 @@ import os
 from xtuner.v1.config import AdamWConfig, FSDPConfig, LRConfig
 from xtuner.v1.datasets import FTDPTokenizeFnConfig
 from xtuner.v1.datasets.config import DataloaderConfig, DatasetConfig
+from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.loss.ce_loss import CELossConfig
 from xtuner.v1.model import ConceptOlmoStage2V1Config
 from xtuner.v1.train import MFUConfig, TrainerConfig
@@ -78,9 +80,18 @@ if STAGE_GROUP_SIZE > 1 and (RECOMPUTE_RATIO != 0 or RESHARD_AFTER_FORWARD):
     raise ValueError("STAGE_GROUP_SIZE > 1 requires RECOMPUTE_RATIO=0 and RESHARD_AFTER_FORWARD=0")
 if (FUSED_GRAD_CLIP or LOCAL_DTENSOR_ADAMW) and not FUSED_ADAMW:
     raise ValueError("FUSED_GRAD_CLIP and LOCAL_DTENSOR_ADAMW require FUSED_ADAMW=1")
+FLOAT8_MODE = os.getenv("FLOAT8_MODE", "none").lower()
+float8_cfg = {
+    "none": None,
+    "tensorwise": Float8Config(scaling_granularity_gemm=ScalingGranularity.TENSORWISE),
+}.get(FLOAT8_MODE)
+if FLOAT8_MODE not in {"none", "tensorwise"}:
+    raise ValueError("FLOAT8_MODE must be one of: none, tensorwise")
 
 _peak_tflops_override = os.getenv("PEAK_TFLOPS_PER_GPU")
 PEAK_TFLOPS_PER_GPU = float(_peak_tflops_override) if _peak_tflops_override else None
+if float8_cfg is not None and PEAK_TFLOPS_PER_GPU is None:
+    raise ValueError("FP8 training requires PEAK_TFLOPS_PER_GPU for a valid MFU denominator")
 WORK_DIR = os.getenv(
     "WORK_DIR",
     f"/tmp/concept_olmo_stage2_v1_8k_compile_{'on' if TORCH_COMPILE else 'off'}",
@@ -90,6 +101,7 @@ model_cfg = ConceptOlmoStage2V1Config(
     compile_cfg=None if TORCH_COMPILE else False,
     lm_head_vocab_padding_multiple=LM_HEAD_VOCAB_PADDING_MULTIPLE,
     stage_group_size=STAGE_GROUP_SIZE,
+    float8_cfg=float8_cfg,
 )
 optim_cfg = AdamWConfig(
     lr=6e-5,
