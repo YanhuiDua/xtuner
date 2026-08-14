@@ -18,7 +18,7 @@ from xtuner.v1.model import (
     get_model_config,
     get_model_config_from_hf,
 )
-from xtuner.v1.module import ConceptStage, DecoderStage, DepthDD, EncoderStage, MHAConfig
+from xtuner.v1.module import ConceptStage, DecoderStage, DepthDD, EncoderStage, MHAConfig, ResidualRoute
 from xtuner.v1.module.rope import RopeParametersConfig
 from xtuner.v1.utils.load_spec import LoadEnum
 
@@ -261,6 +261,44 @@ def test_depth_dd_tuple_history_matches_materialized_reference(monkeypatch, use_
     output_grad = torch.randn(actual.shape, generator=generator, dtype=torch.float64)
     actual_grads = torch.autograd.grad(actual, (*history, *depth_dd.parameters()), output_grad, retain_graph=True)
     expected_grads = torch.autograd.grad(expected, (*history, *depth_dd.parameters()), output_grad)
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("num_source_states", [8, 16])
+@pytest.mark.parametrize("use_softmax", [False, True])
+def test_residual_route_compiled_reduction_matches_einsum(monkeypatch, num_source_states, use_softmax):
+    hidden_size = 8
+    generator = torch.Generator().manual_seed(23)
+    route = ResidualRoute(hidden_size, num_source_states, use_softmax).double()
+    _initialize(route)
+
+    target_hidden = torch.randn(2, 3, hidden_size, generator=generator, dtype=torch.float64, requires_grad=True)
+    source_states = torch.randn(
+        2,
+        3,
+        num_source_states,
+        hidden_size,
+        generator=generator,
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    residual_scale = torch.randn((), generator=generator, dtype=torch.float64, requires_grad=True)
+
+    weights = route.w2(F.gelu(route.w1(target_hidden)))
+    if use_softmax:
+        weights = weights.softmax(dim=-1)
+    source_mix = torch.einsum("bsm,bsmh->bsh", weights, source_states)
+    expected = target_hidden + source_mix * route.residual_diag * residual_scale
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    actual = route(target_hidden, source_states, residual_scale)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-12)
+    output_grad = torch.randn(actual.shape, generator=generator, dtype=torch.float64)
+    grad_inputs = (target_hidden, source_states, residual_scale, *route.parameters())
+    actual_grads = torch.autograd.grad(actual, grad_inputs, output_grad, retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, grad_inputs, output_grad)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-10, atol=1e-12)
 

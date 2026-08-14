@@ -89,7 +89,14 @@ class ResidualRoute(nn.Module):
         weights = self.w2(F.gelu(self.w1(target_hidden)))[..., -active_sources:]
         if self.use_softmax:
             weights = weights.softmax(dim=-1)
-        source_mix = torch.einsum("bsm,bsmh->bsh", weights, source_states)
+
+        # Keep the eager/HuggingFace GEMV path for exact checkpoint parity.
+        # Compiled stages fuse the elementwise multiply and source reduction,
+        # avoiding a batched GEMV for every route in every decoder layer.
+        if not torch.compiler.is_compiling():
+            source_mix = torch.einsum("bsm,bsmh->bsh", weights, source_states)
+        else:
+            source_mix = (weights.unsqueeze(-1) * source_states).sum(dim=2)
         update = source_mix * self.residual_diag.to(source_mix.dtype)
         if residual_scale is not None:
             update = update * residual_scale.to(update.dtype)
