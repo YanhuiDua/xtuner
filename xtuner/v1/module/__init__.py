@@ -12,9 +12,12 @@ from .concept_olmo import (
     ConceptQuantizer,
     ConceptRoute,
     ConceptStage,
+    ConceptStageGroup,
     DecoderStage,
+    DecoderStageGroup,
     DepthDD,
     EncoderStage,
+    EncoderStageGroup,
     ResidualRoute,
 )
 from .dispatcher import NaiveDispatcher, TorchAll2AllDispatcher, build_dispatcher
@@ -59,8 +62,11 @@ __all__ = [
     "ConceptQuantizer",
     "ConceptRoute",
     "ConceptStage",
+    "ConceptStageGroup",
     "DecoderStage",
+    "DecoderStageGroup",
     "DepthDD",
     "EncoderStage",
+    "EncoderStageGroup",
     "ResidualRoute",
 ]

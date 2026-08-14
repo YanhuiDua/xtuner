@@ -1,5 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
+from collections import OrderedDict
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -219,3 +221,93 @@ class DecoderStage(nn.Module):
         hidden_states = self.read_encoder_route(hidden_states, encoder_states)
         hidden_states = self.read_concept_route(hidden_states, concept_states, gate[1])
         return hidden_states, raw
+
+
+class EncoderStageGroup(nn.Sequential):
+    """A compiled/FSDP unit containing consecutive encoder stages."""
+
+    def __init__(self, stages: list[tuple[int, EncoderStage]]):
+        super().__init__(OrderedDict((str(index), stage) for index, stage in stages))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        seq_ctx: SequenceContext,
+        *history_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        raw_states: list[torch.Tensor] = []
+        for stage in self:
+            hidden_states, raw = stage(
+                hidden_states,
+                position_embeddings,
+                seq_ctx,
+                *history_states,
+                *raw_states,
+            )
+            raw_states.append(raw)
+        return hidden_states, *raw_states
+
+
+class ConceptStageGroup(nn.Sequential):
+    """A compiled/FSDP unit containing consecutive concept stages."""
+
+    def __init__(self, stages: list[tuple[int, ConceptStage]]):
+        super().__init__(OrderedDict((str(index), stage) for index, stage in stages))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        seq_ctx: SequenceContext,
+        encoder_concept_states: torch.Tensor,
+        *history_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        raw_states: list[torch.Tensor] = []
+        for stage in self:
+            hidden_states, raw = stage(
+                hidden_states,
+                position_embeddings,
+                seq_ctx,
+                encoder_concept_states,
+                *history_states,
+                *raw_states,
+            )
+            raw_states.append(raw)
+        return hidden_states, *raw_states
+
+
+class DecoderStageGroup(nn.Sequential):
+    """A compiled/FSDP unit containing consecutive decoder stages."""
+
+    def __init__(self, stages: list[tuple[int, DecoderStage]]):
+        super().__init__(OrderedDict((str(index), stage) for index, stage in stages))
+        self.stage_indices = tuple(index for index, _ in stages)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        seq_ctx: SequenceContext,
+        repeated_concepts: torch.Tensor,
+        encoder_states: torch.Tensor,
+        concept_states: torch.Tensor,
+        gate_logits: torch.Tensor,
+        *history_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        raw_states: list[torch.Tensor] = []
+        for stage_idx, stage in zip(self.stage_indices, self, strict=True):
+            gate = gate_logits[stage_idx].float().softmax(dim=-1)
+            hidden_states, raw = stage(
+                hidden_states,
+                position_embeddings,
+                seq_ctx,
+                repeated_concepts,
+                encoder_states,
+                concept_states,
+                gate,
+                *history_states,
+                *raw_states,
+            )
+            raw_states.append(raw)
+        return hidden_states, *raw_states

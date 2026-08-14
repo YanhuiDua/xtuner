@@ -37,9 +37,12 @@ from xtuner.v1.module import (
     ConceptQuantizer,
     ConceptRoute,
     ConceptStage,
+    ConceptStageGroup,
     DecoderStage,
+    DecoderStageGroup,
     DepthDD,
     EncoderStage,
+    EncoderStageGroup,
     LMHead,
     MHAConfig,
     ResidualRoute,
@@ -59,6 +62,13 @@ CONCEPT_OLMO_COMPILE_CFG: dict[str, TorchCompileOption] = {
     "xtuner.v1.loss.ce_loss.LMHeadLossContext.loss_fn": TorchCompileOption(fullgraph=True),
     **DEFAULT_FLOAT8_CFG,
 }
+CONCEPT_OLMO_GROUPED_COMPILE_CFG: dict[str, TorchCompileOption] = {
+    "xtuner.v1.module.concept_olmo.EncoderStageGroup.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.module.concept_olmo.ConceptStageGroup.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.module.concept_olmo.DecoderStageGroup.forward": TorchCompileOption(fullgraph=True),
+    "xtuner.v1.loss.ce_loss.LMHeadLossContext.loss_fn": TorchCompileOption(fullgraph=True),
+    **DEFAULT_FLOAT8_CFG,
+}
 
 
 class ConceptLMV22VQ(BaseModel):
@@ -71,53 +81,71 @@ class ConceptLMV22VQ(BaseModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.rotary_emb = self.build_rotary_embedding(config)
 
-        self.encoder_stages = nn.ModuleList(
-            [
-                EncoderStage(
-                    self._build_transformer(layer_idx),
-                    DepthDD(config.hidden_size, layer_idx, use_softmax=False),
-                )
-                for layer_idx in range(config.concept_encoder_layers)
-            ]
-        )
-        self.concept_stages = nn.ModuleList(
-            [
-                ConceptStage(
-                    self._build_transformer(layer_idx),
-                    DepthDD(config.hidden_size, layer_idx, use_softmax=False),
-                    ResidualRoute(
-                        config.hidden_size,
-                        config.concept_encoder_layers - 1,
-                        use_softmax=True,
-                    ),
-                )
-                for layer_idx in range(config.concept_special_layers)
-            ]
-        )
-        self.decoder_stages = nn.ModuleList(
-            [
-                DecoderStage(
-                    self._build_transformer(layer_idx),
-                    DepthDD(
-                        config.hidden_size,
-                        layer_idx,
-                        use_softmax=config.concept_dd_two_route_add_decoder_use_softmax,
-                    ),
-                    ConceptRoute(config.hidden_size, config.rms_norm_eps),
-                    ResidualRoute(
-                        config.hidden_size,
-                        config.concept_encoder_layers,
-                        use_softmax=True,
-                    ),
-                    ResidualRoute(
-                        config.hidden_size,
-                        config.concept_special_layers,
-                        use_softmax=True,
-                    ),
-                )
-                for layer_idx in range(config.concept_decoder_layers)
-            ]
-        )
+        encoder_stages = [
+            EncoderStage(
+                self._build_transformer(layer_idx),
+                DepthDD(config.hidden_size, layer_idx, use_softmax=False),
+            )
+            for layer_idx in range(config.concept_encoder_layers)
+        ]
+        concept_stages = [
+            ConceptStage(
+                self._build_transformer(layer_idx),
+                DepthDD(config.hidden_size, layer_idx, use_softmax=False),
+                ResidualRoute(
+                    config.hidden_size,
+                    config.concept_encoder_layers - 1,
+                    use_softmax=True,
+                ),
+            )
+            for layer_idx in range(config.concept_special_layers)
+        ]
+        decoder_stages = [
+            DecoderStage(
+                self._build_transformer(layer_idx),
+                DepthDD(
+                    config.hidden_size,
+                    layer_idx,
+                    use_softmax=config.concept_dd_two_route_add_decoder_use_softmax,
+                ),
+                ConceptRoute(config.hidden_size, config.rms_norm_eps),
+                ResidualRoute(
+                    config.hidden_size,
+                    config.concept_encoder_layers,
+                    use_softmax=True,
+                ),
+                ResidualRoute(
+                    config.hidden_size,
+                    config.concept_special_layers,
+                    use_softmax=True,
+                ),
+            )
+            for layer_idx in range(config.concept_decoder_layers)
+        ]
+        if config.stage_group_size == 1:
+            self.encoder_stages = nn.ModuleList(encoder_stages)
+            self.concept_stages = nn.ModuleList(concept_stages)
+            self.decoder_stages = nn.ModuleList(decoder_stages)
+        else:
+            group_size = config.stage_group_size
+            self.encoder_stage_groups = nn.ModuleList(
+                [
+                    EncoderStageGroup(list(enumerate(encoder_stages[start : start + group_size], start=start)))
+                    for start in range(0, len(encoder_stages), group_size)
+                ]
+            )
+            self.concept_stage_groups = nn.ModuleList(
+                [
+                    ConceptStageGroup(list(enumerate(concept_stages[start : start + group_size], start=start)))
+                    for start in range(0, len(concept_stages), group_size)
+                ]
+            )
+            self.decoder_stage_groups = nn.ModuleList(
+                [
+                    DecoderStageGroup(list(enumerate(decoder_stages[start : start + group_size], start=start)))
+                    for start in range(0, len(decoder_stages), group_size)
+                ]
+            )
 
         self.concept_vq_input_norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.concept_quantizer = ConceptQuantizer(
@@ -225,6 +253,37 @@ class ConceptLMV22VQ(BaseModel):
             ]
         mappings = (
             (r"^embed_tokens\.", "embedding.word_embeddings."),
+            (r"^encoder_stage_groups\.\d+\.(\d+)\.transformer\.", r"encoder.layers.\1."),
+            (r"^encoder_stage_groups\.\d+\.(\d+)\.depth_dd\.", r"dd_encoder_self_dd.depth_dds.\1."),
+            (
+                r"^concept_stage_groups\.\d+\.(\d+)\.transformer\.",
+                r"concept_predictor.hlm_block.layers.\1.",
+            ),
+            (
+                r"^concept_stage_groups\.\d+\.(\d+)\.depth_dd\.",
+                r"concept_predictor.concept_self_dd.depth_dds.\1.",
+            ),
+            (
+                r"^concept_stage_groups\.\d+\.(\d+)\.read_encoder_route\.",
+                r"concept_predictor.concept_read_encoder_routes.\1.",
+            ),
+            (r"^decoder_stage_groups\.\d+\.(\d+)\.transformer\.", r"decoder.layers.\1."),
+            (
+                r"^decoder_stage_groups\.\d+\.(\d+)\.decoder_dd\.",
+                r"dd_two_route_add.decoder_dds.\1.",
+            ),
+            (
+                r"^decoder_stage_groups\.\d+\.(\d+)\.concept_route\.",
+                r"dd_two_route_add.concept_routes.\1.",
+            ),
+            (
+                r"^decoder_stage_groups\.\d+\.(\d+)\.read_encoder_route\.",
+                r"decoder_read_encoder_routes.\1.",
+            ),
+            (
+                r"^decoder_stage_groups\.\d+\.(\d+)\.read_concept_route\.",
+                r"decoder_read_concept_routes.\1.",
+            ),
             (r"^encoder_stages\.(\d+)\.transformer\.", r"encoder.layers.\1."),
             (r"^encoder_stages\.(\d+)\.depth_dd\.", r"dd_encoder_self_dd.depth_dds.\1."),
             (r"^concept_stages\.(\d+)\.transformer\.", r"concept_predictor.hlm_block.layers.\1."),
@@ -370,6 +429,8 @@ class ConceptLMV22VQ(BaseModel):
     ) -> AbstractContextManager:
         if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) != 1:
             return nullcontext()
+        if self.config.stage_group_size > 1:
+            raise RuntimeError("stage_group_size > 1 currently does not support activation offload")
         if hidden_states.device.type != "cuda":
             raise RuntimeError("XTUNER_ACTIVATION_OFFLOAD=1 requires CUDA activations")
         if self.offload_stream is None:
@@ -516,16 +577,30 @@ class ConceptLMV22VQ(BaseModel):
 
         encoder_history = (hidden_states,)
         encoder_raw_states: list[torch.Tensor] = []
-        for stage_idx, stage in enumerate(self.encoder_stages):
-            with self._activation_offload_context(hidden_states, stage_idx, "encoder"):
-                hidden_states, raw = stage(
-                    hidden_states,
-                    token_position_embeddings,
-                    seq_ctx,
-                    *encoder_history,
-                )
-            encoder_raw_states.append(raw)
-            encoder_history = (*encoder_history, raw)
+        if self.config.stage_group_size == 1:
+            for stage_idx, stage in enumerate(self.encoder_stages):
+                with self._activation_offload_context(hidden_states, stage_idx, "encoder"):
+                    hidden_states, raw = stage(
+                        hidden_states,
+                        token_position_embeddings,
+                        seq_ctx,
+                        *encoder_history,
+                    )
+                encoder_raw_states.append(raw)
+                encoder_history = (*encoder_history, raw)
+        else:
+            for group_idx, group in enumerate(self.encoder_stage_groups):
+                stage_idx = group_idx * self.config.stage_group_size
+                with self._activation_offload_context(hidden_states, stage_idx, "encoder"):
+                    group_outputs = group(
+                        hidden_states,
+                        token_position_embeddings,
+                        seq_ctx,
+                        *encoder_history,
+                    )
+                hidden_states, *raw_states = group_outputs
+                encoder_raw_states.extend(raw_states)
+                encoder_history = (*encoder_history, *raw_states)
 
         sp_mesh = seq_ctx.sequence_parallel_mesh
         full_encoder_hidden = self._gather_sequence(hidden_states, sp_mesh)
@@ -558,17 +633,32 @@ class ConceptLMV22VQ(BaseModel):
 
         concept_history = (concept_hidden,)
         concept_raw_states: list[torch.Tensor] = []
-        for stage_idx, stage in enumerate(self.concept_stages):
-            with self._activation_offload_context(concept_hidden, stage_idx, "concept"):
-                concept_hidden, raw = stage(
-                    concept_hidden,
-                    concept_position_embeddings,
-                    concept_ctx,
-                    encoder_concept_states,
-                    *concept_history,
-                )
-            concept_raw_states.append(raw)
-            concept_history = (*concept_history, raw)
+        if self.config.stage_group_size == 1:
+            for stage_idx, stage in enumerate(self.concept_stages):
+                with self._activation_offload_context(concept_hidden, stage_idx, "concept"):
+                    concept_hidden, raw = stage(
+                        concept_hidden,
+                        concept_position_embeddings,
+                        concept_ctx,
+                        encoder_concept_states,
+                        *concept_history,
+                    )
+                concept_raw_states.append(raw)
+                concept_history = (*concept_history, raw)
+        else:
+            for group_idx, group in enumerate(self.concept_stage_groups):
+                stage_idx = group_idx * self.config.stage_group_size
+                with self._activation_offload_context(concept_hidden, stage_idx, "concept"):
+                    group_outputs = group(
+                        concept_hidden,
+                        concept_position_embeddings,
+                        concept_ctx,
+                        encoder_concept_states,
+                        *concept_history,
+                    )
+                concept_hidden, *raw_states = group_outputs
+                concept_raw_states.extend(raw_states)
+                concept_history = (*concept_history, *raw_states)
         concept_hidden = self.concept_final_norm(concept_hidden)
         concept_logits = self._predict_concept_logits(concept_hidden)
         codebook = self.concept_quantizer.transformed_codebook().to(concept_logits.dtype)
@@ -604,20 +694,37 @@ class ConceptLMV22VQ(BaseModel):
         decoder_concept_states = self._local_token_shard(decoder_concept_states, seq_ctx, hidden_states.shape[1])
 
         decoder_history = (hidden_states,)
-        for layer_idx, stage in enumerate(self.decoder_stages):
-            with self._activation_offload_context(hidden_states, layer_idx, "decoder"):
-                gate = self.final_read_concept_gate_logits[layer_idx].float().softmax(dim=-1)
-                hidden_states, raw = stage(
-                    hidden_states,
-                    token_position_embeddings,
-                    seq_ctx,
-                    repeated_concepts,
-                    decoder_encoder_states,
-                    decoder_concept_states,
-                    gate,
-                    *decoder_history,
-                )
-            decoder_history = (*decoder_history, raw)
+        if self.config.stage_group_size == 1:
+            for layer_idx, stage in enumerate(self.decoder_stages):
+                with self._activation_offload_context(hidden_states, layer_idx, "decoder"):
+                    gate = self.final_read_concept_gate_logits[layer_idx].float().softmax(dim=-1)
+                    hidden_states, raw = stage(
+                        hidden_states,
+                        token_position_embeddings,
+                        seq_ctx,
+                        repeated_concepts,
+                        decoder_encoder_states,
+                        decoder_concept_states,
+                        gate,
+                        *decoder_history,
+                    )
+                decoder_history = (*decoder_history, raw)
+        else:
+            for group_idx, group in enumerate(self.decoder_stage_groups):
+                layer_idx = group_idx * self.config.stage_group_size
+                with self._activation_offload_context(hidden_states, layer_idx, "decoder"):
+                    group_outputs = group(
+                        hidden_states,
+                        token_position_embeddings,
+                        seq_ctx,
+                        repeated_concepts,
+                        decoder_encoder_states,
+                        decoder_concept_states,
+                        self.final_read_concept_gate_logits,
+                        *decoder_history,
+                    )
+                hidden_states, *raw_states = group_outputs
+                decoder_history = (*decoder_history, *raw_states)
         hidden_states = self.final_norm(hidden_states)
 
         output: dict = {}
@@ -636,6 +743,8 @@ class ConceptLMV22VQ(BaseModel):
     @property
     @override
     def default_compile_cfg(self) -> dict[str, TorchCompileOption]:
+        if self.config.stage_group_size > 1:
+            return CONCEPT_OLMO_GROUPED_COMPILE_CFG
         return CONCEPT_OLMO_COMPILE_CFG
 
     @override
@@ -673,30 +782,51 @@ class ConceptLMV22VQ(BaseModel):
         shard_mesh = self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh
         offload_policy = CPUOffloadPolicy() if fsdp_config.cpu_offload else None
 
-        stage_groups = (self.encoder_stages, self.concept_stages, self.decoder_stages)
-        stage_locations = [(group, stage_idx) for group in stage_groups for stage_idx in range(len(group))]
-        num_recompute_stages = int(len(stage_locations) * fsdp_config.recompute_ratio)
-        generator = torch.Generator()
-        generator.manual_seed(dist.get_rank())
-        shuffled_indices = torch.randperm(len(stage_locations), generator=generator)
-        for global_idx_tensor in tqdm(shuffled_indices, desc="[Concept OLMo FSDP Sharding]"):
-            global_idx = int(global_idx_tensor)
-            group, stage_idx = stage_locations[global_idx]
-            stage = group[stage_idx]
-            if global_idx < num_recompute_stages:
-                stage = checkpoint_wrapper(
-                    stage,
-                    preserve_rng_state=checkpoint_preserve_rng_state,
-                    checkpoint_impl=CheckpointImpl.REENTRANT,
-                )
-            group[stage_idx] = stage
-            self._fully_shard(
-                mesh=shard_mesh,
-                mp_policy=mp_policy,
-                reshard_after_forward=fsdp_config.reshard_after_forward,
-                offload_policy=offload_policy,
-                module=stage,
+        if self.config.stage_group_size > 1:
+            if fsdp_config.recompute_ratio > 0:
+                raise ValueError("stage_group_size > 1 currently requires recompute_ratio=0")
+            if fsdp_config.reshard_after_forward:
+                raise ValueError("stage_group_size > 1 currently requires reshard_after_forward=False")
+            if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1:
+                raise ValueError("stage_group_size > 1 currently does not support activation offload")
+            stage_groups = (
+                *self.encoder_stage_groups,
+                *self.concept_stage_groups,
+                *self.decoder_stage_groups,
             )
+            for group in stage_groups:
+                self._fully_shard(
+                    mesh=shard_mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=False,
+                    offload_policy=offload_policy,
+                    module=group,
+                )
+        else:
+            stage_stacks = (self.encoder_stages, self.concept_stages, self.decoder_stages)
+            stage_locations = [(stack, stage_idx) for stack in stage_stacks for stage_idx in range(len(stack))]
+            num_recompute_stages = int(len(stage_locations) * fsdp_config.recompute_ratio)
+            generator = torch.Generator()
+            generator.manual_seed(dist.get_rank())
+            shuffled_indices = torch.randperm(len(stage_locations), generator=generator)
+            for global_idx_tensor in tqdm(shuffled_indices, desc="[Concept OLMo FSDP Sharding]"):
+                global_idx = int(global_idx_tensor)
+                stack, stage_idx = stage_locations[global_idx]
+                stage = stack[stage_idx]
+                if global_idx < num_recompute_stages:
+                    stage = checkpoint_wrapper(
+                        stage,
+                        preserve_rng_state=checkpoint_preserve_rng_state,
+                        checkpoint_impl=CheckpointImpl.REENTRANT,
+                    )
+                stack[stage_idx] = stage
+                self._fully_shard(
+                    mesh=shard_mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=fsdp_config.reshard_after_forward,
+                    offload_policy=offload_policy,
+                    module=stage,
+                )
 
         # Keep large shared modules independently shardable/prefetchable. Tiny
         # norms are intentionally left to the root FSDP group so their
@@ -726,18 +856,30 @@ class ConceptLMV22VQ(BaseModel):
             reshard_after_forward=fsdp_config.reshard_after_forward,
             offload_policy=offload_policy,
         )
-        ordered_forward_modules = [
-            *self.encoder_stages,
-            *self.concept_stages,
-            self.prediction_heads,
-            *self.decoder_stages,
-            self.lm_head,
-        ]
+        if self.config.stage_group_size > 1:
+            ordered_forward_modules = [
+                *self.encoder_stage_groups,
+                *self.concept_stage_groups,
+                self.prediction_heads,
+                *self.decoder_stage_groups,
+                self.lm_head,
+            ]
+        else:
+            ordered_forward_modules = [
+                *self.encoder_stages,
+                *self.concept_stages,
+                self.prediction_heads,
+                *self.decoder_stages,
+                self.lm_head,
+            ]
         for current_module, next_module in zip(
             ordered_forward_modules[:-1], ordered_forward_modules[1:], strict=True
         ):
             current_module.set_modules_to_forward_prefetch([next_module])  # type: ignore[attr-defined]
-        self.set_modules_to_forward_prefetch([self.embed_tokens, self.encoder_stages[0]])  # type: ignore[operator]
+        first_encoder_module = (
+            self.encoder_stage_groups[0] if self.config.stage_group_size > 1 else self.encoder_stages[0]
+        )
+        self.set_modules_to_forward_prefetch([self.embed_tokens, first_encoder_module])  # type: ignore[arg-type]
         self._to_empty_meta()
         return self
 
@@ -781,6 +923,7 @@ class ConceptLMV22VQConfig(TransformerConfig):
     window_size: tuple[int, int]
     window_attn_skip_freq: int
     lm_head_vocab_padding_multiple: int = 1
+    stage_group_size: int = 1
 
     @model_validator(mode="after")
     def _validate_supported_variant(self) -> Self:
@@ -794,6 +937,8 @@ class ConceptLMV22VQConfig(TransformerConfig):
             raise ValueError("Concept OLMo only supports a left causal attention window")
         if self.lm_head_vocab_padding_multiple <= 0:
             raise ValueError("lm_head_vocab_padding_multiple must be positive")
+        if self.stage_group_size <= 0:
+            raise ValueError("stage_group_size must be positive")
         return self
 
     def build(self) -> ConceptLMV22VQ:

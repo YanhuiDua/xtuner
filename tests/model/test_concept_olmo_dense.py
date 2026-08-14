@@ -7,6 +7,7 @@ import torch
 import torch.distributed.nn.functional as distF
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FSDPModule
 
 from xtuner._testing import DeterministicDDPTestCase
 from xtuner.v1.config import FSDPConfig
@@ -88,6 +89,18 @@ def _fp8_tiny_config() -> ConceptLMV22VQConfig:
     )
 
 
+def _stage_group_tiny_config(stage_group_size: int) -> ConceptLMV22VQConfig:
+    return _tiny_config().model_copy(
+        update={
+            "num_hidden_layers": 10,
+            "concept_encoder_layers": 5,
+            "concept_decoder_layers": 5,
+            "concept_special_layers": 5,
+            "stage_group_size": stage_group_size,
+        }
+    )
+
+
 def _initialize(model: torch.nn.Module) -> None:
     generator = torch.Generator().manual_seed(7)
     with torch.no_grad():
@@ -132,6 +145,25 @@ def test_config_alias_and_meta_layout():
         "concept_final_norm._extra_state",
         "final_norm._extra_state",
     }
+
+    grouped_config = config.model_copy(update={"stage_group_size": 4})
+    with torch.device("meta"):
+        grouped_model = grouped_config.build()
+    assert len(grouped_model.state_dict()) == 631
+    assert [len(group) for group in grouped_model.encoder_stage_groups] == [4, 4, 4, 4]
+    assert [len(group) for group in grouped_model.concept_stage_groups] == [4, 4]
+    assert [len(group) for group in grouped_model.decoder_stage_groups] == [4, 4, 4, 4]
+    assert grouped_model.to_hf_key_list(
+        "encoder_stage_groups.0.3.transformer.self_attention.linear_qkv.weight"
+    ) == ["encoder.layers.3.self_attention.linear_qkv.weight"]
+    assert grouped_model.to_hf_key_list("decoder_stage_groups.0.2.read_concept_route.w2.weight") == [
+        "decoder_read_concept_routes.2.w2.weight"
+    ]
+    grouped_hf_keys = sorted(
+        hf_key for key in grouped_model.state_dict() for hf_key in grouped_model.to_hf_key_list(key)
+    )
+    ungrouped_hf_keys = sorted(hf_key for key in model.state_dict() for hf_key in model.to_hf_key_list(key))
+    assert grouped_hf_keys == ungrouped_hf_keys
 
 
 def test_lm_head_vocab_padding_checkpoint_conversion():
@@ -303,6 +335,45 @@ def test_residual_route_compiled_reduction_matches_einsum(monkeypatch, num_sourc
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-10, atol=1e-12)
 
 
+def test_stage_group_eager_forward_backward_matches_individual_stages():
+    baseline = _stage_group_tiny_config(stage_group_size=1).build().eval()
+    grouped = _stage_group_tiny_config(stage_group_size=4).build().eval()
+    _initialize(baseline)
+
+    assert [len(group) for group in grouped.encoder_stage_groups] == [4, 1]
+    assert [len(group) for group in grouped.concept_stage_groups] == [4, 1]
+    assert [len(group) for group in grouped.decoder_stage_groups] == [4, 1]
+    assert grouped.to_hf_key_list(
+        "encoder_stage_groups.1.4.transformer.self_attention.linear_qkv.weight"
+    ) == ["encoder.layers.4.self_attention.linear_qkv.weight"]
+
+    baseline_parameters = list(baseline.named_parameters())
+    grouped_parameters = list(grouped.named_parameters())
+    assert len(grouped_parameters) == len(baseline_parameters)
+    with torch.no_grad():
+        for (baseline_name, baseline_parameter), (grouped_name, grouped_parameter) in zip(
+            baseline_parameters, grouped_parameters, strict=True
+        ):
+            assert grouped.to_hf_key_list(grouped_name) == baseline.to_hf_key_list(baseline_name)
+            grouped_parameter.copy_(baseline_parameter)
+
+    input_ids = torch.arange(1, 9).unsqueeze(0)
+    baseline_logits = baseline(SequenceContext.from_input_ids((input_ids,), device="cpu")).logits
+    grouped_logits = grouped(SequenceContext.from_input_ids((input_ids,), device="cpu")).logits
+    torch.testing.assert_close(grouped_logits, baseline_logits, rtol=1e-6, atol=1e-6)
+
+    generator = torch.Generator().manual_seed(29)
+    output_grad = torch.randn(grouped_logits.shape, generator=generator)
+    baseline_logits.backward(output_grad)
+    grouped_logits.backward(output_grad)
+    for (_, baseline_parameter), (_, grouped_parameter) in zip(
+        baseline_parameters, grouped_parameters, strict=True
+    ):
+        assert (grouped_parameter.grad is None) == (baseline_parameter.grad is None)
+        if baseline_parameter.grad is not None:
+            torch.testing.assert_close(grouped_parameter.grad, baseline_parameter.grad, rtol=1e-5, atol=1e-6)
+
+
 def test_packed_documents_match_separate_forwards(monkeypatch):
     monkeypatch.setenv("XTUNER_HF_IMPL", "true")
     model = _tiny_config().build().eval()
@@ -379,6 +450,87 @@ class TestConceptOlmoOptimizations(DeterministicDDPTestCase):
         assert output.shape == (1, 8, config.vocab_size)
         for stage_type in (EncoderStage, ConceptStage, DecoderStage):
             assert hasattr(stage_type.forward, "_torchdynamo_orig_callable")
+
+    def test_grouped_stage_compile_with_fsdp(self):
+        self.create_pg("cuda")
+        baseline_config = _stage_group_tiny_config(stage_group_size=1)
+        baseline_config.attention.attn_impl = "flash_attention"
+        baseline = baseline_config.build().cuda().bfloat16().eval()
+        _initialize(baseline)
+
+        grouped_config = _stage_group_tiny_config(stage_group_size=4)
+        grouped_config.attention.attn_impl = "flash_attention"
+        grouped_config.compile_cfg = None
+        grouped = grouped_config.build().cuda().bfloat16().eval()
+
+        baseline_parameters = list(baseline.named_parameters())
+        grouped_parameters = list(grouped.named_parameters())
+        with torch.no_grad():
+            for (baseline_name, baseline_parameter), (grouped_name, grouped_parameter) in zip(
+                baseline_parameters, grouped_parameters, strict=True
+            ):
+                assert grouped.to_hf_key_list(grouped_name) == baseline.to_hf_key_list(baseline_name)
+                grouped_parameter.copy_(baseline_parameter)
+
+        input_ids = torch.arange(1, 9, device="cuda").unsqueeze(0)
+        baseline_logits = baseline(SequenceContext.from_input_ids((input_ids,), device="cuda")).logits
+        generator = torch.Generator(device="cuda").manual_seed(31)
+        output_grad = torch.randn(baseline_logits.shape, generator=generator, device="cuda")
+        output_grad /= output_grad.numel()
+        baseline_logits.float().backward(output_grad)
+
+        grouped.fully_shard(
+            FSDPConfig(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                recompute_ratio=0,
+                reshard_after_forward=False,
+            )
+        )
+        all_groups = (
+            *grouped.encoder_stage_groups,
+            *grouped.concept_stage_groups,
+            *grouped.decoder_stage_groups,
+        )
+        hook_counts = {id(group): [0, 0] for group in all_groups}
+        hook_compile_states: list[bool] = []
+
+        def _record_pre_hook(module, _args):
+            hook_counts[id(module)][0] += 1
+            hook_compile_states.append(torch.compiler.is_compiling())
+
+        def _record_post_hook(module, _args, _output):
+            hook_counts[id(module)][1] += 1
+            hook_compile_states.append(torch.compiler.is_compiling())
+
+        for group in all_groups:
+            assert isinstance(group, FSDPModule)
+            assert all(not isinstance(stage, FSDPModule) for stage in group)
+            group.register_forward_pre_hook(_record_pre_hook)
+            group.register_forward_hook(_record_post_hook)
+
+        grouped_logits = grouped(SequenceContext.from_input_ids((input_ids,), device="cuda")).logits
+        torch.testing.assert_close(grouped_logits.float(), baseline_logits.float(), rtol=0.02, atol=0.02)
+        grouped_logits.float().backward(output_grad)
+
+        assert all(counts == [1, 1] for counts in hook_counts.values())
+        assert not any(hook_compile_states)
+        for group in all_groups:
+            assert hasattr(type(group).forward, "_torchdynamo_orig_callable")
+
+        grouped_parameters = list(grouped.named_parameters())
+        for (_, baseline_parameter), (_, grouped_parameter) in zip(
+            baseline_parameters, grouped_parameters, strict=True
+        ):
+            assert grouped_parameter.grad is not None
+            assert torch.isfinite(grouped_parameter.grad.to_local()).all()
+            if baseline_parameter.grad is not None:
+                torch.testing.assert_close(
+                    grouped_parameter.grad.to_local().float(),
+                    baseline_parameter.grad.float(),
+                    rtol=0.05,
+                    atol=0.05,
+                )
 
     def test_tensorwise_fp8_forward_backward(self):
         self.create_pg("cuda")
