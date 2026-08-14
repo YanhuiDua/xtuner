@@ -367,6 +367,10 @@ class ConceptLMV22VQ(BaseModel):
 
     @staticmethod
     def _lengths(seq_ctx: SequenceContext) -> list[int]:
+        if seq_ctx.cu_seq_lens_q.numel() == 2 and seq_ctx.num_padding == 0:
+            # SequenceContext keeps max_length_q on CPU specifically so the
+            # common single-sequence case does not need a CUDA-to-CPU copy.
+            return [int(seq_ctx.max_length_q.item())]
         lengths = seq_ctx.cu_seq_lens_q[1:] - seq_ctx.cu_seq_lens_q[:-1]
         return [int(length) for length in lengths.detach().cpu().tolist()]
 
@@ -445,6 +449,13 @@ class ConceptLMV22VQ(BaseModel):
             reserve_pin_memory=True,
         )
 
+    @staticmethod
+    def _cat_if_multiple(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
+        """Concatenate tensors without copying an already-contiguous singleton."""
+        if len(tensors) == 1:
+            return tensors[0].contiguous()
+        return torch.cat(tensors, dim=dim)
+
     def _merge_chunks(
         self,
         hidden_states: torch.Tensor,
@@ -470,7 +481,7 @@ class ConceptLMV22VQ(BaseModel):
                     merged = reshaped.mean(dim=2)
             chunks.append(merged)
             concept_lengths.append(merged.shape[1])
-        return torch.cat(chunks, dim=1), concept_lengths
+        return self._cat_if_multiple(chunks, dim=1), concept_lengths
 
     def _repeat_shift(
         self,
@@ -498,7 +509,7 @@ class ConceptLMV22VQ(BaseModel):
                 padding = repeated.new_zeros(1, seq_len - repeated.shape[1], *repeated.shape[2:])
                 repeated = torch.cat((repeated, padding), dim=1)
             repeated_docs.append(repeated[:, :seq_len])
-        return torch.cat(repeated_docs, dim=1)
+        return self._cat_if_multiple(repeated_docs, dim=1)
 
     @staticmethod
     def _prepend_zero_chunks(
@@ -513,7 +524,7 @@ class ConceptLMV22VQ(BaseModel):
             start += concept_len
             chunks.append(torch.cat((torch.zeros_like(state[:, :1]), state), dim=1))
             source_lengths.append(concept_len + 1)
-        return torch.cat(chunks, dim=1), source_lengths
+        return ConceptLMV22VQ._cat_if_multiple(chunks, dim=1), source_lengths
 
     @staticmethod
     def _build_concept_context(
@@ -524,21 +535,22 @@ class ConceptLMV22VQ(BaseModel):
         concept_padding: int = 0,
     ) -> SequenceContext:
         device = concept_hidden.device
-        cu_seq_lens = torch.tensor(
+        use_pinned_metadata = device.type == "cuda"
+        cu_seq_lens_cpu = torch.tensor(
             [0, *accumulate(concept_lengths)],
             dtype=torch.int32,
-            device=device,
+            pin_memory=use_pinned_metadata,
         )
-        position_ids = torch.cat(
-            [torch.arange(length, device=device) * chunk_size for length in concept_lengths]
-        ).unsqueeze(0)
+        cu_seq_lens = cu_seq_lens_cpu.to(device, non_blocking=use_pinned_metadata)
+        position_id_chunks = [torch.arange(length, device=device) * chunk_size for length in concept_lengths]
+        position_ids = ConceptLMV22VQ._cat_if_multiple(position_id_chunks, dim=0).unsqueeze(0)
         shard_start = 0
         shard_size = concept_hidden.shape[1]
         num_padding = 0
         if sp_mesh is not None and sp_mesh.size() > 1:
             shard_start = sp_mesh.get_local_rank() * shard_size
             position_ids = position_ids[:, shard_start : shard_start + shard_size].contiguous()
-            valid_length = int(cu_seq_lens[-1]) - concept_padding
+            valid_length = sum(concept_lengths) - concept_padding
             num_padding = max(0, min(shard_size, shard_start + shard_size - valid_length))
         return SequenceContext(
             input_ids=None,

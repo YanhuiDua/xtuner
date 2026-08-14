@@ -14,6 +14,7 @@ from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.model import (
+    ConceptLMV22VQ,
     ConceptLMV22VQConfig,
     ConceptOlmoStage2V1Config,
     get_model_config,
@@ -372,6 +373,141 @@ def test_stage_group_eager_forward_backward_matches_individual_stages():
         assert (grouped_parameter.grad is None) == (baseline_parameter.grad is None)
         if baseline_parameter.grad is not None:
             torch.testing.assert_close(grouped_parameter.grad, baseline_parameter.grad, rtol=1e-5, atol=1e-6)
+
+
+def test_lengths_single_sequence_uses_cpu_max_length():
+    seq_ctx = SequenceContext.from_input_ids((torch.arange(8).unsqueeze(0),), device="cpu")
+    assert seq_ctx.max_length_q.device.type == "cpu"
+    assert seq_ctx.num_padding == 0
+
+    # A distinct cumulative length proves this branch reads the CPU maximum
+    # instead of materializing cu_seq_lens_q values.
+    seq_ctx.cu_seq_lens_q = torch.tensor([0, 99], dtype=torch.int32)
+    assert ConceptLMV22VQ._lengths(seq_ctx) == [8]
+
+
+def test_lengths_packed_sequence_uses_cumulative_lengths():
+    documents = (torch.arange(3).unsqueeze(0), torch.arange(5).unsqueeze(0))
+    seq_ctx = SequenceContext.from_input_ids(documents, device="cpu")
+    seq_ctx.max_length_q = torch.tensor(99)
+
+    assert ConceptLMV22VQ._lengths(seq_ctx) == [3, 5]
+
+
+def test_lengths_padded_sequence_uses_cumulative_lengths():
+    seq_ctx = SequenceContext.from_input_ids((torch.arange(8).unsqueeze(0),), device="cpu")
+    seq_ctx.num_padding = 2
+    seq_ctx.max_length_q = torch.tensor(6)
+
+    assert ConceptLMV22VQ._lengths(seq_ctx) == [8]
+
+
+@pytest.mark.parametrize("token_lengths", [[9], [7, 10]], ids=["single_document", "packed_documents"])
+@pytest.mark.parametrize("shift_feature", [False, True])
+def test_concept_document_transforms_match_cat_reference(token_lengths, shift_feature):
+    config = _tiny_config().model_copy(update={"concept_shift_feature": shift_feature})
+    model = config.build()
+    generator = torch.Generator().manual_seed(37)
+    hidden_states = torch.randn(1, sum(token_lengths), config.hidden_size, generator=generator)
+
+    merged_chunks = []
+    start = 0
+    for seq_len in token_lengths:
+        state = hidden_states[:, start : start + seq_len]
+        start += seq_len
+        if seq_len < config.concept_chunk_size:
+            merged = state.mean(dim=1, keepdim=True)
+        else:
+            usable = (seq_len // config.concept_chunk_size) * config.concept_chunk_size
+            merged = state[:, :usable].reshape(
+                1,
+                usable // config.concept_chunk_size,
+                config.concept_chunk_size,
+                config.hidden_size,
+            ).mean(dim=2)
+        merged_chunks.append(merged)
+    expected_merged = torch.cat(merged_chunks, dim=1)
+    expected_concept_lengths = [chunk.shape[1] for chunk in merged_chunks]
+    actual_merged, actual_concept_lengths = model._merge_chunks(hidden_states, token_lengths)
+    torch.testing.assert_close(actual_merged, expected_merged)
+    assert actual_concept_lengths == expected_concept_lengths
+
+    def repeat_shift_reference(
+        states: torch.Tensor,
+        state_lengths: list[int],
+        prepend_zero: bool,
+    ) -> torch.Tensor:
+        repeated_documents = []
+        state_start = 0
+        for state_len, seq_len in zip(state_lengths, token_lengths, strict=True):
+            state = states[:, state_start : state_start + state_len]
+            state_start += state_len
+            if prepend_zero:
+                state = torch.cat((torch.zeros_like(state[:, :1]), state), dim=1)
+            repeated = state.repeat_interleave(config.concept_chunk_size, dim=1)[:, : seq_len + 1]
+            repeated = repeated[:, 1:] if shift_feature else repeated[:, :seq_len]
+            if repeated.shape[1] < seq_len:
+                padding = repeated.new_zeros(1, seq_len - repeated.shape[1], *repeated.shape[2:])
+                repeated = torch.cat((repeated, padding), dim=1)
+            repeated_documents.append(repeated[:, :seq_len])
+        return torch.cat(repeated_documents, dim=1)
+
+    expected_repeated = repeat_shift_reference(expected_merged, expected_concept_lengths, True)
+    actual_repeated = model._repeat_shift(
+        actual_merged,
+        actual_concept_lengths,
+        token_lengths,
+    )
+    torch.testing.assert_close(actual_repeated, expected_repeated)
+
+    source_states = torch.randn(
+        1,
+        sum(expected_concept_lengths),
+        3,
+        config.hidden_size,
+        generator=generator,
+    )
+    source_chunks = []
+    start = 0
+    for concept_len in expected_concept_lengths:
+        state = source_states[:, start : start + concept_len]
+        start += concept_len
+        source_chunks.append(torch.cat((torch.zeros_like(state[:, :1]), state), dim=1))
+    expected_sources = torch.cat(source_chunks, dim=1)
+    expected_source_lengths = [length + 1 for length in expected_concept_lengths]
+    actual_sources, actual_source_lengths = model._prepend_zero_chunks(
+        source_states,
+        actual_concept_lengths,
+    )
+    torch.testing.assert_close(actual_sources, expected_sources)
+    assert actual_source_lengths == expected_source_lengths
+
+    expected_decoder_sources = repeat_shift_reference(expected_sources, expected_source_lengths, False)
+    actual_decoder_sources = model._repeat_shift(
+        actual_sources,
+        actual_source_lengths,
+        token_lengths,
+        prepend_zero=False,
+    )
+    torch.testing.assert_close(actual_decoder_sources, expected_decoder_sources)
+
+    context = model._build_concept_context(
+        actual_merged,
+        actual_concept_lengths,
+        config.concept_chunk_size,
+    )
+    expected_positions = torch.cat(
+        [torch.arange(length) * config.concept_chunk_size for length in expected_concept_lengths]
+    ).unsqueeze(0)
+    torch.testing.assert_close(context.position_ids, expected_positions)
+    torch.testing.assert_close(
+        context.cu_seq_lens_q,
+        torch.tensor([0, *torch.tensor(expected_concept_lengths).cumsum(0).tolist()], dtype=torch.int32),
+    )
+
+    if len(token_lengths) == 1:
+        contiguous = torch.randn(1, 2, 3, generator=generator)
+        assert model._cat_if_multiple([contiguous], dim=1) is contiguous
 
 
 def test_packed_documents_match_separate_forwards(monkeypatch):
