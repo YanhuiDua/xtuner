@@ -7,7 +7,7 @@ from cyclopts import Parameter
 from pydantic import BaseModel, ConfigDict
 from typing_extensions import Annotated
 
-from xtuner.v1.optim import Muon, SwapAdamW
+from xtuner.v1.optim import LocalDTensorAdamW, Muon, SwapAdamW
 from xtuner.v1.utils import get_logger
 
 
@@ -21,6 +21,10 @@ class OptimConfig(BaseModel):
     skip_grad_norm_threshold: Annotated[
         float | None, Parameter(help="Gradient norm threshold for skipping optimizer step.")
     ] = None
+    fused_grad_clip: Annotated[
+        bool,
+        Parameter(help="Fold gradient clipping and finite checks into a fused optimizer step."),
+    ] = False
 
     @abstractmethod
     def build(self, params):
@@ -33,9 +37,16 @@ class AdamWConfig(OptimConfig):
     eps: Annotated[float, Parameter(help="Epsilon value for numerical stability in Adam optimizer")] = 1e-8
     foreach: Annotated[Optional[bool], Parameter(help="Use foreach implementation for AdamW")] = None
     fused: Annotated[Optional[bool], Parameter(help="Use fused implementation for AdamW")] = None
+    local_dtensor_step: Annotated[
+        bool,
+        Parameter(help="Dispatch fused AdamW directly on DTensor local shards."),
+    ] = False
     swap_optimizer: Annotated[Optional[bool], Parameter(help="Swap optimizer states to host memory.")] = False
 
     def build(self, model):
+        if self.swap_optimizer and self.local_dtensor_step:
+            raise ValueError("swap_optimizer and local_dtensor_step are mutually exclusive")
+
         params = [p for p in model.parameters() if p.requires_grad]
 
         trainable_parameters_names = model.trainable_parameters()
@@ -65,7 +76,10 @@ class AdamWConfig(OptimConfig):
                 weight_decay=self.weight_decay,
                 foreach=self.foreach,
             )
-        return torch.optim.AdamW(
+        if self.local_dtensor_step and self.fused is not True:
+            raise ValueError("local_dtensor_step requires fused=True")
+        optimizer_cls = LocalDTensorAdamW if self.local_dtensor_step else torch.optim.AdamW
+        return optimizer_cls(
             params,
             lr=self.lr,
             betas=self.betas,

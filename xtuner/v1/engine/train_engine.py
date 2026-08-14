@@ -49,7 +49,8 @@ from xtuner.v1.utils import (
     log_rank0,
     profile_time_and_memory,
 )
-from xtuner.v1.utils.grad_norm import cal_grad_norm
+from xtuner.v1.utils.dtensor import group_tensors_by_device_mesh_and_placements
+from xtuner.v1.utils.grad_norm import cal_grad_norm, cal_grad_norm_from_groups
 
 
 class TrainStepInfo(DataBatchInfo, BatchForwardInfo):
@@ -155,6 +156,13 @@ class TrainEngine:
         self.fsdp_cfg = fsdp_cfg
         self.model = self.build_model()
         self.optimizer = self.build_optimizer(optim_cfg)
+        self._validate_fused_grad_clip_optimizer()
+        self._defer_grad_clip_to_optimizer = False
+        self._optimizer_grad_scale: torch.Tensor | None = None
+        self._trainable_params = tuple(param for _, param in self.model.trainable_parameters())
+        self._grad_norm_param_groups = group_tensors_by_device_mesh_and_placements(
+            cast(List[DTensor], list(self._trainable_params))
+        )
         self.intra_layer_micro_batch = intra_layer_micro_batch
         self._count = 0
         self.has_freeze_params = self.__has_freeze_params()
@@ -181,6 +189,19 @@ class TrainEngine:
 
     def build_optimizer(self, optim_cfg: OptimConfig) -> torch.optim.Optimizer:
         return optim_cfg.build(self.model)
+
+    def _validate_fused_grad_clip_optimizer(self) -> None:
+        if not self.optim_cfg.fused_grad_clip:
+            return
+        if not getattr(self.optimizer, "_step_supports_amp_scaling", False):
+            raise ValueError("fused_grad_clip requires an optimizer with fused AMP-scaling support")
+        # Optimizer.load_state_dict() restores parameter-group arguments from
+        # the checkpoint. A fused AdamW instance keeps its AMP-scaling support
+        # flag even if a checkpoint silently changes ``fused`` to False, in
+        # which case the deferred clipping path would fail only at step().
+        fused_values = [group["fused"] for group in self.optimizer.param_groups if "fused" in group]
+        if fused_values and not all(fused is True for fused in fused_values):
+            raise ValueError("fused_grad_clip requires fused=True for every optimizer parameter group")
 
     @property
     def data_replicate_size(self) -> int:
@@ -258,28 +279,86 @@ class TrainEngine:
     @_no_grad
     def clip_grad_norm(self, do_clip: bool = True, dtype=torch.float32):
         ProberList.before_clip_grad_norm(self.model)
+        self._defer_grad_clip_to_optimizer = False
+        self._optimizer_grad_scale = None
         self.model.scale_and_reduce_grad()
 
+        # BaseModel provides a model-aware norm implementation.  Keep that
+        # path so main's optimizer-group clipping policy (for example, Muon
+        # groups with ``clip_grad=False``) remains intact.  The fallback is
+        # useful for lightweight test models and custom wrappers that expose
+        # only ``trainable_parameters``.
         trainable_params = [p for _, p in self.model.trainable_parameters()]
         all_grads = [p.grad for p in trainable_params if p.grad is not None]
-        total_grad_norm, grouped_all_grads = self.model.cal_grad_norm(all_grads, dtype=dtype)
+        model_cal_grad_norm = getattr(self.model, "cal_grad_norm", None)
+        if callable(model_cal_grad_norm):
+            total_grad_norm, grouped_all_grads = model_cal_grad_norm(all_grads, dtype=dtype)
+            clip_grads = all_grads
+            clip_all_grads = True
+            if do_clip:
+                clip_param_ids = {
+                    id(p)
+                    for group in self.optimizer.param_groups
+                    if group.get("clip_grad", True)
+                    for p in group["params"]
+                }
+                clip_grads = [
+                    cast(DTensor, p.grad)
+                    for p in trainable_params
+                    if id(p) in clip_param_ids and p.grad is not None
+                ]
+                clip_all_grads = len(clip_param_ids) == len(trainable_params) and clip_param_ids == {
+                    id(p) for p in trainable_params
+                }
+        else:
+            grouped_all_grads = {
+                key: [cast(DTensor, param.grad) for param in params if param.grad is not None]
+                for key, params in getattr(
+                    self,
+                    "_grad_norm_param_groups",
+                    group_tensors_by_device_mesh_and_placements(cast(List[DTensor], trainable_params)),
+                ).items()
+            }
+            grouped_all_grads = {key: grads for key, grads in grouped_all_grads.items() if grads}
+            total_grad_norm, grouped_all_grads = cal_grad_norm_from_groups(grouped_all_grads, dtype=dtype)
+            clip_grads = all_grads
+            clip_all_grads = True
 
         if do_clip:
-            clip_param_ids = {
-                id(p) for group in self.optimizer.param_groups if group.get("clip_grad", True) for p in group["params"]
-            }
-            clip_grads = [
-                cast(DTensor, p.grad) for p in trainable_params if id(p) in clip_param_ids and p.grad is not None
-            ]
-            clip_all_grads = len(clip_param_ids) == len(trainable_params) and clip_param_ids == {
-                id(p) for p in trainable_params
-            }
-            self._clip_gradients(
-                clip_grads,
-                max_norm=self.optim_cfg.max_grad_norm,
-                dtype=dtype,
-                precomputed_grad_info=(total_grad_norm, grouped_all_grads) if clip_all_grads else None,
-            )
+            clip_coef = self.optim_cfg.max_grad_norm / (total_grad_norm + 1e-6)
+            clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+            # Fused AdamW can apply the reciprocal coefficient inside its
+            # kernel. Defer only when every trainable parameter is covered by
+            # the clipping policy; mixed policies must use eager clipping.
+            if (
+                self.optim_cfg.fused_grad_clip
+                and clip_all_grads
+                and not ProberList.prober_list
+            ):
+                self._defer_grad_clip_to_optimizer = True
+                finite = torch.isfinite(total_grad_norm)
+                self._optimizer_grad_scale = torch.where(
+                    finite,
+                    clip_coef_clamped.reciprocal(),
+                    torch.ones_like(clip_coef_clamped),
+                )
+            elif not callable(model_cal_grad_norm):
+                for grads in grouped_all_grads.values():
+                    local_grads = [grad.to_local() for grad in grads]
+                    device = local_grads[0].device
+                    device_clip_coef = clip_coef_clamped.to(device)
+                    if _device_has_foreach_support(device):
+                        torch._foreach_mul_(local_grads, device_clip_coef)
+                    else:
+                        for grad in local_grads:
+                            grad.mul_(device_clip_coef)
+            else:
+                self._clip_gradients(
+                    clip_grads,
+                    max_norm=self.optim_cfg.max_grad_norm,
+                    dtype=dtype,
+                    precomputed_grad_info=(total_grad_norm, grouped_all_grads) if clip_all_grads else None,
+                )
         ProberList.after_clip_grad_norm(self.model, total_grad_norm)
         return total_grad_norm
 
@@ -303,12 +382,29 @@ class TrainEngine:
             device_clip_coef = clip_coef.to(device)
             if _device_has_foreach_support(device):
                 torch._foreach_mul_(cast(list[torch.Tensor], device_grads), device_clip_coef)
-            else:
-                for grad in device_grads:
-                    grad.mul_(device_clip_coef)
+        else:
+            for grad in device_grads:
+                grad.mul_(device_clip_coef)
 
     def step_optimizer(self, grad_norm):
         """Step the optimizer to update the model parameters."""
+        if self._defer_grad_clip_to_optimizer:
+            assert self._optimizer_grad_scale is not None
+            found_inf = ~torch.isfinite(grad_norm)
+            if self.optim_cfg.skip_grad_norm_threshold is not None:
+                found_inf.logical_or_(grad_norm > self.optim_cfg.skip_grad_norm_threshold)
+            self.optimizer.grad_scale = self._optimizer_grad_scale  # type: ignore[attr-defined]
+            self.optimizer.found_inf = found_inf.to(dtype=torch.float32)  # type: ignore[attr-defined]
+            try:
+                self.optimizer.step()
+            finally:
+                del self.optimizer.grad_scale  # type: ignore[attr-defined]
+                del self.optimizer.found_inf  # type: ignore[attr-defined]
+                self._defer_grad_clip_to_optimizer = False
+                self._optimizer_grad_scale = None
+            self.optimizer.zero_grad()
+            return grad_norm
+
         if torch.isnan(grad_norm) or torch.isinf(grad_norm):
             log_rank0.warning(f"Gradient norm {grad_norm} is invalid, skipping optimizer step.")
             self.optimizer.zero_grad()
@@ -573,6 +669,7 @@ class TrainEngine:
                 optim_state_dict=optimizer_state_dict,
                 options=set_options,
             )
+            self._validate_fused_grad_clip_optimizer()
 
     def put_model_to_device(self, device: torch.device | str) -> bool:
         """Put the model to the given device."""

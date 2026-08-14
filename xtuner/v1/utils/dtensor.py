@@ -60,21 +60,21 @@ def cal_total_norm(
     ].device_mesh  # For eg: DeviceMesh('cuda', [0, 1], mesh_dim_names=('default.fsdp',))
     placements = tensors[0].placements  # For eg: (Shard(dim=0),)
     device = tensors[0].device  # For eg: device(type='cuda', index=0)
-    norms: tuple[DTensor, ...]
-    if (foreach is None and _has_foreach_support(tensors, device)) or (  # type: ignore
+    local_tensors = [tensor.to_local() for tensor in tensors]
+    norms: tuple[torch.Tensor, ...]
+    if (foreach is None and _has_foreach_support(local_tensors, device)) or (
         foreach and _device_has_foreach_support(device)
     ):
-        norms = torch._foreach_norm(tensors, norm_type, dtype=dtype)  # type: ignore
-        # element of norms is dtensor with placement of _NormPartial
-        # For example: norms[0] = DTensor(local_tensor=0.04525977373123169,
-        #                                 device_mesh=DeviceMesh('cuda', [0, 1], mesh_dim_names=('default.fsdp',)),
-        #                                 placements=(_NormPartial(reduce_op='sum', norm_type=2.0),))
+        # Run foreach directly on the local shards. DTensor dispatch eventually
+        # executes the same local foreach kernel, but adds operator propagation
+        # and wraps every scalar result back into a DTensor first.
+        norms = torch._foreach_norm(local_tensors, norm_type, dtype=dtype)  # type: ignore[assignment]
     elif foreach:
         raise RuntimeError(f"foreach=True was passed, but can't use the foreach API on {device.type} tensors")
     else:
-        norms = tuple(torch.linalg.vector_norm(g, norm_type, dtype=dtype) for g in tensors)
+        norms = tuple(torch.linalg.vector_norm(g, norm_type, dtype=dtype) for g in local_tensors)
 
-    local_norm = torch.linalg.vector_norm(torch.stack([norm.to_local() for norm in norms]), norm_type, dtype=dtype)
+    local_norm = torch.linalg.vector_norm(torch.stack(norms), norm_type, dtype=dtype)
     if norm_type == 2:
         local_norm_squared = local_norm**2
         for i, placement in enumerate(placements):
