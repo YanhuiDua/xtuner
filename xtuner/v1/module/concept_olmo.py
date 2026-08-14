@@ -65,6 +65,34 @@ class DepthDD(nn.Module):
         return mixed
 
 
+class _CompiledRouteReduce(torch.autograd.Function):
+    """Use complementary kernels for the two directions of route reduction.
+
+    The fixed-length addcmul chain is substantially faster than a Triton
+    reduction in forward, while spelling out the analytical backward avoids
+    the slice/select-heavy graph produced by autograd for that chain.
+    """
+
+    @staticmethod
+    def forward(ctx, weights: torch.Tensor, source_states: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(weights, source_states)
+        source_mix = source_states[:, :, 0] * weights[..., 0:1]
+        for index in range(1, source_states.shape[2]):
+            source_mix = torch.addcmul(
+                source_mix,
+                source_states[:, :, index],
+                weights[..., index : index + 1],
+            )
+        return source_mix
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        weights, source_states = ctx.saved_tensors
+        grad_weights = (grad_output.unsqueeze(2) * source_states).sum(dim=-1)
+        grad_source_states = grad_output.unsqueeze(2) * weights.unsqueeze(-1)
+        return grad_weights, grad_source_states
+
+
 class ResidualRoute(nn.Module):
     def __init__(
         self,
@@ -98,7 +126,7 @@ class ResidualRoute(nn.Module):
         if not torch.compiler.is_compiling():
             source_mix = torch.einsum("bsm,bsmh->bsh", weights, source_states)
         else:
-            source_mix = (weights.unsqueeze(-1) * source_states).sum(dim=2)
+            source_mix = _CompiledRouteReduce.apply(weights, source_states)
         update = source_mix * self.residual_diag.to(source_mix.dtype)
         if residual_scale is not None:
             update = update * residual_scale.to(update.dtype)
