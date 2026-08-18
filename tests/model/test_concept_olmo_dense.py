@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 from pathlib import Path
@@ -9,10 +10,12 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule
 
+from transformers import AutoModelForCausalLM
 from xtuner._testing import DeterministicDDPTestCase
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config, ScalingGranularity
+from xtuner.v1.loss.ce_loss import CELossConfig
 from xtuner.v1.model import (
     ConceptLMV22VQ,
     ConceptLMV22VQConfig,
@@ -26,6 +29,37 @@ from xtuner.v1.utils.load_spec import LoadEnum
 
 
 MODEL_PATH = os.getenv("CONCEPT_OLMO_STAGE2_V1_PATH")
+
+
+def _global_grad_norms(model: torch.nn.Module) -> tuple[float, float, int]:
+    """Return FP32 two-level and FP64 diagnostic global L2 norms."""
+    parameter_norms_fp32: list[torch.Tensor] = []
+    parameter_norms_fp64: list[torch.Tensor] = []
+    grad_numel = 0
+    for parameter in model.parameters():
+        if parameter.grad is None:
+            continue
+        parameter_norms_fp32.append(torch.linalg.vector_norm(parameter.grad.detach(), ord=2.0, dtype=torch.float32))
+        parameter_norms_fp64.append(torch.linalg.vector_norm(parameter.grad.detach(), ord=2.0, dtype=torch.float64))
+        grad_numel += parameter.grad.numel()
+    if not parameter_norms_fp32:
+        raise AssertionError("Expected at least one parameter gradient")
+    total_norm_fp32 = torch.linalg.vector_norm(torch.stack(parameter_norms_fp32), ord=2.0, dtype=torch.float32)
+    total_norm_fp64 = torch.linalg.vector_norm(torch.stack(parameter_norms_fp64), ord=2.0, dtype=torch.float64)
+    return total_norm_fp32.item(), total_norm_fp64.item(), grad_numel
+
+
+def _tensor_error_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float | bool]:
+    actual_fp32 = actual.float()
+    expected_fp32 = expected.float()
+    absolute_error = (actual_fp32 - expected_fp32).abs()
+    relative_error = absolute_error / expected_fp32.abs().clamp_min(1e-6)
+    return {
+        "bitwise_equal": torch.equal(actual, expected),
+        "max_abs_error": absolute_error.max().item(),
+        "mean_abs_error": absolute_error.mean().item(),
+        "max_rel_error": relative_error.max().item(),
+    }
 
 
 def _tiny_config() -> ConceptLMV22VQConfig:
@@ -762,3 +796,156 @@ def test_full_checkpoint_forward_bitwise(monkeypatch):
         [4.90625, -6.21875, 2.796875, -1.8515625, -2.78125, 0.185546875, -3.796875, -6.03125]
     )
     torch.testing.assert_close(logits[0, -1, :8].cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(MODEL_PATH is None, reason="CONCEPT_OLMO_STAGE2_V1_PATH is not set")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the full checkpoint")
+def test_full_checkpoint_hf_alignment(monkeypatch):
+    """Compare all logits, next-token loss, and the parameter grad norm with HF."""
+    assert MODEL_PATH is not None
+    monkeypatch.setenv("XTUNER_HF_IMPL", "true")
+    monkeypatch.setenv("XTUNER_DETERMINISTIC", "true")
+    monkeypatch.setenv("XTUNER_ACTIVATION_OFFLOAD", "0")
+    device = torch.device("cuda")
+    input_ids = torch.arange(1, 9, device=device, dtype=torch.long).unsqueeze(0)
+    shifted_labels = torch.full_like(input_ids, -100)
+    shifted_labels[:, :-1] = input_ids[:, 1:]
+    loss_weight = (shifted_labels != -100).float()
+    loss_weight /= loss_weight.sum()
+
+    # HuggingFace computes the next-token loss from logits[:, :-1] and
+    # labels[:, 1:]. Keep its complete logits for a separate whole-model
+    # comparison, then release the 8.9B model before loading XTuner.
+    torch.cuda.reset_peak_memory_stats(device)
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+        dtype=torch.bfloat16,
+        device_map="cuda",
+    ).train()
+    hf_output = hf_model(input_ids=input_ids, labels=input_ids, use_cache=False)
+    assert hf_output.loss is not None
+    hf_logits = hf_output.logits.detach().float().cpu()
+    hf_native_loss_tensor = hf_output.loss
+    hf_native_loss = hf_native_loss_tensor.detach().float().item()
+    hf_shared_loss_tensor = F.cross_entropy(
+        hf_output.logits.float().reshape(-1, hf_output.logits.shape[-1]),
+        shifted_labels.flatten(),
+        reduction="none",
+        ignore_index=-100,
+    )
+    hf_shared_loss_tensor = (hf_shared_loss_tensor * loss_weight.flatten()).sum()
+    hf_shared_loss = hf_shared_loss_tensor.detach().float().item()
+
+    # Keep the graph once so we can distinguish the HF-native mean-CE
+    # backward from the exact loss reduction used by XTuner.
+    hf_native_loss_tensor.backward(retain_graph=True)
+    hf_native_grad_norm_fp32, hf_native_grad_norm_fp64, hf_native_grad_numel = _global_grad_norms(hf_model)
+    hf_model.zero_grad(set_to_none=True)
+    hf_shared_loss_tensor.backward()
+    hf_shared_grad_norm_fp32, hf_shared_grad_norm_fp64, hf_shared_grad_numel = _global_grad_norms(hf_model)
+    hf_peak_memory_gib = torch.cuda.max_memory_allocated(device) / 2**30
+
+    del hf_native_loss_tensor, hf_shared_loss_tensor, hf_output, hf_model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    config = ConceptLMV22VQConfig.from_hf(MODEL_PATH).model_copy(
+        update={
+            "compile_cfg": False,
+            "float8_cfg": None,
+            "lm_head_vocab_padding_multiple": 1,
+            "stage_group_size": 1,
+        }
+    )
+    with torch.device("meta"):
+        model = config.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
+    loaded, unloaded, missing = model.from_hf(MODEL_PATH)
+    assert len(loaded) == 631
+    assert not unloaded
+    assert not missing
+    model.train()
+
+    # Keep the complete sequence on both sides so the attention/concept graph
+    # and every [batch, sequence, vocabulary] logit are directly comparable.
+    # The final label is ignored because it has no next token, matching HF's
+    # logits[:, :-1] / labels[:, 1:] convention.
+    full_seq_ctx = SequenceContext.from_input_ids((input_ids,), device=device)
+    loss_config = CELossConfig(mode="eager", loss_reduction="token")
+    loss_context = loss_config.build(data={"shifted_labels": shifted_labels}, sp_mesh=None)
+    assert loss_context is not None
+    loss_context = loss_config.loss_ctx_cls.build_batches([loss_context])[0]
+    torch.cuda.reset_peak_memory_stats(device)
+    output = model(full_seq_ctx, loss_ctx={"lm": loss_context})
+    assert output.loss is not None
+    assert output.logits is not None
+    xtuner_full_logits = output.logits.reshape_as(hf_logits).detach().float().cpu()
+    xtuner_loss_tensor = output.loss
+    xtuner_loss = xtuner_loss_tensor.detach().float().item()
+    xtuner_loss_tensor.backward()
+    xtuner_grad_norm_fp32, xtuner_grad_norm_fp64, xtuner_grad_numel = _global_grad_norms(model)
+    xtuner_peak_memory_gib = torch.cuda.max_memory_allocated(device) / 2**30
+
+    logits_metrics = _tensor_error_metrics(xtuner_full_logits, hf_logits)
+    native_loss_abs_error = abs(xtuner_loss - hf_native_loss)
+    native_loss_rel_error = native_loss_abs_error / max(abs(hf_native_loss), 1e-12)
+    shared_loss_abs_error = abs(xtuner_loss - hf_shared_loss)
+    shared_loss_rel_error = shared_loss_abs_error / max(abs(hf_shared_loss), 1e-12)
+    native_grad_norm_fp32_abs_error = abs(xtuner_grad_norm_fp32 - hf_native_grad_norm_fp32)
+    native_grad_norm_fp32_rel_error = native_grad_norm_fp32_abs_error / max(abs(hf_native_grad_norm_fp32), 1e-12)
+    shared_grad_norm_fp32_abs_error = abs(xtuner_grad_norm_fp32 - hf_shared_grad_norm_fp32)
+    shared_grad_norm_fp32_rel_error = shared_grad_norm_fp32_abs_error / max(abs(hf_shared_grad_norm_fp32), 1e-12)
+    native_grad_norm_fp64_abs_error = abs(xtuner_grad_norm_fp64 - hf_native_grad_norm_fp64)
+    native_grad_norm_fp64_rel_error = native_grad_norm_fp64_abs_error / max(abs(hf_native_grad_norm_fp64), 1e-12)
+    shared_grad_norm_fp64_abs_error = abs(xtuner_grad_norm_fp64 - hf_shared_grad_norm_fp64)
+    shared_grad_norm_fp64_rel_error = shared_grad_norm_fp64_abs_error / max(abs(hf_shared_grad_norm_fp64), 1e-12)
+    metrics = {
+        "input_ids": input_ids.cpu().tolist(),
+        "logits": {
+            "shape": list(hf_logits.shape),
+            **logits_metrics,
+        },
+        "loss": {
+            "hf_native": hf_native_loss,
+            "hf_shared_reduction": hf_shared_loss,
+            "xtuner": xtuner_loss,
+            "native_abs_error": native_loss_abs_error,
+            "native_rel_error": native_loss_rel_error,
+            "shared_abs_error": shared_loss_abs_error,
+            "shared_rel_error": shared_loss_rel_error,
+        },
+        "grad_norm_fp32": {
+            "hf_native": hf_native_grad_norm_fp32,
+            "hf_shared_reduction": hf_shared_grad_norm_fp32,
+            "xtuner": xtuner_grad_norm_fp32,
+            "native_abs_error": native_grad_norm_fp32_abs_error,
+            "native_rel_error": native_grad_norm_fp32_rel_error,
+            "shared_abs_error": shared_grad_norm_fp32_abs_error,
+            "shared_rel_error": shared_grad_norm_fp32_rel_error,
+            "hf_grad_numel": hf_native_grad_numel,
+            "xtuner_grad_numel": xtuner_grad_numel,
+        },
+        "grad_norm_fp64_diagnostic": {
+            "hf_native": hf_native_grad_norm_fp64,
+            "hf_shared_reduction": hf_shared_grad_norm_fp64,
+            "xtuner": xtuner_grad_norm_fp64,
+            "native_abs_error": native_grad_norm_fp64_abs_error,
+            "native_rel_error": native_grad_norm_fp64_rel_error,
+            "shared_abs_error": shared_grad_norm_fp64_abs_error,
+            "shared_rel_error": shared_grad_norm_fp64_rel_error,
+            "hf_grad_numel": hf_native_grad_numel,
+            "xtuner_grad_numel": xtuner_grad_numel,
+        },
+        "peak_memory_gib": {
+            "hf": hf_peak_memory_gib,
+            "xtuner": xtuner_peak_memory_gib,
+        },
+    }
+    print(f"CONCEPT_OLMO_HF_ALIGNMENT={json.dumps(metrics, sort_keys=True)}")
+
+    assert hf_native_grad_numel == hf_shared_grad_numel == xtuner_grad_numel
+    assert logits_metrics["max_abs_error"] == 0.0
+    assert native_loss_abs_error <= 1e-6
+    assert shared_loss_abs_error == 0.0
+    assert native_grad_norm_fp32_rel_error <= 5e-3
+    assert shared_grad_norm_fp32_rel_error <= 5e-3
