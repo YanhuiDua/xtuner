@@ -9,8 +9,9 @@ import torch.distributed.nn.functional as distF
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from xtuner._testing import DeterministicDDPTestCase
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
@@ -29,6 +30,12 @@ from xtuner.v1.utils.load_spec import LoadEnum
 
 
 MODEL_PATH = os.getenv("CONCEPT_OLMO_STAGE2_V1_PATH")
+ALIGNMENT_PROMPTS = (
+    "Explain gravity in one concise sentence.",
+    "Write a Python function that adds two integers, and explain how it "
+    "handles negative inputs.",
+    "请用三句话介绍机器学习中的过拟合，并给出一种常见的缓解方法。",
+)
 
 
 def _global_grad_norms(model: torch.nn.Module) -> tuple[float, float, int]:
@@ -60,6 +67,56 @@ def _tensor_error_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[
         "mean_abs_error": absolute_error.mean().item(),
         "max_rel_error": relative_error.max().item(),
     }
+
+
+def _build_alignment_prompt_batch(
+    model_path: str | Path,
+    device: torch.device,
+) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...], torch.Tensor, torch.Tensor, list[int]]:
+    """Tokenize the shared three-prompt varlen alignment batch."""
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    documents_cpu = tuple(
+        tokenizer.encode(
+            prompt,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        for prompt in ALIGNMENT_PROMPTS
+    )
+    document_lengths = tuple(document.shape[1] for document in documents_cpu)
+    assert all(document.shape[0] == 1 and document.shape[1] > 1 for document in documents_cpu)
+    assert len(set(document_lengths)) == len(documents_cpu), (
+        "The prompts must exercise genuinely varlen input"
+    )
+    if tokenizer.pad_token_id is not None:
+        assert all(not torch.eq(document, tokenizer.pad_token_id).any() for document in documents_cpu)
+
+    shifted_label_documents: list[torch.Tensor] = []
+    for document in documents_cpu:
+        labels = torch.full_like(document, -100)
+        labels[:, :-1] = document[:, 1:]
+        shifted_label_documents.append(labels)
+    shifted_labels = torch.cat(shifted_label_documents, dim=1).to(device)
+    loss_weight = (shifted_labels != -100).float()
+    loss_weight /= loss_weight.sum()
+    assert int((shifted_labels != -100).sum()) == sum(length - 1 for length in document_lengths)
+
+    cu_seq_lens = [0]
+    for document_length in document_lengths:
+        cu_seq_lens.append(cu_seq_lens[-1] + document_length)
+    return documents_cpu, document_lengths, shifted_labels, loss_weight, cu_seq_lens
+
+
+def _assert_alignment_sequence_context(
+    seq_ctx: SequenceContext,
+    document_lengths: tuple[int, ...],
+    expected_cu_seq_lens: list[int],
+) -> None:
+    assert seq_ctx.cu_seq_lens_q.cpu().tolist() == expected_cu_seq_lens
+    assert seq_ctx.position_ids is not None
+    position_chunks = seq_ctx.position_ids.cpu().split(document_lengths, dim=1)
+    for positions, document_length in zip(position_chunks, document_lengths, strict=True):
+        torch.testing.assert_close(positions, torch.arange(document_length).unsqueeze(0), rtol=0, atol=0)
 
 
 def _tiny_config() -> ConceptLMV22VQConfig:
@@ -801,21 +858,26 @@ def test_full_checkpoint_forward_bitwise(monkeypatch):
 @pytest.mark.skipif(MODEL_PATH is None, reason="CONCEPT_OLMO_STAGE2_V1_PATH is not set")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the full checkpoint")
 def test_full_checkpoint_hf_alignment(monkeypatch):
-    """Compare all logits, next-token loss, and the parameter grad norm with HF."""
+    """Compare all logits, next-token loss, and the parameter grad norm with HF.
+
+    Both implementations run the same tokenizer-produced prompts independently.
+    The optimized alignment case below owns packed-varlen coverage; keeping the
+    execution shapes identical here preserves this test as the strict HF oracle.
+    """
     assert MODEL_PATH is not None
     monkeypatch.setenv("XTUNER_HF_IMPL", "true")
     monkeypatch.setenv("XTUNER_DETERMINISTIC", "true")
     monkeypatch.setenv("XTUNER_ACTIVATION_OFFLOAD", "0")
     device = torch.device("cuda")
-    input_ids = torch.arange(1, 9, device=device, dtype=torch.long).unsqueeze(0)
-    shifted_labels = torch.full_like(input_ids, -100)
-    shifted_labels[:, :-1] = input_ids[:, 1:]
-    loss_weight = (shifted_labels != -100).float()
-    loss_weight /= loss_weight.sum()
+    documents_cpu, document_lengths, shifted_labels, loss_weight, expected_cu_seq_lens = (
+        _build_alignment_prompt_batch(MODEL_PATH, device)
+    )
 
-    # HuggingFace computes the next-token loss from logits[:, :-1] and
-    # labels[:, 1:]. Keep its complete logits for a separate whole-model
-    # comparison, then release the 8.9B model before loading XTuner.
+    shifted_label_documents = shifted_labels.split(document_lengths, dim=1)
+    loss_weight_documents = loss_weight.split(document_lengths, dim=1)
+
+    # This remote HF model ignores attention_mask, so run each tokenizer output
+    # independently. XTuner uses the same per-prompt execution shapes below.
     torch.cuda.reset_peak_memory_stats(device)
     hf_model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
@@ -823,18 +885,41 @@ def test_full_checkpoint_hf_alignment(monkeypatch):
         dtype=torch.bfloat16,
         device_map="cuda",
     ).train()
-    hf_output = hf_model(input_ids=input_ids, labels=input_ids, use_cache=False)
-    assert hf_output.loss is not None
-    hf_logits = hf_output.logits.detach().float().cpu()
-    hf_native_loss_tensor = hf_output.loss
+    hf_document_outputs = []
+    for document in documents_cpu:
+        document = document.to(device)
+        output = hf_model(input_ids=document, labels=document, use_cache=False)
+        assert output.loss is not None
+        hf_document_outputs.append(output)
+    hf_logits_tensor = torch.cat([output.logits for output in hf_document_outputs], dim=1)
+    hf_logits = hf_logits_tensor.detach().float().cpu()
+    total_valid_tokens = sum(document_length - 1 for document_length in document_lengths)
+    hf_native_loss_tensor = torch.stack(
+        [
+            output.loss * (document_length - 1)
+            for output, document_length in zip(hf_document_outputs, document_lengths, strict=True)
+        ]
+    ).sum() / total_valid_tokens
     hf_native_loss = hf_native_loss_tensor.detach().float().item()
-    hf_shared_loss_tensor = F.cross_entropy(
-        hf_output.logits.float().reshape(-1, hf_output.logits.shape[-1]),
-        shifted_labels.flatten(),
-        reduction="none",
-        ignore_index=-100,
-    )
-    hf_shared_loss_tensor = (hf_shared_loss_tensor * loss_weight.flatten()).sum()
+    hf_shared_loss_tensor = torch.stack(
+        [
+            (
+                F.cross_entropy(
+                    output.logits.float().reshape(-1, output.logits.shape[-1]),
+                    document_labels.flatten(),
+                    reduction="none",
+                    ignore_index=-100,
+                )
+                * document_loss_weight.flatten()
+            ).sum()
+            for output, document_labels, document_loss_weight in zip(
+                hf_document_outputs,
+                shifted_label_documents,
+                loss_weight_documents,
+                strict=True,
+            )
+        ]
+    ).sum()
     hf_shared_loss = hf_shared_loss_tensor.detach().float().item()
 
     # Keep the graph once so we can distinguish the HF-native mean-CE
@@ -846,7 +931,7 @@ def test_full_checkpoint_hf_alignment(monkeypatch):
     hf_shared_grad_norm_fp32, hf_shared_grad_norm_fp64, hf_shared_grad_numel = _global_grad_norms(hf_model)
     hf_peak_memory_gib = torch.cuda.max_memory_allocated(device) / 2**30
 
-    del hf_native_loss_tensor, hf_shared_loss_tensor, hf_output, hf_model
+    del hf_native_loss_tensor, hf_shared_loss_tensor, hf_logits_tensor, hf_document_outputs, hf_model
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -866,27 +951,52 @@ def test_full_checkpoint_hf_alignment(monkeypatch):
     assert not missing
     model.train()
 
-    # Keep the complete sequence on both sides so the attention/concept graph
-    # and every [batch, sequence, vocabulary] logit are directly comparable.
-    # The final label is ignored because it has no next token, matching HF's
-    # logits[:, :-1] / labels[:, 1:] convention.
-    full_seq_ctx = SequenceContext.from_input_ids((input_ids,), device=device)
+    # Match HF's GEMM shapes exactly. Packed-varlen execution deliberately lives
+    # in test_full_checkpoint_hf_optimized_varlen_alignment, where differences
+    # from fused/compiled kernels are measured with optimized-path tolerances.
+    document_seq_contexts = tuple(
+        SequenceContext.from_input_ids((document,), device="cpu").to(device)
+        for document in documents_cpu
+    )
+    for seq_ctx, document_length in zip(document_seq_contexts, document_lengths, strict=True):
+        _assert_alignment_sequence_context(seq_ctx, (document_length,), [0, document_length])
     loss_config = CELossConfig(mode="eager", loss_reduction="token")
-    loss_context = loss_config.build(data={"shifted_labels": shifted_labels}, sp_mesh=None)
-    assert loss_context is not None
-    loss_context = loss_config.loss_ctx_cls.build_batches([loss_context])[0]
+    loss_contexts = []
+    for document_labels in shifted_label_documents:
+        loss_context = loss_config.build(data={"shifted_labels": document_labels}, sp_mesh=None)
+        assert loss_context is not None
+        loss_contexts.append(loss_context)
+    loss_contexts = loss_config.loss_ctx_cls.build_batches(loss_contexts)
     torch.cuda.reset_peak_memory_stats(device)
-    output = model(full_seq_ctx, loss_ctx={"lm": loss_context})
-    assert output.loss is not None
-    assert output.logits is not None
-    xtuner_full_logits = output.logits.reshape_as(hf_logits).detach().float().cpu()
-    xtuner_loss_tensor = output.loss
+    xtuner_document_logits = []
+    xtuner_document_losses = []
+    for seq_ctx, loss_context in zip(document_seq_contexts, loss_contexts, strict=True):
+        output = model(seq_ctx, loss_ctx={"lm": loss_context})
+        assert output.loss is not None
+        assert output.logits is not None
+        xtuner_document_logits.append(output.logits)
+        xtuner_document_losses.append(output.loss)
+    xtuner_logits_tensor = torch.cat(xtuner_document_logits, dim=0)
+    xtuner_full_logits = xtuner_logits_tensor.reshape_as(hf_logits).detach().float().cpu()
+    xtuner_loss_tensor = torch.stack(xtuner_document_losses).sum()
     xtuner_loss = xtuner_loss_tensor.detach().float().item()
     xtuner_loss_tensor.backward()
     xtuner_grad_norm_fp32, xtuner_grad_norm_fp64, xtuner_grad_numel = _global_grad_norms(model)
     xtuner_peak_memory_gib = torch.cuda.max_memory_allocated(device) / 2**30
 
     logits_metrics = _tensor_error_metrics(xtuner_full_logits, hf_logits)
+    document_logits_metrics = []
+    start = 0
+    for prompt, document_length in zip(ALIGNMENT_PROMPTS, document_lengths, strict=True):
+        end = start + document_length
+        document_logits_metrics.append(
+            {
+                "prompt": prompt,
+                "length": document_length,
+                **_tensor_error_metrics(xtuner_full_logits[:, start:end], hf_logits[:, start:end]),
+            }
+        )
+        start = end
     native_loss_abs_error = abs(xtuner_loss - hf_native_loss)
     native_loss_rel_error = native_loss_abs_error / max(abs(hf_native_loss), 1e-12)
     shared_loss_abs_error = abs(xtuner_loss - hf_shared_loss)
@@ -900,10 +1010,15 @@ def test_full_checkpoint_hf_alignment(monkeypatch):
     shared_grad_norm_fp64_abs_error = abs(xtuner_grad_norm_fp64 - hf_shared_grad_norm_fp64)
     shared_grad_norm_fp64_rel_error = shared_grad_norm_fp64_abs_error / max(abs(hf_shared_grad_norm_fp64), 1e-12)
     metrics = {
-        "input_ids": input_ids.cpu().tolist(),
+        "prompts": list(ALIGNMENT_PROMPTS),
+        "input_ids": [document.tolist() for document in documents_cpu],
+        "document_lengths": list(document_lengths),
+        "concatenated_cu_seq_lens": expected_cu_seq_lens,
+        "execution": {"hf": "per_prompt", "xtuner": "per_prompt"},
         "logits": {
             "shape": list(hf_logits.shape),
             **logits_metrics,
+            "per_document": document_logits_metrics,
         },
         "loss": {
             "hf_native": hf_native_loss,
@@ -941,7 +1056,7 @@ def test_full_checkpoint_hf_alignment(monkeypatch):
             "xtuner": xtuner_peak_memory_gib,
         },
     }
-    print(f"CONCEPT_OLMO_HF_ALIGNMENT={json.dumps(metrics, sort_keys=True)}")
+    print(f"CONCEPT_OLMO_HF_ALIGNMENT={json.dumps(metrics, ensure_ascii=False, sort_keys=True)}")
 
     assert hf_native_grad_numel == hf_shared_grad_numel == xtuner_grad_numel
     assert logits_metrics["max_abs_error"] == 0.0
@@ -949,3 +1064,202 @@ def test_full_checkpoint_hf_alignment(monkeypatch):
     assert shared_loss_abs_error == 0.0
     assert native_grad_norm_fp32_rel_error <= 5e-3
     assert shared_grad_norm_fp32_rel_error <= 5e-3
+
+
+@pytest.mark.skipif(MODEL_PATH is None, reason="CONCEPT_OLMO_STAGE2_V1_PATH is not set")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the full checkpoint")
+def test_full_checkpoint_hf_optimized_varlen_alignment(monkeypatch):
+    """Compare the optimized packed compute graph with HF on three prompts.
+
+    The checkpoint's remote code does not implement Transformers' selectable
+    ``attn_implementation`` interface. It calls PyTorch SDPA directly instead.
+    Force its Flash SDPA backend, and pin XTuner to external flash-attn v2
+    varlen rather than the benchmark's FA3 path. Both sides therefore exercise
+    FlashAttention-2 semantics, though they are different kernel libraries and
+    are compared with optimized-path tolerances rather than bitwise equality.
+
+    HuggingFace ignores ``attention_mask`` in this remote model, so it cannot
+    serve as a one-shot packed-sequence oracle. Each prompt is therefore run
+    independently by HF, while XTuner receives the three documents as one
+    packed varlen sequence with independent position and attention boundaries.
+    """
+    assert MODEL_PATH is not None
+    monkeypatch.delenv("XTUNER_HF_IMPL", raising=False)
+    monkeypatch.setenv("XTUNER_ACTIVATION_OFFLOAD", "0")
+    monkeypatch.setenv("XTUNER_USE_FA3", "0")
+    device = torch.device("cuda")
+
+    # The flash-attention implementation is resolved when XTuner's ops module
+    # is imported, before a pytest monkeypatch can change XTUNER_USE_FA3. Patch
+    # that already-resolved callable as well, so this case cannot accidentally
+    # exercise FA3 inherited from the parent test process.
+    import xtuner.v1.ops.attn_imp as attn_imp
+    from xtuner.v1.ops.flash_attn.gpu import flash_attn_varlen_func_v2
+
+    if flash_attn_varlen_func_v2 is None:
+        pytest.skip("flash-attn v2 is required for optimized HF parity")
+    monkeypatch.setattr(attn_imp, "flash_attn_varlen_func", flash_attn_varlen_func_v2)
+
+    documents_cpu, document_lengths, shifted_labels, loss_weight, expected_cu_seq_lens = (
+        _build_alignment_prompt_batch(MODEL_PATH, device)
+    )
+
+    checkpoint_config = ConceptLMV22VQConfig.from_hf(MODEL_PATH)
+    assert max(document_lengths) <= checkpoint_config.window_size[0]
+
+    # The remote HF model cannot consume packed document boundaries. Running
+    # the three prompts separately is the unambiguous oracle: attention,
+    # positions, concept chunking, and shifted labels all restart per prompt.
+    torch.cuda.reset_peak_memory_stats(device)
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+        dtype=torch.bfloat16,
+        device_map="cuda",
+    ).train()
+    hf_document_outputs = []
+    with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
+        for document in documents_cpu:
+            hf_document_outputs.append(
+                hf_model(
+                    input_ids=document.to(device),
+                    use_cache=False,
+                )
+            )
+        hf_logits_tensor = torch.cat([output.logits for output in hf_document_outputs], dim=1)
+        hf_loss_tensor = F.cross_entropy(
+            hf_logits_tensor.float().reshape(-1, hf_logits_tensor.shape[-1]),
+            shifted_labels.flatten(),
+            reduction="none",
+            ignore_index=-100,
+        )
+        hf_loss_tensor = (hf_loss_tensor * loss_weight.flatten()).sum()
+        hf_logits = hf_logits_tensor.detach().float().cpu()
+        hf_loss = hf_loss_tensor.detach().float().item()
+        hf_loss_tensor.backward()
+    hf_grad_norm_fp32, hf_grad_norm_fp64, hf_grad_numel = _global_grad_norms(hf_model)
+    hf_peak_memory_gib = torch.cuda.max_memory_allocated(device) / 2**30
+
+    del hf_loss_tensor, hf_logits_tensor, hf_document_outputs, hf_model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    config = checkpoint_config.model_copy(
+        update={
+            "compile_cfg": None,
+            "float8_cfg": None,
+            "lm_head_vocab_padding_multiple": 8,
+            "stage_group_size": 4,
+        }
+    )
+    config.attention.attn_impl = "flash_attention"
+    with torch.device("meta"):
+        model = config.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
+    loaded, unloaded, missing = model.from_hf(MODEL_PATH)
+    assert len(loaded) == 631
+    assert not unloaded
+    assert not missing
+    model.train()
+
+    packed_seq_ctx = SequenceContext.from_input_ids(documents_cpu, device="cpu").to(device)
+    _assert_alignment_sequence_context(packed_seq_ctx, document_lengths, expected_cu_seq_lens)
+
+    loss_config = CELossConfig(mode="eager", loss_reduction="token")
+    loss_context = loss_config.build(data={"shifted_labels": shifted_labels}, sp_mesh=None)
+    assert loss_context is not None
+    loss_context = loss_config.loss_ctx_cls.build_batches([loss_context])[0]
+    torch.cuda.reset_peak_memory_stats(device)
+    output = model(packed_seq_ctx, loss_ctx={"lm": loss_context})
+    assert output.loss is not None
+    assert output.logits is not None
+    xtuner_logits = output.logits.reshape_as(hf_logits).detach().float().cpu()
+    xtuner_loss_tensor = output.loss
+    xtuner_loss = xtuner_loss_tensor.detach().float().item()
+    xtuner_loss_tensor.backward()
+    xtuner_grad_norm_fp32, xtuner_grad_norm_fp64, xtuner_grad_numel = _global_grad_norms(model)
+    xtuner_peak_memory_gib = torch.cuda.max_memory_allocated(device) / 2**30
+
+    logits_metrics = _tensor_error_metrics(xtuner_logits, hf_logits)
+    document_logits_metrics = []
+    start = 0
+    for prompt, document_length in zip(ALIGNMENT_PROMPTS, document_lengths, strict=True):
+        end = start + document_length
+        document_logits_metrics.append(
+            {
+                "prompt": prompt,
+                "length": document_length,
+                **_tensor_error_metrics(xtuner_logits[:, start:end], hf_logits[:, start:end]),
+            }
+        )
+        start = end
+    loss_abs_error = abs(xtuner_loss - hf_loss)
+    loss_rel_error = loss_abs_error / max(abs(hf_loss), 1e-12)
+    grad_norm_fp32_abs_error = abs(xtuner_grad_norm_fp32 - hf_grad_norm_fp32)
+    grad_norm_fp32_rel_error = grad_norm_fp32_abs_error / max(abs(hf_grad_norm_fp32), 1e-12)
+    grad_norm_fp64_abs_error = abs(xtuner_grad_norm_fp64 - hf_grad_norm_fp64)
+    grad_norm_fp64_rel_error = grad_norm_fp64_abs_error / max(abs(hf_grad_norm_fp64), 1e-12)
+    metrics = {
+        "attention": {
+            "hf": "torch_sdpa_flash",
+            "xtuner": "flash_attn_varlen_v2",
+        },
+        "document_lengths": list(document_lengths),
+        "cu_seq_lens": expected_cu_seq_lens,
+        "optimized_xtuner": {
+            "compile": True,
+            "stage_group_size": config.stage_group_size,
+            "lm_head_vocab_padding_multiple": config.lm_head_vocab_padding_multiple,
+            "float8": False,
+            "fsdp": False,
+        },
+        "logits": {
+            "shape": list(hf_logits.shape),
+            **logits_metrics,
+            "per_document": document_logits_metrics,
+        },
+        "loss": {
+            "hf": hf_loss,
+            "xtuner": xtuner_loss,
+            "abs_error": loss_abs_error,
+            "rel_error": loss_rel_error,
+        },
+        "grad_norm_fp32": {
+            "hf": hf_grad_norm_fp32,
+            "xtuner": xtuner_grad_norm_fp32,
+            "abs_error": grad_norm_fp32_abs_error,
+            "rel_error": grad_norm_fp32_rel_error,
+        },
+        "grad_norm_fp64_diagnostic": {
+            "hf": hf_grad_norm_fp64,
+            "xtuner": xtuner_grad_norm_fp64,
+            "abs_error": grad_norm_fp64_abs_error,
+            "rel_error": grad_norm_fp64_rel_error,
+        },
+        "grad_numel": {
+            "hf": hf_grad_numel,
+            "xtuner": xtuner_grad_numel,
+        },
+        "peak_memory_gib": {
+            "hf": hf_peak_memory_gib,
+            "xtuner": xtuner_peak_memory_gib,
+        },
+    }
+    print(
+        "CONCEPT_OLMO_HF_OPTIMIZED_VARLEN_ALIGNMENT="
+        f"{json.dumps(metrics, ensure_ascii=False, sort_keys=True)}"
+    )
+
+    padded_lm_head_rows = model.lm_head.weight.shape[0] - config.vocab_size
+    assert padded_lm_head_rows == 2
+    assert model.lm_head.weight.grad is not None
+    assert not torch.count_nonzero(model.lm_head.weight.grad[config.vocab_size :])
+    assert xtuner_grad_numel == hf_grad_numel + padded_lm_head_rows * config.hidden_size
+
+    # Measured full-checkpoint budgets for the optimized compute graph. Unlike
+    # the strict case above, this path intentionally changes GEMM shapes,
+    # reduction order, LM-head padding, and the FlashAttention implementation.
+    assert logits_metrics["max_abs_error"] <= 1.0
+    assert logits_metrics["mean_abs_error"] <= 0.1
+    assert loss_rel_error <= 2e-3
+    assert grad_norm_fp32_rel_error <= 0.08
+    assert grad_norm_fp64_rel_error <= 0.08
