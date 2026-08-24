@@ -7,18 +7,21 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 mkdir -p "$WORK_DIR" "$WORK_DIR/data"
 export DATA_FORMAT="${DATA_FORMAT:-jsonl}"
 export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
+export TOTAL_STEP="${TOTAL_STEP:-3}"
 
 if [[ "$DATA_FORMAT" == "jsonl" ]]; then
     export DATA_PATH="${DATA_PATH:-$WORK_DIR/data/synthetic.jsonl}"
-    python - "$DATA_PATH" "${SEQ_LEN:-8192}" <<'PY'
+    synthetic_samples="${SYNTHETIC_SAMPLES:-$((TOTAL_STEP * GLOBAL_BATCH_SIZE + GLOBAL_BATCH_SIZE))}"
+    python - "$DATA_PATH" "${SEQ_LEN:-8192}" "$synthetic_samples" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
 seq_len = int(sys.argv[2])
+sample_count = int(sys.argv[3])
 with path.open("w", encoding="ascii") as file:
-    for _ in range(16):
+    for _ in range(max(16, sample_count)):
         json.dump({"content": "x" * seq_len}, file)
         file.write("\n")
 PY
@@ -30,6 +33,8 @@ fi
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 torchrun --standalone --nnodes=1 --nproc-per-node=8 \
     -m xtuner.v1.train.cli.sft \
