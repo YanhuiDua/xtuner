@@ -56,6 +56,10 @@ def default_init_weights(module: nn.Module) -> set[str]:
         seen.add(id(module))
 
     def _default_init_atom(name: str, module: nn.Module):
+        if hasattr(module, "init_extra_weights"):
+            extra_params = module.init_extra_weights()
+            initialized_params.update(clean_param_name(f"{name}.{param_name}") for param_name in extra_params)
+
         if hasattr(module, "bias") and module.bias is not None:
             bias = cast(torch.Tensor, module.bias)
             init_params(bias, nn.init.zeros_)

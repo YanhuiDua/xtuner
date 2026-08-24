@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
+import math
 from typing import Annotated, cast
 
 import torch
@@ -13,7 +14,7 @@ from typing_extensions import overload
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
 from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
-from xtuner.v1.utils import get_logger
+from xtuner.v1.utils import get_logger, init_params
 
 from ...ops.gated_deltanet import get_causal_conv1d_fn, get_chunk_gated_delta_rule_fn
 from ...ops.gated_deltanet.gen_seq_idx import gen_seq_idx
@@ -187,6 +188,32 @@ class GatedDeltaNet(nn.Module):
 
     def get_muon_split_sizes(self) -> dict[nn.Parameter, tuple[int, ...]]:
         """Return the logical Q, K, and V row blocks for MuonSplit."""
+
+    @torch.no_grad()
+    def init_extra_weights(self) -> set[str]:
+        """Initialize Qwen3.5 GatedDeltaNet parameters that are not standard weights or biases."""
+
+        def init_a_log(param: torch.Tensor) -> None:
+            nn.init.uniform_(param, a=0.0, b=16.0)
+            param.log_()
+
+        def init_dt_bias(param: torch.Tensor) -> None:
+            dt_min, dt_max, dt_init_floor = 0.001, 0.1, 1e-4
+            nn.init.uniform_(param)
+            dt = torch.exp(param * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
+            dt.clamp_(min=dt_init_floor)
+            param.copy_(dt + torch.log(-torch.expm1(-dt)))
+
+        init_params(self.A_log, init_a_log)
+        init_params(self.dt_bias, init_dt_bias)
+        return {"A_log", "dt_bias"}
+
+    def get_muon_split_sizes(self) -> dict[nn.Parameter, tuple[int, ...]]:
+        """Return the logical Q, K, and V row blocks for Muon orthogonalization.
+
+        Returns:
+            dict[nn.Parameter, tuple[int, ...]]: Q, K, and V row split sizes keyed by the fused parameter.
+        """
         return {
             cast(nn.Parameter, self.in_proj_qkv.weight): (
                 self.key_dim,
@@ -195,21 +222,38 @@ class GatedDeltaNet(nn.Module):
             )
         }
 
+    def _mudd_qkv_projection(
+        self,
+        query_input: torch.Tensor,
+        key_input: torch.Tensor,
+        value_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            self.in_proj_qkv(query_input)[..., : self.key_dim],
+            self.in_proj_qkv(key_input)[..., self.key_dim : 2 * self.key_dim],
+            self.in_proj_qkv(value_input)[..., 2 * self.key_dim :],
+        )
+
     def forward_for_sp(
         self,
         hidden_states: torch.Tensor,
         seq_ctx: SequenceContext,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,  # not used
+        mudd_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> AttnOutputs:
         batch_size, seq_len, _ = hidden_states.shape
         assert batch_size == 1, "Only batch size of 1 is supported for now in GateDeltaNet"
-        mixed_qkv = self.in_proj_qkv(hidden_states)
+        query_input, key_input, value_input = mudd_inputs if mudd_inputs is not None else (hidden_states,) * 3
+        if mudd_inputs is None:
+            mixed_qkv = self.in_proj_qkv(query_input)
+        else:
+            query, key, value = self._mudd_qkv_projection(query_input, key_input, value_input)
 
-        z = self.in_proj_z(hidden_states)
+        z = self.in_proj_z(query_input)
         z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        b = self.in_proj_b(query_input)
+        a = self.in_proj_a(query_input)
 
         weight = self.conv1d.weight.squeeze(1)
         bias = self.conv1d.bias
@@ -228,15 +272,8 @@ class GatedDeltaNet(nn.Module):
         else:
             seq_idx = seq_ctx.seq_idx
 
-        query, key, value = torch.split(
-            mixed_qkv,  # (1, L/sp_size, 8192)
-            [
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
-            ],
-            dim=-1,
-        )
+        if mudd_inputs is None:
+            query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         query = query.transpose(1, 2)  # (1, dim, L/sp_size)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
@@ -377,19 +414,24 @@ class GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         seq_ctx: SequenceContext,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,  # not used
+        mudd_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> AttnOutputs:
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
-            return self.forward_for_sp(hidden_states, seq_ctx, position_embeddings)
+            return self.forward_for_sp(hidden_states, seq_ctx, position_embeddings, mudd_inputs)
 
         batch_size, seq_len, _ = hidden_states.shape
         assert batch_size == 1, "Only batch size of 1 is supported for now in GateDeltaNet"
-        mixed_qkv = self.in_proj_qkv(hidden_states)
+        query_input, key_input, value_input = mudd_inputs if mudd_inputs is not None else (hidden_states,) * 3
+        if mudd_inputs is None:
+            mixed_qkv = self.in_proj_qkv(query_input)
+        else:
+            query, key, value = self._mudd_qkv_projection(query_input, key_input, value_input)
 
-        z = self.in_proj_z(hidden_states)
+        z = self.in_proj_z(query_input)
         z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        b = self.in_proj_b(query_input)
+        a = self.in_proj_a(query_input)
 
         weight = self.conv1d.weight.squeeze(1)
         bias = self.conv1d.bias
@@ -405,23 +447,37 @@ class GatedDeltaNet(nn.Module):
         else:
             seq_idx = seq_ctx.seq_idx
 
-        mixed_qkv = self.causal_conv1d_fn(
-            x=mixed_qkv,  # need non contiguous
-            weight=weight,
-            bias=bias,
-            activation=self.activation,
-            seq_idx=seq_idx,
-        )
-        # mixed_qkv = mixed_qkv.transpose(1, 2)
-        query, key, value = torch.split(
-            mixed_qkv,
-            [
-                self.key_dim,
-                self.key_dim,
-                self.value_dim,
-            ],
-            dim=-1,
-        )
+        if mudd_inputs is None:
+            mixed_qkv = self.causal_conv1d_fn(
+                x=mixed_qkv,
+                weight=weight,
+                bias=bias,
+                activation=self.activation,
+                seq_idx=seq_idx,
+            )
+            query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        else:
+            query = self.causal_conv1d_fn(
+                x=query,
+                weight=weight[: self.key_dim],
+                bias=bias[: self.key_dim] if bias is not None else None,
+                activation=self.activation,
+                seq_idx=seq_idx,
+            )
+            key = self.causal_conv1d_fn(
+                x=key,
+                weight=weight[self.key_dim : 2 * self.key_dim],
+                bias=bias[self.key_dim : 2 * self.key_dim] if bias is not None else None,
+                activation=self.activation,
+                seq_idx=seq_idx,
+            )
+            value = self.causal_conv1d_fn(
+                x=value,
+                weight=weight[2 * self.key_dim :],
+                bias=bias[2 * self.key_dim :] if bias is not None else None,
+                activation=self.activation,
+                seq_idx=seq_idx,
+            )
         query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
         key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)

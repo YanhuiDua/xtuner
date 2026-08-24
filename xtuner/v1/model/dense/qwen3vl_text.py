@@ -6,8 +6,7 @@ import torch.nn.functional as F
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.loss import BaseLossContext
 from xtuner.v1.model.base import ModelOutputs
-from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayerOutput
-
+from .dense import DenseModelOutputs
 from .qwen3 import Qwen3Dense, Qwen3Dense4BConfig, Qwen3Dense8BConfig
 
 
@@ -63,14 +62,13 @@ class Qwen3VLTextDense(Qwen3Dense):
         deepstack_visual_embeds = seq_ctx.deepstack_visual_embeds
         visual_pos_masks = seq_ctx.visual_pos_masks
         # =====================================================
-
         for idx, decoder_layer in self.layers.items():
-            layer_results: DenseDecoderLayerOutput = decoder_layer(
+            current_raw = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 seq_ctx=seq_ctx,
             )
-            hidden_states = layer_results["hidden_states"]
+            hidden_states = current_raw
 
             if deepstack_visual_embeds is not None and ((idx := int(idx)) in range(len(deepstack_visual_embeds))):
                 assert visual_pos_masks is not None
@@ -79,6 +77,7 @@ class Qwen3VLTextDense(Qwen3Dense):
             if self.config.return_hidden_states:
                 output["hidden_states"].append(hidden_states)
 
+        layer_hidden_states = hidden_states
         hidden_states = self.norm(hidden_states)
 
         if loss_ctx is None:
@@ -92,7 +91,16 @@ class Qwen3VLTextDense(Qwen3Dense):
             output["logits"] = logits
             output["extra_info"] = extra_info
 
-        return ModelOutputs(**output)
+        mtp_loss = self._forward_mtp(
+            layer_hidden_states=layer_hidden_states,
+            seq_ctx=seq_ctx,
+            position_embeddings=position_embeddings,
+            loss_ctx=loss_ctx,
+        )
+        if mtp_loss is not None:
+            output["mtp_loss"] = mtp_loss
+
+        return DenseModelOutputs(**output)
 
 
 class Qwen3VLTextDense4BConfig(Qwen3Dense4BConfig):

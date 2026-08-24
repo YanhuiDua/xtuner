@@ -12,6 +12,7 @@ from .compose.internvl import (
     InternVLBaseConfig,
 )
 from .compose.qwen3_5 import Qwen3_5_VLDense4BConfig, Qwen3_5_VLMoE35BA3Config
+from .dense.qwen3_5_text import Qwen3_5_VLTextDense9BConfig
 from .compose.qwen3_vl import (
     Qwen3VLDense4BConfig,
     Qwen3VLDense8BConfig,
@@ -119,4 +120,5 @@ __all__ = [
     "ConceptLMV22VQ",
     "ConceptLMV22VQConfig",
     "ConceptOlmoStage2V1Config",
+    "Qwen3_5_VLTextDense9BConfig",
 ]

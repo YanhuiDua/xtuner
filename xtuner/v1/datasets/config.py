@@ -28,6 +28,7 @@ from .collator import (
 )
 from .dataloader import BaseDataloader, Dataloader
 from .jsonl import JsonlDataset
+from .megatron_indexed import MegatronIndexedDataset, resolve_megatron_prefixes
 from .packing import ExpandSoftPackDataset, HardPackDataset, MLLMPretrainHybridPackDataset, _LegacySoftPackDataset
 from .preset_pack import PresetPackDataset
 from .preset_sampler import PresetSampler
@@ -52,11 +53,12 @@ class DatasetConfig(BaseModel):
     enable_mmap_shared: Annotated[bool, Parameter(group="dataset")] = False
     media_root: Annotated[str | None, Parameter(group="dataset")] = ""
     disable_filter: Annotated[bool, Parameter(group="dataset")] = False
+    sequence_length: Annotated[int | None, Parameter(group="dataset")] = None
 
     def build(
         self,
         tokenize_fn: Optional["CachableTokenizeFunction"] = None,
-    ) -> "JsonlDataset":
+    ) -> "JsonlDataset | MegatronIndexedDataset":
         if self.class_name == "JsonlDataset":
             return JsonlDataset(
                 tokenize_fn=tokenize_fn,
@@ -79,6 +81,13 @@ class DatasetConfig(BaseModel):
                 media_root=self.media_root,
                 cache_dir=self.cache_dir,
                 cache_tag=self.cache_tag,
+            )
+        elif self.class_name == "MegatronIndexedDataset":
+            return MegatronIndexedDataset(
+                anno_path=self.anno_path,
+                sample_ratio=self.sample_ratio,
+                name=self.name,
+                sequence_length=self.sequence_length,
             )
         else:
             raise ValueError(f"Unsupported class_name: {self.class_name}")
@@ -106,8 +115,8 @@ DatasetConfigListAdatper = TypeAdapter(DatasetConfigList, config=ConfigDict(arbi
 # TODO: (huanghaian) Moving arguments to dataset config
 def build_datasets(
     dataset_config: DatasetConfigList, tokenizer: PreTrainedTokenizer, tokenizer_hash: str | None = None
-) -> list[JsonlDataset]:
-    datasets: list[JsonlDataset] = []
+) -> list[JsonlDataset | MegatronIndexedDataset]:
+    datasets: list[JsonlDataset | MegatronIndexedDataset] = []
     assert len(dataset_config) > 0
 
     if tokenizer_hash is None:
@@ -118,7 +127,9 @@ def build_datasets(
         assert isinstance(_dataset_config, DatasetConfig)
         _tokenize_fn_name = config["tokenize_fn"]
         anno_path = _dataset_config.anno_path
-        if os.path.isfile(anno_path):
+        if _dataset_config.class_name == "MegatronIndexedDataset":
+            all_anno_path = resolve_megatron_prefixes(anno_path)
+        elif os.path.isfile(anno_path):
             all_anno_path = [anno_path]
         else:
             all_anno_path = [
@@ -130,7 +141,10 @@ def build_datasets(
             _dataset_config = copy.deepcopy(_dataset_config)
             _dataset_config.anno_path = anno_path
             anno_name = os.path.basename(anno_path)  # for debug
-            _tokenize_fn = _tokenize_fn_name.build(tokenizer, tokenizer_hash=tokenizer_hash, anno_name=anno_name)
+            if _dataset_config.class_name == "MegatronIndexedDataset":
+                _tokenize_fn = None
+            else:
+                _tokenize_fn = _tokenize_fn_name.build(tokenizer, tokenizer_hash=tokenizer_hash, anno_name=anno_name)
             _dataset = _dataset_config.build(_tokenize_fn)
             if get_rank() == 0:
                 logger.debug(

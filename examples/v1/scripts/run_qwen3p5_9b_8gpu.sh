@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+: "${WORK_DIR:?WORK_DIR must point to workspace-backed storage}"
+
+mkdir -p "$WORK_DIR" "$WORK_DIR/data"
+export DATA_FORMAT="${DATA_FORMAT:-jsonl}"
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
+
+if [[ "$DATA_FORMAT" == "jsonl" ]]; then
+    export DATA_PATH="${DATA_PATH:-$WORK_DIR/data/synthetic.jsonl}"
+    python - "$DATA_PATH" "${SEQ_LEN:-8192}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+seq_len = int(sys.argv[2])
+with path.open("w", encoding="ascii") as file:
+    for _ in range(16):
+        json.dump({"content": "x" * seq_len}, file)
+        file.write("\n")
+PY
+else
+    : "${DATA_PATH:?DATA_PATH is required when DATA_FORMAT=$DATA_FORMAT}"
+    export DATA_PATH
+fi
+
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export TOKENIZERS_PARALLELISM=false
+
+torchrun --standalone --nnodes=1 --nproc-per-node=8 \
+    -m xtuner.v1.train.cli.sft \
+    --config "$REPO_ROOT/examples/v1/config/sft_qwen3p5_9b.py"

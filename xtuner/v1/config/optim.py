@@ -7,6 +7,8 @@ from cyclopts import Parameter
 from pydantic import BaseModel, ConfigDict
 from typing_extensions import Annotated
 
+import os
+
 from xtuner.v1.optim import LocalDTensorAdamW, Muon, SwapAdamW
 from xtuner.v1.utils import get_logger
 
@@ -105,6 +107,9 @@ class MuonConfig(OptimConfig):
         Literal["all", "adamw_only"],
         Parameter(help="Gradient clipping policy: clip all parameters or only the AdamW parameter groups"),
     ] = "adamw_only"
+    adamw_foreach: Annotated[
+        bool, Parameter(help="Use foreach updates for parameters handled by Muon's AdamW fallback")
+    ] = True
 
     def build(self, model):
         trainable_parameters_names = model.trainable_parameters()
@@ -196,7 +201,7 @@ class MuonConfig(OptimConfig):
         # Other expert params: num_experts = n_routed_experts
         if muon_params_moe_other:
             param_groups.append(dict(params=muon_params_moe_other, num_experts=num_experts, clip_grad=clip_muon_grad))
-        param_groups.append(dict(params=adamw_params, algorithm="adamw", clip_grad=True))
+        param_groups.append(dict(params=adamw_params, algorithm="adamw", clip_grad=True, adamw_foreach=self.adamw_foreach))
 
         # Sanity check: ensure all trainable parameters are assigned to optimizer
         total_assigned = (
@@ -238,7 +243,7 @@ class MuonConfig(OptimConfig):
             nesterov=True,
             flatten=True,
             adjust_lr=self.adjust_lr,
-            use_triton=False,
+            use_triton=os.getenv("XTUNER_MUON_USE_TRITON", "0").lower() in ("1", "true", "yes", "on"),
             epsilon=self.eps,
             enable_all2all=self.enable_all2all,
             muon_split_sizes=muon_split_sizes,

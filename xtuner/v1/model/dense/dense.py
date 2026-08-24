@@ -1,6 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from pathlib import Path
-from typing import Self, cast
+from typing import Self, TypedDict, cast
 
 import torch
 import torch.distributed as dist
@@ -18,7 +18,8 @@ from typing_extensions import overload, override
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.float8_handler import Float8Handler
-from xtuner.v1.loss import BaseLossContext, CELossContext
+from xtuner.v1.loss import BaseLossContext, CELossContext, MTPLossContext
+from xtuner.v1.loss.mtp_loss import MTPLossConfig
 from xtuner.v1.model.base import (
     DEFAULT_FLOAT8_CFG,
     BaseModel,
@@ -34,7 +35,9 @@ from xtuner.v1.module import (
     MLAConfig,
     RMSNorm,
 )
-from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer, DenseDecoderLayerOutput
+from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
+from xtuner.v1.module.mtp import MTPBlock, MTPLayer
+from xtuner.v1.module.mudd import Qwen35MUDD, Qwen35MUDDState
 from xtuner.v1.utils import (
     get_device,
     get_logger,
@@ -52,6 +55,15 @@ DENSE_COMPILE_CFG: dict[str, TorchCompileOption] = {
 }
 
 
+class DenseModelOutputs(ModelOutputs):
+    mtp_loss: torch.Tensor | None = None
+
+
+class DenseLossContextDict(TypedDict):
+    lm: BaseLossContext
+    mtp: list[BaseLossContext] | None
+
+
 class Dense(BaseModel):
     config: TransformerConfig
 
@@ -63,6 +75,12 @@ class Dense(BaseModel):
         self.layers = self.build_layers(config)
         self.rotary_emb = self.build_rotary_embedding(config)
         self.embed_tokens = self.build_embeddings(config)
+        self.mudd = (
+            Qwen35MUDD(config.hidden_size, config.num_hidden_layers, config.rms_norm_eps)
+            if bool(getattr(config, "mudd_enabled", False))
+            else None
+        )
+        self.mtp_block = self.build_mtp_block(config) if config.mtp_config is not None else None
 
         # Make sure it works properly when not using fsdp
         if config.tie_word_embeddings:
@@ -95,18 +113,29 @@ class Dense(BaseModel):
             output["hidden_states"] = []
 
         self._mark_dynamic(seq_ctx)
+        mudd_state: Qwen35MUDDState | None = None
+        if self.mudd is not None:
+            mudd_state = self.mudd.initial_state(hidden_states)
 
         for idx, decoder_layer in self.layers.items():
-            layer_results: DenseDecoderLayerOutput = decoder_layer(
+            current_raw = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 seq_ctx=seq_ctx,
+                mudd_streams=mudd_state.streams if mudd_state is not None else None,
             )
-            hidden_states = layer_results["hidden_states"]
+
+            if self.mudd is not None:
+                assert mudd_state is not None
+                mudd_state = self.mudd.finish_layer(int(idx), current_raw, mudd_state)
+                hidden_states = self.mudd.final_read(mudd_state)
+            else:
+                hidden_states = current_raw
 
             if self.config.return_hidden_states:
                 output["hidden_states"].append(hidden_states)
 
+        layer_hidden_states = hidden_states
         hidden_states = self.norm(hidden_states)
 
         if loss_ctx is None:
@@ -120,10 +149,90 @@ class Dense(BaseModel):
             output["logits"] = logits
             output["extra_info"] = extra_info
 
-        return ModelOutputs(**output)
+        mtp_loss = self._forward_mtp(
+            layer_hidden_states=layer_hidden_states,
+            seq_ctx=seq_ctx,
+            position_embeddings=position_embeddings,
+            loss_ctx=loss_ctx,
+        )
+        if mtp_loss is not None:
+            output["mtp_loss"] = mtp_loss
+
+        return DenseModelOutputs(**output)
+
+    def build_loss_ctx_batch(
+        self,
+        data_batch: list[dict],
+        sp_mesh: DeviceMesh | None = None,
+    ) -> list[DenseLossContextDict]:  # type: ignore[override]
+        res: list[dict] = super().build_loss_ctx_batch(data_batch, sp_mesh)
+        cu_seq_lens_list = [data["seq_ctx"].cu_seq_lens_k for data in data_batch]
+
+        if self.config.mtp_config is not None:
+            for mtp_idx in range(self.config.mtp_config.num_layers):
+                mtp_loss_cfg = MTPLossConfig(
+                    **self.config.lm_loss_cfg.model_dump(),
+                    mtp_depth=mtp_idx + 1,
+                    detach_mtp_lm_head_weight=self.config.mtp_config.detach_mtp_lm_head_weight,
+                )
+                mtp_loss_ctx_list = self._build_loss_ctx(mtp_loss_cfg, data_batch, sp_mesh)
+                if mtp_loss_ctx_list is not None:
+                    mtp_loss_ctx_list = MTPLossContext.build_batches(
+                        cast(list[MTPLossContext], mtp_loss_ctx_list),
+                        cu_seq_lens_list=cu_seq_lens_list,
+                        sp_mesh=sp_mesh,
+                    )
+                    for i, mtp_loss_ctx in enumerate(mtp_loss_ctx_list):
+                        res[i].setdefault("mtp", []).append(mtp_loss_ctx)
+
+        for loss_ctx_dict in res:
+            loss_ctx_dict.setdefault("mtp", None)
+        return cast(list[DenseLossContextDict], res)
 
     def build_embeddings(self, config: TransformerConfig):
         return nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+
+    def build_mtp_block(self, config: TransformerConfig) -> MTPBlock:
+        mtp_config = config.mtp_config
+        assert mtp_config is not None
+
+        last_layer_idx = config.num_hidden_layers - 1
+        layer_type = config.layers_type[last_layer_idx]
+        if layer_type in ["full_attention", "sliding_attention"]:
+            attention_config = config.attention
+        elif layer_type == "linear_attention":
+            assert config.linear_attention is not None
+            attention_config = config.linear_attention
+        else:
+            raise ValueError(f"Unsupported MTP layer type {layer_type}")
+
+        mtp_layers = []
+        num_physical_layers = 1 if mtp_config.share_weights else mtp_config.num_layers
+        for mtp_idx in range(num_physical_layers):
+            decoder_layer = DenseDecoderLayer(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                mlp_bias=config.mlp_bias,
+                hidden_act=config.hidden_act,
+                rms_norm_eps=config.rms_norm_eps,
+                rms_norm_type=config.rms_norm_type,
+                attention_config=attention_config,
+                generate_config=config.generate_config,
+                rope_scaling_cfg=config.rope_scaling_cfg,
+                float8_cfg=config.float8_cfg,
+                layer_type=layer_type,
+                layer_idx=config.num_hidden_layers + mtp_idx,
+            )
+            mtp_layers.append(
+                MTPLayer(
+                    hidden_size=config.hidden_size,
+                    rms_norm_eps=config.rms_norm_eps,
+                    rms_norm_type=config.rms_norm_type,
+                    decoder_layer=decoder_layer,
+                    float8_cfg=config.float8_cfg,
+                )
+            )
+        return MTPBlock(mtp_config=mtp_config, mtp_layers=mtp_layers)
 
     def build_layers(self, config: TransformerConfig) -> nn.ModuleDict:
         # 让 layers 是一个 nn.ModuleDict 方便做 pipeline parallel 的参数切分，
@@ -228,7 +337,7 @@ class Dense(BaseModel):
         num_recompute_layers = int(self.config.num_hidden_layers * self.fsdp_config.recompute_ratio)
 
         generator = torch.Generator()
-        generator.manual_seed(dist.get_rank())
+        generator.manual_seed(0)
         shuffled_layers_idxs = torch.randperm(len(self.layers), generator=generator)
 
         for layer_idx in tqdm(shuffled_layers_idxs, desc="[FSDP Sharding]"):
@@ -255,11 +364,35 @@ class Dense(BaseModel):
                 module=layer,
             )
 
-        for layer_cur, layer_next in zip(
-            list(self.layers.values())[:-1],
-            list(self.layers.values())[1:],
-        ):
-            layer_cur.set_modules_to_forward_prefetch([layer_next])  # type: ignore
+        if self.fsdp_config.reshard_after_forward:
+            for layer_cur, layer_next in zip(
+                list(self.layers.values())[:-1],
+                list(self.layers.values())[1:],
+            ):
+                layer_cur.set_modules_to_forward_prefetch([layer_next])  # type: ignore
+
+        if self.mtp_block is not None:
+            num_recompute_mtp_layers = int(len(self.mtp_block.layers) * self.fsdp_config.recompute_ratio)
+            for mtp_idx, mtp_layer in enumerate(self.mtp_block.layers):
+                if mtp_idx < num_recompute_mtp_layers:
+                    mtp_layer = checkpoint_wrapper(
+                        mtp_layer,
+                        checkpoint_impl=CheckpointImpl.REENTRANT,
+                        checkpoint_fn=pytree_reentrant_checkpoint,
+                    )
+                self.mtp_block.layers[mtp_idx] = mtp_layer
+                self._fully_shard(
+                    mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=self.fsdp_config.reshard_after_forward,
+                    offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+                    module=mtp_layer,
+                )
+
+            if self.fsdp_config.reshard_after_forward:
+                self.layers[str(self.config.num_hidden_layers - 1)].set_modules_to_forward_prefetch(  # type: ignore
+                    [self.mtp_block.layers[0]]
+                )
 
         self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
@@ -291,7 +424,8 @@ class Dense(BaseModel):
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
         )
-        self.set_modules_to_forward_prefetch([self.embed_tokens, self.layers["0"]])  # type: ignore
+        if self.fsdp_config.reshard_after_forward:
+            self.set_modules_to_forward_prefetch([self.embed_tokens, self.layers["0"]])  # type: ignore
 
         self._init_load_spec()
         self._to_empty_meta()
@@ -328,6 +462,36 @@ class Dense(BaseModel):
                 ),
             )
             self.fsdp_mesh = self.hsdp_mesh[f"{self.config.mesh_prefix}.hsdp_shard"]
+
+    def _forward_mtp(
+        self,
+        *,
+        layer_hidden_states: torch.Tensor,
+        seq_ctx: SequenceContext,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        loss_ctx: dict[str, BaseLossContext | list[BaseLossContext]] | None,
+    ) -> torch.Tensor | None:
+        if self.mtp_block is None or loss_ctx is None:
+            return None
+
+        mtp_loss_ctx_list = loss_ctx.get("mtp")
+        if not isinstance(mtp_loss_ctx_list, list):
+            return None
+
+        mtp_outputs = self.mtp_block(
+            layer_hidden_states,
+            embed_tokens_fn=self.embed_tokens,
+            position_embeddings=position_embeddings,
+            seq_ctx=seq_ctx,
+        )
+        mtp_losses = torch.tensor(0.0, device=DEVICE)
+        for mtp_output, mtp_ctx in zip(mtp_outputs, mtp_loss_ctx_list):
+            mtp_hidden_states = mtp_output[0]
+            mtp_loss, _ = self.lm_head(mtp_hidden_states, cast(MTPLossContext, mtp_ctx))
+            mtp_losses += mtp_loss
+
+        assert self.config.mtp_config is not None
+        return mtp_losses / len(mtp_loss_ctx_list) * self.config.mtp_config.loss_scaling_factor
 
     # TODO: Remove patch before opensource
     @staticmethod

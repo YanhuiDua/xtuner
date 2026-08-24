@@ -10,6 +10,7 @@ from .config import (
 )
 from .ftdp import FTDPTokenizeFnConfig, FtdpTokenizeFunction
 from .jsonl import JsonlDataset
+from .megatron_indexed import MegatronIndexedDataset, resolve_megatron_prefixes
 from .mllm_tokenize_fn import (
     InternS1VLTokenizeFnConfig,
     InternS1VLTokenizeFunction,
@@ -39,6 +40,8 @@ __all__ = [
     "PresetPackDataset",
     "PresetSampler",
     "JsonlDataset",
+    "MegatronIndexedDataset",
+    "resolve_megatron_prefixes",
     "CachableTokenizeFunction",
     "calculate_file_sha256",
     "calculate_xxhash",

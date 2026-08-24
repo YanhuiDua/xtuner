@@ -12,6 +12,19 @@ from .qwen3vl_text import Qwen3VLTextDense
 
 class Qwen3_5_VLTextDense(Qwen3VLTextDense):
     def to_hf_key_list(self, key: str) -> list[str]:
+        if key.startswith("mtp_block."):
+            key = key.removeprefix("mtp_block.")
+            key = re.sub(r"layers\.(\d+)\.decoder_layer\.", r"layers.\1.", key)
+            if ".enorm." in key:
+                key = re.sub(r"layers\.\d+\.enorm\.", "pre_fc_norm_embedding.", key)
+            elif ".hnorm." in key:
+                key = re.sub(r"layers\.\d+\.hnorm\.", "pre_fc_norm_hidden.", key)
+            elif ".final_layernorm." in key:
+                key = re.sub(r"layers\.\d+\.final_layernorm\.", "norm.", key)
+            if ".eh_proj." in key:
+                key = re.sub(r"layers\.\d+\.eh_proj\.", "fc.", key)
+            return ["mtp." + key]
+
         # Emit the standalone language-model layout (``model.<...>``). The VLM nesting
         # under ``model.language_model.`` is applied by the config's ``hf_key_mapping``
         # so this tower stays unaware of how it is composed into the VLM.
@@ -48,6 +61,7 @@ class Qwen3_5_VLTextDenseConfig(TransformerConfig):
             r"model\.language_model\.layers\.\d+\.linear_attn\.A_log",
         ],
     )
+    mudd_enabled: bool = False
 
     @computed_field
     def layers_type(self) -> list[Literal["full_attention", "linear_attention"]]:
@@ -70,6 +84,47 @@ class Qwen3_5_VLTextDense4BConfig(Qwen3_5_VLTextDenseConfig):
     rms_norm_eps: float = 1e-6
     hidden_act: str = "silu"
     tie_word_embeddings: bool = True
+    attention: MHAConfig = MHAConfig(
+        with_gate=True,
+        num_attention_heads=16,
+        num_key_value_heads=4,
+        head_dim=256,
+        qk_norm=True,
+        rms_norm_eps=1e-6,
+        rms_norm_type="zero_centered",
+    )
+    linear_attention: GatedDeltaNetConfig = GatedDeltaNetConfig(
+        num_value_heads=32,
+        num_key_heads=16,
+        key_head_dim=128,
+        value_head_dim=128,
+        conv_kernel_dim=4,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+    )
+    rope_parameters_cfg: RopeParametersConfig = Field(
+        default_factory=lambda: RopeParametersConfig(
+            rope_theta=10000000.0,
+            rope_type="qwen3_vl",
+            mrope_section=[11, 11, 10],
+            partial_rotary_factor=0.25,
+        )
+    )
+
+
+class Qwen3_5_VLTextDense9BConfig(Qwen3_5_VLTextDenseConfig):
+    """Qwen3.5-9B text-tower configuration."""
+
+    vocab_size: int = 248320
+    max_position_embeddings: int = 262144
+    pad_token_id: int | None = None
+    eos_token_id: int = 248044
+    num_hidden_layers: int = 32
+    hidden_size: int = 4096
+    intermediate_size: int = 12288
+    rms_norm_eps: float = 1e-6
+    hidden_act: str = "silu"
+    tie_word_embeddings: bool = False
     attention: MHAConfig = MHAConfig(
         with_gate=True,
         num_attention_heads=16,

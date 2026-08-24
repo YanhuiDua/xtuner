@@ -834,8 +834,9 @@ class Muon(Optimizer):
 
             step = group["step"]  # Keep as int
 
+            update_fn = adamw_update_foreach_async if group.get("adamw_foreach", True) else adamw_update_serial_async
             yield AsyncTask(
-                adamw_update_foreach_async(
+                update_fn(
                     X=maybe_to_local(params),
                     G=maybe_to_local(gradients),
                     M=maybe_to_local(momentums),
@@ -1420,6 +1421,24 @@ def adamw_update_foreach_async(
 ) -> Generator[None, None, None]:
     """Async wrapper around foreach AdamW update."""
     adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon)
+    yield
+
+
+def adamw_update_serial_async(
+    X: list[Tensor],
+    G: list[Tensor],
+    M: list[Tensor],
+    V: list[Tensor],
+    lr: Tensor,
+    beta1: Tensor,
+    beta2: Tensor,
+    weight_decay: Tensor,
+    step: int,
+    epsilon: float,
+) -> Generator[None, None, None]:
+    """Run AdamW fallback updates one parameter at a time to bound temporaries."""
+    for param, grad, momentum, variance in zip(X, G, M, V):
+        adamw_update(param, grad, momentum, variance, lr, beta1, beta2, weight_decay, step, epsilon)
     yield
 
 

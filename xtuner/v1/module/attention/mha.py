@@ -317,6 +317,7 @@ class MultiHeadAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         seq_ctx: SequenceContext,
+        mudd_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> AttnOutputs:
         """Forward pass for the Multi-Head Attention module.
 
@@ -338,17 +339,18 @@ class MultiHeadAttention(nn.Module):
         """
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
+        query_input, key_input, value_input = mudd_inputs if mudd_inputs is not None else (hidden_states,) * 3
 
         if self.with_gate:
             query_states, gate = torch.chunk(
-                self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
+                self.q_proj(query_input).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
             )
             gate = gate.reshape(*input_shape, -1)
         else:
             gate = None
-            query_states = self.q_proj(hidden_states).view(hidden_shape)  # [b, seq,  n_head, head_dim]
-        key_states = self.k_proj(hidden_states).view(hidden_shape)
-        value_states = self.v_proj(hidden_states).view(hidden_shape)
+            query_states = self.q_proj(query_input).view(hidden_shape)  # [b, seq,  n_head, head_dim]
+        key_states = self.k_proj(key_input).view(hidden_shape)
+        value_states = self.v_proj(value_input).view(hidden_shape)
 
         if self.qk_norm:
             query_states = self.q_norm(query_states)

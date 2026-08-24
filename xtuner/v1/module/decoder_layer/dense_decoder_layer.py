@@ -1,4 +1,4 @@
-from typing import Literal, TypedDict
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -12,27 +12,6 @@ from xtuner.v1.ops.act_fn import get_act_fn
 from xtuner.v1.utils import ForwardState
 
 from ..linear import build_linear
-
-
-class DenseDecoderLayerOutput(TypedDict):
-    """Per-micro-batch outputs of one :class:`DenseDecoderLayer` forward.
-
-    A dense layer only produces hidden states, but it reports them through the same keyed contract
-    as :class:`~xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer` so that the two
-    layer families stay interchangeable to their callers.
-    """
-
-    hidden_states: torch.Tensor
-
-
-class DenseDecoderLayerMicroBatchOutput(TypedDict):
-    """Outputs of one :class:`DenseDecoderLayer` forward over several micro-
-    batches.
-
-    Each field holds one entry per micro-batch, in input order.
-    """
-
-    hidden_states: list[torch.Tensor]
 
 
 class DenseMLP(nn.Module):
@@ -95,11 +74,11 @@ class DenseDecoderLayer(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor | list[torch.Tensor],
-        *,
+        *hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]],
         seq_ctx: SequenceContext | list[SequenceContext],
-    ) -> DenseDecoderLayerOutput | DenseDecoderLayerMicroBatchOutput:
+        mudd_streams: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Run equal-shaped training micro-batches in one layer invocation.
 
         Keeping the micro-batch loop inside the decoder layer lets outer FSDP and checkpointing
@@ -118,46 +97,56 @@ class DenseDecoderLayer(nn.Module):
             single tensor for a single ``hidden_states`` tensor, a per-micro-batch list for a list
             of them.
         """
-        if not isinstance(hidden_states, list):
+        if len(hidden_states) == 1:
             assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
             assert isinstance(seq_ctx, SequenceContext)
-            return {
-                "hidden_states": self._forward(
-                    hidden_states=hidden_states,
-                    position_embeddings=position_embeddings,
-                    seq_ctx=seq_ctx,
-                )
-            }
+            return self._forward(
+                hidden_states=hidden_states[0],
+                position_embeddings=position_embeddings,
+                seq_ctx=seq_ctx,
+                mudd_streams=mudd_streams,
+            )
 
+        if mudd_streams is not None:
+            raise NotImplementedError("MUDD does not support intra-layer micro-batching")
         assert isinstance(position_embeddings, list) and len(position_embeddings) == len(hidden_states)
         assert isinstance(seq_ctx, list) and len(seq_ctx) == len(hidden_states)
         assert all(hidden.shape == hidden_states[0].shape for hidden in hidden_states)
-        return {
-            "hidden_states": [
-                self._forward(
-                    hidden_states=hidden,
-                    position_embeddings=position_embedding,
-                    seq_ctx=context,
-                )
-                for hidden, position_embedding, context in zip(hidden_states, position_embeddings, seq_ctx)
-            ]
-        }
+        return tuple(
+            self._forward(
+                hidden_states=hidden,
+                position_embeddings=position_embedding,
+                seq_ctx=context,
+            )
+            for hidden, position_embedding, context in zip(hidden_states, position_embeddings, seq_ctx)
+        )
 
     def _forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         seq_ctx: SequenceContext,
+        mudd_streams: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
+        if mudd_streams is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            mudd_inputs = None
+        else:
+            mudd_q, mudd_k, mudd_v, residual = mudd_streams
+            mudd_inputs = (
+                self.input_layernorm(mudd_q),
+                self.input_layernorm(mudd_k),
+                self.input_layernorm(mudd_v),
+            )
+            hidden_states = mudd_inputs[0]
 
         # Self Attention
         attn_outputs: AttnOutputs = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             seq_ctx=seq_ctx,
+            mudd_inputs=mudd_inputs,
         )
         hidden_states = attn_outputs["projected_output"]
         hidden_states = residual + hidden_states
