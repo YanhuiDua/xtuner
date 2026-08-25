@@ -51,7 +51,7 @@ if optimizer == "muon":
     optim_cfg = MuonConfig(
         lr=float(os.environ.get("LR", "2e-5")),
         weight_decay=float(os.environ.get("WEIGHT_DECAY", "0.05")),
-        enable_all2all=False,
+        enable_all2all=_bool_env("MUON_ENABLE_ALL2ALL", False),
         adamw_foreach=_bool_env("MUON_ADAMW_FOREACH", False),
     )
 elif optimizer == "adamw":
@@ -116,6 +116,7 @@ trainer = TrainerConfig(
         ep_size=1,
         hsdp_sharding_size=hsdp_sharding_size,
         cpu_offload=False,
+        reshard_after_forward=_bool_env("RESHARD_AFTER_FORWARD", True),
         recompute_ratio=float(os.environ.get("RECOMPUTE_RATIO", "1.0")),
         checkpoint_preserve_rng_state=False,
         torch_compile=model_compile,

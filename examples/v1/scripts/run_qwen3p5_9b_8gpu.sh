@@ -6,8 +6,18 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 mkdir -p "$WORK_DIR" "$WORK_DIR/data"
 export DATA_FORMAT="${DATA_FORMAT:-jsonl}"
+export SEQ_LEN="${SEQ_LEN:-8192}"
 export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
 export TOTAL_STEP="${TOTAL_STEP:-3}"
+export RECOMPUTE_RATIO="${RECOMPUTE_RATIO:-0}"
+export RESHARD_AFTER_FORWARD="${RESHARD_AFTER_FORWARD:-0}"
+export MUDD_ENABLED="${MUDD_ENABLED:-0}"
+export MTP_ENABLED="${MTP_ENABLED:-1}"
+export OPTIMIZER="${OPTIMIZER:-muon}"
+export MODEL_COMPILE="${MODEL_COMPILE:-0}"
+export LOSS_CHUNK_SIZE="${LOSS_CHUNK_SIZE:-256}"
+export MUON_ENABLE_ALL2ALL="${MUON_ENABLE_ALL2ALL:-0}"
+export MUON_ADAMW_FOREACH="${MUON_ADAMW_FOREACH:-0}"
 
 if [[ "$DATA_FORMAT" == "jsonl" ]]; then
     export DATA_PATH="${DATA_PATH:-$WORK_DIR/data/synthetic.jsonl}"
