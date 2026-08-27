@@ -216,11 +216,13 @@ class LMHeadLossContext(BaseLossContext):
         shifted_labels = shifted_labels.flatten()
         loss_weight = loss_weight.flatten()
 
+<<<<<<< HEAD
+        # ``reduction="none"`` already returns zero for ignored targets, even
+        # when an entire chunk is ignored. Avoid checking the number of valid
+        # targets in Python because converting that CUDA scalar to ``bool``
+        # synchronizes every loss chunk with the host.
         loss = F.cross_entropy(logits, shifted_labels, reduction="none", ignore_index=self.loss_cfg.ignore_idx)
-        # Step 2.b in the loss calculation: sum the loss over all tokens.
-        # With reduction="none", ignored labels already contribute zero, even
-        # when the entire local rank is ignored, so no CUDA scalar branch is
-        # needed here.
+        # Step 2.b in the loss calculation: sum the loss over all tokens
         loss = (loss * loss_weight).sum()
 
         return loss, (logits, {})
