@@ -50,30 +50,25 @@ def roll_packed_tensor(
     # Normalize dim to a positive index
     dim = dim % tensor.dim()
 
-    rolled_tensor = tensor.clone()
+    shift_size = -shifts
+    seq_len = tensor.shape[dim]
+    if shift_size == 0 or seq_len == 0:
+        return tensor.clone()
 
-    # Roll each packed sequence independently within its boundaries
-    for i in range(len(cu_seq_lens) - 1):
-        start_idx = cu_seq_lens[i].item()
-        end_idx = cu_seq_lens[i + 1].item()
+    # A left roll over the whole packed tensor produces the same values as
+    # rolling every sequence independently except at sequence tails. Build the
+    # tail mask entirely on the tensor device so CUDA boundaries are never read
+    # back through ``.item()`` in the training hot path.
+    boundaries = cu_seq_lens[1:].to(device=tensor.device, dtype=torch.long)
+    positions = torch.arange(seq_len, device=tensor.device)
+    sequence_indices = torch.searchsorted(boundaries, positions, right=True).clamp_max(boundaries.numel() - 1)
+    sequence_ends = boundaries[sequence_indices]
+    boundary_mask = positions + shift_size >= sequence_ends
 
-        # Extract sequence slice along the specified dimension
-        seq_slice = tensor.narrow(dim, start_idx, end_idx - start_idx)  # type: ignore[arg-type]
-        rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dim)
-
-        # Fill the last |shifts| positions along dim to avoid information
-        # leakage across sequences.  For shifts=-1 the last 1 position is
-        # filled; for shifts=-2 the last 2 positions are filled, etc.
-        seq_len = end_idx - start_idx
-        fill_len = min(-shifts, seq_len)
-        fill_start = seq_len - fill_len
-        fill_slice = rolled_seq.narrow(dim, fill_start, fill_len)  # type: ignore[arg-type]
-        fill_slice.fill_(fill_value)
-
-        # Write back to the rolled tensor
-        rolled_tensor.narrow(dim, start_idx, end_idx - start_idx).copy_(rolled_seq)  # type: ignore[arg-type]
-
-    return rolled_tensor
+    mask_shape = [1] * tensor.dim()
+    mask_shape[dim] = seq_len
+    rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dim)
+    return rolled_tensor.masked_fill(boundary_mask.view(mask_shape), fill_value)
 
 
 def roll_sequence_context(
