@@ -14,12 +14,15 @@ def test_chunk_loss_handles_an_all_ignored_chunk_without_host_branch() -> None:
 
     hidden_states = torch.randn(1, 4, 3, requires_grad=True)
     head_weight = torch.randn(5, 3, requires_grad=True)
+    reference_hidden_states = hidden_states.detach().clone().requires_grad_()
+    reference_head_weight = head_weight.detach().clone().requires_grad_()
     loss, _ = loss_context(hidden_states, head_weight)
 
-    logits = F.linear(hidden_states, head_weight).float().flatten(0, 1)
+    logits = F.linear(reference_hidden_states, reference_head_weight).float().flatten(0, 1)
     reference = F.cross_entropy(logits, labels.flatten(), reduction="none", ignore_index=-100).sum() / 2
     torch.testing.assert_close(loss, reference)
 
     loss.backward()
-    assert torch.isfinite(hidden_states.grad).all()
-    assert torch.isfinite(head_weight.grad).all()
+    reference.backward()
+    torch.testing.assert_close(hidden_states.grad, reference_hidden_states.grad)
+    torch.testing.assert_close(head_weight.grad, reference_head_weight.grad)

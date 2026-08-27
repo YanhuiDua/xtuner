@@ -21,7 +21,7 @@ class ChunkLoss(torch.autograd.Function):
         device = hidden_states.device
         accumulated_loss = torch.tensor(0.0, device=device)
         grad_inputs = torch.empty_like(hidden_states)
-        grad_weight = torch.zeros_like(head_weight)
+        grad_weight = None
 
         grad_inputs_chunks = torch.split(grad_inputs, chunk_size, dim=1)
         hidden_states_chunks = torch.split(hidden_states, chunk_size, dim=1)
@@ -48,14 +48,22 @@ class ChunkLoss(torch.autograd.Function):
                     )
                 else:
                     chunk_grad_input = grad(chunk_loss, (hidden_states_chunk,), allow_unused=True)[0]
-                    chunk_grad_weight = torch.zeros_like(head_weight)
+                    chunk_grad_weight = None
 
             accumulated_loss.add_(chunk_loss)
             grad_inputs_chunk.copy_(chunk_grad_input)
-            grad_weight.add_(chunk_grad_weight)
+            if chunk_grad_weight is not None:
+                if grad_weight is None:
+                    # Reuse the first chunk gradient instead of zeroing a full
+                    # LM-head-sized buffer and immediately adding into it.
+                    grad_weight = chunk_grad_weight
+                else:
+                    grad_weight.add_(chunk_grad_weight)
 
             chunked_extra_info.append(extra_info)
 
+        if grad_weight is None:
+            grad_weight = torch.zeros_like(head_weight)
         ctx.save_for_backward(grad_inputs, grad_weight)
         return accumulated_loss, chunked_extra_info
 
