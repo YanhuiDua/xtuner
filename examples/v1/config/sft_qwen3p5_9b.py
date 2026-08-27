@@ -17,20 +17,35 @@ def _bool_env(name: str, default: bool) -> bool:
 
 
 def _profile_step() -> list[int] | None:
-    raw = os.environ.get("PROFILE_STEP", "")
+    # Trainer compares this with its zero-based pre-step counter, so 4 profiles
+    # the user-visible fifth optimization step.
+    raw = os.environ.get("PROFILE_STEP", "4")
     return [int(step.strip()) for step in raw.split(",") if step.strip()] or None
 
 
-work_dir = Path(os.environ["WORK_DIR"])
-data_path = Path(os.environ["DATA_PATH"])
+repo_root = Path(__file__).resolve().parents[3]
+work_dir = Path(
+    os.environ.get(
+        "WORK_DIR",
+        repo_root / "work_dirs/qwen3p5_9b_8gpu_gbs16_20steps_step5_trace_ncp_mtp_on",
+    )
+)
+data_path = Path(
+    os.environ.get(
+        "DATA_PATH",
+        "/mnt/shared-storage-user/llmrazor-share/geruijun/ncp-dataset/megatron_qwen35_8192/indexed",
+    )
+)
 seq_len = int(os.environ.get("SEQ_LEN", "8192"))
-global_batch_size = int(os.environ.get("GLOBAL_BATCH_SIZE", "8"))
+global_batch_size = int(os.environ.get("GLOBAL_BATCH_SIZE", "16"))
 hsdp_sharding_size_env = os.environ.get("HSDP_SHARDING_SIZE")
 hsdp_sharding_size = int(hsdp_sharding_size_env) if hsdp_sharding_size_env else None
 optimizer = os.environ.get("OPTIMIZER", "muon")
-data_format = os.environ.get("DATA_FORMAT", "jsonl")
+data_format = os.environ.get("DATA_FORMAT", "megatron_indexed")
 model_compile = _bool_env("MODEL_COMPILE", False)
 torch_compile_mode = os.environ.get("TORCH_COMPILE_MODE")
+loss_mode = os.environ.get("LOSS_MODE", "chunk")
+loss_reduction = os.environ.get("LOSS_REDUCTION", "square")
 
 if model_compile and torch_compile_mode:
     compile_cfg = {
@@ -107,9 +122,9 @@ trainer = TrainerConfig(
     optim_cfg=optim_cfg,
     lr_cfg=LRConfig(lr_type="constant", warmup_ratio=0.0, lr_min=0.0),
     loss_cfg=CELossConfig(
-        mode="chunk",
+        mode=loss_mode,
         chunk_size=int(os.environ.get("LOSS_CHUNK_SIZE", "256")),
-        loss_reduction="square",
+        loss_reduction=loss_reduction,
     ),
     fsdp_cfg=FSDPConfig(
         tp_size=1,
@@ -117,13 +132,14 @@ trainer = TrainerConfig(
         hsdp_sharding_size=hsdp_sharding_size,
         cpu_offload=False,
         reshard_after_forward=_bool_env("RESHARD_AFTER_FORWARD", True),
+        gradient_accumulation_no_sync=_bool_env("FSDP_GRAD_ACCUMULATION_NO_SYNC", False),
         recompute_ratio=float(os.environ.get("RECOMPUTE_RATIO", "1.0")),
         checkpoint_preserve_rng_state=False,
         torch_compile=model_compile,
     ),
     sp_size=1,
     global_batch_size=global_batch_size,
-    total_step=int(os.environ.get("TOTAL_STEP", "3")),
+    total_step=int(os.environ.get("TOTAL_STEP", "20")),
     checkpoint_interval=None,
     hf_interval=None,
     work_dir=work_dir,

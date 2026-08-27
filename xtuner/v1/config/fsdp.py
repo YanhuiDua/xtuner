@@ -15,6 +15,15 @@ class FSDPConfig(BaseModel):
     tp_size: Annotated[int, Parameter(help="Tensor parallel size")] = 1
     ep_size: Annotated[int, Parameter(help="Expert parallel size")] = 1
     reshard_after_forward: Annotated[bool, Parameter(help="Reshard model parameters after forward pass")] = True
+    gradient_accumulation_no_sync: Annotated[
+        bool,
+        Parameter(
+            help=(
+                "Skip FSDP2 gradient synchronization and backward reshard on "
+                "non-final gradient-accumulation micro-batches"
+            )
+        ),
+    ] = False
     recompute_ratio: Annotated[float, Parameter(help="Gradient checkpointing ratio for memory optimization")] = 1.0
     vision_recompute_ratio: Annotated[float, Parameter(help="Recompute ratio for vision modules")] = 1.0
     checkpoint_preserve_rng_state: Annotated[bool, Parameter(help="Preserve RNG state during checkpointing")] = True

@@ -2,23 +2,30 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-: "${WORK_DIR:?WORK_DIR must point to workspace-backed storage}"
+export WORK_DIR="${WORK_DIR:-$REPO_ROOT/work_dirs/qwen3p5_9b_8gpu_gbs16_20steps_step5_trace_ncp_mtp_on}"
 
 mkdir -p "$WORK_DIR" "$WORK_DIR/data"
-export DATA_FORMAT="${DATA_FORMAT:-jsonl}"
+export DATA_FORMAT="${DATA_FORMAT:-megatron_indexed}"
 export SEQ_LEN="${SEQ_LEN:-8192}"
-export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
-export TOTAL_STEP="${TOTAL_STEP:-3}"
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
+export TOTAL_STEP="${TOTAL_STEP:-20}"
+# Trainer checks this value against its zero-based pre-step counter, so 4
+# captures the user-visible Step 5/20.
+export PROFILE_STEP="${PROFILE_STEP:-4}"
 export RECOMPUTE_RATIO="${RECOMPUTE_RATIO:-0}"
 export RESHARD_AFTER_FORWARD="${RESHARD_AFTER_FORWARD:-0}"
+export FSDP_GRAD_ACCUMULATION_NO_SYNC="${FSDP_GRAD_ACCUMULATION_NO_SYNC:-1}"
 export MUDD_ENABLED="${MUDD_ENABLED:-0}"
 export MTP_ENABLED="${MTP_ENABLED:-1}"
 export OPTIMIZER="${OPTIMIZER:-muon}"
 export MODEL_COMPILE="${MODEL_COMPILE:-1}"
-export LOSS_CHUNK_SIZE="${LOSS_CHUNK_SIZE:-512}"
+export LOSS_MODE="${LOSS_MODE:-chunk}"
+export LOSS_REDUCTION="${LOSS_REDUCTION:-square}"
+export LOSS_CHUNK_SIZE="${LOSS_CHUNK_SIZE:-4096}"
 export MUON_ENABLE_ALL2ALL="${MUON_ENABLE_ALL2ALL:-1}"
 export MUON_ADAMW_FOREACH="${MUON_ADAMW_FOREACH:-1}"
 export XTUNER_MUON_USE_TRITON="${XTUNER_MUON_USE_TRITON:-1}"
+export XTUNER_USE_FA3=1
 
 if [[ "$DATA_FORMAT" == "jsonl" ]]; then
     export DATA_PATH="${DATA_PATH:-$WORK_DIR/data/synthetic.jsonl}"
@@ -37,8 +44,7 @@ with path.open("w", encoding="ascii") as file:
         file.write("\n")
 PY
 else
-    : "${DATA_PATH:?DATA_PATH is required when DATA_FORMAT=$DATA_FORMAT}"
-    export DATA_PATH
+    export DATA_PATH="${DATA_PATH:-/mnt/shared-storage-user/llmrazor-share/geruijun/ncp-dataset/megatron_qwen35_8192/indexed}"
 fi
 
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"

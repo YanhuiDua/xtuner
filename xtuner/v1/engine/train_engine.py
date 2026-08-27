@@ -231,8 +231,10 @@ class TrainEngine:
         )
         iters_per_step = self.grad_accumulation_steps(len(data_batches))
 
+        fsdp_accumulation_no_sync = self.fsdp_cfg.gradient_accumulation_no_sync and iters_per_step > 1
         if self._count == 0:
             log_rank0.info(f"grad_accumulation_steps: {iters_per_step}")
+            log_rank0.info(f"FSDP2 gradient accumulation no_sync: {fsdp_accumulation_no_sync}")
             self._count += 1
 
         micro_batch_iter = 0
@@ -241,31 +243,51 @@ class TrainEngine:
         data_batch_info = self.model.pre_micro_batch_forward(data_batches)
         total_loss = torch.tensor(0.0, device=DEVICE)
 
-        for i in range(0, len(data_batches), intra_layer_micro_batch):
-            ProberList.set_micro_batch_iter(micro_batch_iter)
-            micro_batch_iter += 1
-            data_batch = data_batches[i : i + intra_layer_micro_batch]
-            seq_ctx_list = [i["seq_ctx"] for i in data_batch]
-            loss_ctx_list = [i["loss_ctx"] for i in data_batch]
+        try:
+            if fsdp_accumulation_no_sync:
+                self.model.set_requires_gradient_sync(False)
+                self.model.set_reshard_after_backward(False)
 
-            if self.intra_layer_micro_batch == 1:
-                output = self.model(seq_ctx=seq_ctx_list[0], loss_ctx=loss_ctx_list[0])
-            else:
-                # For intra_layer_micro_batch > 1, we need to handle the data batches differently.
-                # Here we assume that the model can handle a list of seq_ctx and loss_ctx.
-                output = self.model(
-                    seq_ctx=seq_ctx_list,
-                    loss_ctx=loss_ctx_list,  # type: ignore[arg-type]
-                )
-            output.free_nongrad_feature()
+            for i in range(0, len(data_batches), intra_layer_micro_batch):
+                is_last_micro_batch = micro_batch_iter == iters_per_step - 1
+                if fsdp_accumulation_no_sync and is_last_micro_batch:
+                    # FSDP2's no_sync equivalent. Non-final micro-batches keep
+                    # full parameters and accumulate full gradients locally;
+                    # the final backward performs the only gradient reduction
+                    # and reshards parameters for the optimizer step.
+                    self.model.set_requires_gradient_sync(True)
+                    self.model.set_reshard_after_backward(True)
 
-            micro_batch_results.append(output)
+                ProberList.set_micro_batch_iter(micro_batch_iter)
+                micro_batch_iter += 1
+                data_batch = data_batches[i : i + intra_layer_micro_batch]
+                seq_ctx_list = [i["seq_ctx"] for i in data_batch]
+                loss_ctx_list = [i["loss_ctx"] for i in data_batch]
 
-            loss = self._get_total_loss(output)
-            loss.backward()
-            total_loss += loss.detach()
-            # call dump_forward_records after backward to record the recomputed activations
-            ProberList.after_micro_iter_forward()
+                if self.intra_layer_micro_batch == 1:
+                    output = self.model(seq_ctx=seq_ctx_list[0], loss_ctx=loss_ctx_list[0])
+                else:
+                    # For intra_layer_micro_batch > 1, we need to handle the data batches differently.
+                    # Here we assume that the model can handle a list of seq_ctx and loss_ctx.
+                    output = self.model(
+                        seq_ctx=seq_ctx_list,
+                        loss_ctx=loss_ctx_list,  # type: ignore[arg-type]
+                    )
+                output.free_nongrad_feature()
+
+                micro_batch_results.append(output)
+
+                loss = self._get_total_loss(output)
+                loss.backward()
+                total_loss += loss.detach()
+                # call dump_forward_records after backward to record the recomputed activations
+                ProberList.after_micro_iter_forward()
+        finally:
+            if fsdp_accumulation_no_sync:
+                # Keep the model reusable if forward/backward raises before the
+                # final micro-batch restores the normal FSDP2 state.
+                self.model.set_requires_gradient_sync(True)
+                self.model.set_reshard_after_backward(True)
 
         batch_forward_info = self.model.post_micro_batch_forward(micro_batch_results)
         return TrainStepInfo(total_loss=total_loss.item(), **data_batch_info, **batch_forward_info)
