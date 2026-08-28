@@ -167,10 +167,7 @@ class SyncProduceStrategyConfig(ProduceStrategyConfig):
         sync_weights_interval: int = 1,
         rollout_controller: "Optional[RolloutControllerProxy]" = None,
     ) -> "SyncProduceStrategy":
-        return SyncProduceStrategy(
-            is_valid_sample_fn=self.is_valid_sample_fn,
-            should_continue_fn=self.should_continue_fn,
-        )
+        return SyncProduceStrategy(should_continue_fn=self.should_continue_fn)
 
 
 class AsyncProduceStrategyConfig(ProduceStrategyConfig):

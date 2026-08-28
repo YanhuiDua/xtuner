@@ -116,7 +116,7 @@ class BaseProduceContext:
     task_name: str
     train_step: int
     model_step: int
-    progress: "ProduceProgress | DisaggProduceProgress"
+    progress: ProduceProgress | DisaggProduceProgress
     is_valid_sample_fn: IsValidSampleFn | None = None
     stale_threshold: int | None = None
     expired_groups_retryable: bool = True
@@ -185,7 +185,7 @@ class BaseProduceContext:
         if initial_status in (Status.FAILED, Status.FILTERED):
             # 失败样本和业务过滤样本都不进入 replay buffer。
             self.progress.add_produced(self.task_name, samples=len(group), tokens=produced_tokens)
-            self.progress.add_discarded(self.task_name, discard_status, samples=len(group))
+            self.progress.add_discarded(self.task_name, initial_status, samples=len(group))
             await release_and_discard_rollout_groups([group])
             return False
 
