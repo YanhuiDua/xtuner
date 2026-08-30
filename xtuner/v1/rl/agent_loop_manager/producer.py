@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from xtuner.v1.data_proto.rl_data import Status
+from xtuner.v1.rl.agent_loop import IsValidSampleFn
 from xtuner.v1.rl.utils import create_task
 from xtuner.v1.utils import get_logger
 
@@ -125,12 +126,15 @@ class ProduceStrategyConfig(ABC, BaseModel):
     when it should stop producing samples for the current training step.
 
     Args:
+        is_valid_sample_fn (IsValidSampleFn | None): Deprecated compatibility
+            field. RLTrainer moves it to the task's agent loop configuration.
         should_continue_fn (ShouldContinueFn): Function used to decide whether
             production should continue after a group is processed. Defaults to
             ``default_should_continue_fn``.
     """
 
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    is_valid_sample_fn: IsValidSampleFn | None = None
     should_continue_fn: ShouldContinueFn = default_should_continue_fn
 
     @abstractmethod

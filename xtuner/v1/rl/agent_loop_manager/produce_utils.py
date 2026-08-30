@@ -96,11 +96,6 @@ def calculate_stale_threshold(max_staleness: int, sync_weights_interval: int) ->
 
 
 @runtime_checkable
-class IsValidSampleFn(Protocol):
-    def __call__(self, samples: list[RolloutState]) -> bool: ...
-
-
-@runtime_checkable
 class ShouldContinueFn(Protocol):
     def __call__(self, completed_count: int, batch_size: int, **kwargs) -> bool: ...
 
@@ -117,7 +112,6 @@ class BaseProduceContext:
     train_step: int
     model_step: int
     progress: ProduceProgress | DisaggProduceProgress
-    is_valid_sample_fn: IsValidSampleFn | None = None
     stale_threshold: int | None = None
     expired_groups_retryable: bool = True
     token_stale_threshold: int | None = None
@@ -149,13 +143,11 @@ class BaseProduceContext:
         if isinstance(self.agent_loop, ray.actor.ActorHandle):
             result = await self.agent_loop.collect_rollout_group.remote(
                 rollout_state,
-                is_valid_sample_func=self.is_valid_sample_fn,
                 enable_partial_rollout=enable_partial_rollout,
             )
         else:
             result = await self.agent_loop.collect_rollout_group(
                 rollout_state,
-                is_valid_sample_func=self.is_valid_sample_fn,
                 enable_partial_rollout=enable_partial_rollout,
             )
         elapsed = time.perf_counter() - start
@@ -175,11 +167,14 @@ class BaseProduceContext:
             rewards_sum = 0.0
             rewards_count = 0
             for item in group:
+                if item.reward is None or "score" not in item.reward:
+                    logger.warning(
+                        f"Missing reward score in item (rollout_id: {item.rollout_id}) of generated group for task {self.task_name}. This item will be skipped in reward statistics."
+                    )
+                    continue
                 # TODO: 在 agent 存在一拆多的情况下，这个 raw reward 统计会不准，但是考虑到在这区分有点 hard code，应该暂时不处理
-                reward = item.reward.get("score") if item.reward is not None else None
-                if reward is not None:
-                    rewards_sum += float(reward)
-                    rewards_count += 1
+                rewards_sum += float(item.reward["score"])
+                rewards_count += 1
             self.progress.add_raw_rewards(self.task_name, rewards_sum, rewards_count)
 
         if initial_status in (Status.FAILED, Status.FILTERED):
@@ -262,7 +257,6 @@ class _TaskRunner:
     agent_loop: AgentLoopSpec
     produce_strategy: Any
     sampler: Sampler
-    is_valid_sample_fn: IsValidSampleFn | None = None
     weight: float = 1.0
     order: int = 0
 

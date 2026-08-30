@@ -6,7 +6,6 @@ import importlib
 import json
 import traceback
 import uuid
-from collections.abc import Callable
 from typing import Any, Literal
 
 from lagent.utils import create_object
@@ -19,7 +18,7 @@ from xtuner.v1.rl.utils import create_task
 
 from ...rollout.chat_template import canonicalize_messages_for_chat_template
 from ...rollout.trace_store import get_store
-from ..agent_loop import AgentLoop, AgentLoopConfig
+from ..agent_loop import AgentLoop, AgentLoopConfig, maybe_filter_invalid_sample
 from .schemas import AgentRolloutItem, RolloutStatus
 
 
@@ -233,17 +232,11 @@ class AgentInSandboxLoop(AgentLoop):
     async def collect_rollout_group(
         self,
         rollout_state: list[RolloutState],
-        *,
-        is_valid_sample_func: Callable[[list[RolloutState]], bool] | None = None,
         **kwargs,
     ) -> list[RolloutState]:
         """Generate agent traces and score every completed segment."""
         group = await self.generate_group(rollout_state, **kwargs)
         if get_group_status(group) != Status.COMPLETED:
-            return group
-        if is_valid_sample_func is not None and not is_valid_sample_func(group):
-            for state in group:
-                state.status = Status.FILTERED
             return group
         if not self.teacher_clients:
             return group
@@ -273,7 +266,9 @@ class AgentInSandboxLoop(AgentLoop):
         generated_samples = asyncio.gather(*pending_tasks)
         sample_groups = await generated_samples
         samples = [sample for sample_group in sample_groups for sample in sample_group]
-        return _drop_failed_train_samples(samples, self.mode)
+        samples = _drop_failed_train_samples(samples, self.mode)
+        # Keep sample validation as the final group-generation step.
+        return maybe_filter_invalid_sample(samples, self.is_valid_sample_fn, self.logger)
 
     # NOTE: A single sandbox session may yield multiple trainable segments, so this returns a list
     # rather than the base class's single RolloutState. The base contract is never exercised for

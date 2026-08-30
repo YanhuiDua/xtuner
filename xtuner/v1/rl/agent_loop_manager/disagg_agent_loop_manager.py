@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 from xtuner.v1.data_proto.rl_data import Status
-from xtuner.v1.rl.agent_loop import AgentLoopConfig
+from xtuner.v1.rl.agent_loop import AgentLoopConfig, IsValidSampleFn
 from xtuner.v1.rl.distillation import DistillationConfig
 from xtuner.v1.rl.judger import ComposedJudgerConfig, JudgerConfig, build_judger
 from xtuner.v1.rl.replay_buffer import ReplayBuffer
@@ -28,7 +28,6 @@ from .produce_utils import (
     _MANAGER_STATE_PATH,
     _STATUS_POLL_INTERVAL_S,
     _TASK_CHECKPOINT_DIR,
-    IsValidSampleFn,
     ProduceBatchResult,
     ProduceBatchStatus,
     _TaskRunner,
@@ -52,7 +51,7 @@ class DisaggTaskSpecConfig(BaseModel):
     weight: float = Field(default=1.0, ge=0.0)
     agent_loop_config: AgentLoopConfig
     judger_config: JudgerConfig | ComposedJudgerConfig | None = None
-    filter_func: IsValidSampleFn | None = None
+    is_valid_sample_fn: IsValidSampleFn | None = None
     produce_strategy_config: DisaggProduceStrategyConfig = DisaggAsyncProduceStrategyConfig()
     sampler_config: SamplerConfig
 
@@ -84,11 +83,15 @@ class DisaggAgentLoopManagerConfig(BaseModel):
                 raise ValueError(f"Duplicate task_name found in DisaggAgentLoopManagerConfig: {task_cfg.task_name}")
             seen_task_names.add(task_cfg.task_name)
 
+            distillation_kwargs = (
+                {"distillation_config": distillation_config} if distillation_config is not None else {}
+            )
             agent_loop = task_cfg.agent_loop_config.build(
                 rollout_controller=rollout_controller,
                 judger=build_judger(task_cfg.judger_config) if task_cfg.judger_config is not None else None,
                 logger=logger,
-                distillation_config=distillation_config,
+                is_valid_sample_fn=task_cfg.is_valid_sample_fn,
+                **distillation_kwargs,
             )
             produce_strategy = task_cfg.produce_strategy_config.build(
                 sync_weights_interval=sync_weights_interval,
@@ -101,7 +104,6 @@ class DisaggAgentLoopManagerConfig(BaseModel):
                     agent_loop=agent_loop,
                     produce_strategy=produce_strategy,
                     sampler=sampler,
-                    is_valid_sample_fn=task_cfg.filter_func,
                     weight=task_cfg.weight,
                     order=order,
                 )
@@ -246,7 +248,6 @@ class DisaggAgentLoopManager:
                         model_step=self._model_step,
                         progress=progress,
                         update_event=self._update_event,
-                        is_valid_sample_fn=task.is_valid_sample_fn,
                         stale_threshold=task.stale_threshold,
                         token_stale_threshold=task.token_stale_threshold,
                         expired_groups_retryable=task.expired_groups_retryable,
@@ -276,7 +277,6 @@ class DisaggAgentLoopManager:
                 model_step=self._model_step,
                 progress=self._produce_progress,
                 update_event=self._update_event,
-                is_valid_sample_fn=task.is_valid_sample_fn,
                 stale_threshold=task.stale_threshold,
                 token_stale_threshold=task.token_stale_threshold,
                 expired_groups_retryable=task.expired_groups_retryable,
