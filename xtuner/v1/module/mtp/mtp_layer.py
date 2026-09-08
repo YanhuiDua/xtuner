@@ -9,7 +9,6 @@ from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.module import RMSNorm
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
     MoEDecoderLayerMicroBatchOutput,
-    MoEDecoderLayerOutput,
 )
 from xtuner.v1.module.linear import build_linear
 

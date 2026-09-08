@@ -1436,7 +1436,8 @@ def adamw_update_serial_async(
     step: int,
     epsilon: float,
 ) -> Generator[None, None, None]:
-    """Run AdamW fallback updates one parameter at a time to bound temporaries."""
+    """Run AdamW fallback updates one parameter at a time to bound
+    temporaries."""
     for param, grad, momentum, variance in zip(X, G, M, V):
         adamw_update(param, grad, momentum, variance, lr, beta1, beta2, weight_decay, step, epsilon)
     yield

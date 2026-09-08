@@ -39,9 +39,8 @@ class MFUConfig(BaseModel):
 def get_peak_tflops_per_gpu(device_name: str) -> float:
     """Return dense BF16/FP16 Tensor Core peak throughput for one GPU.
 
-    The lookup follows TorchTitan's runtime device-name based MFU accounting.
-    Unknown devices fail explicitly instead of silently using another GPU's
-    peak, because an incorrect denominator produces a plausible but invalid MFU.
+    The lookup follows TorchTitan's runtime device-name based MFU accounting. Unknown devices fail explicitly instead
+    of silently using another GPU's peak, because an incorrect denominator produces a plausible but invalid MFU.
     """
 
     normalized_name = device_name.casefold()
@@ -122,14 +121,12 @@ class MFUMetrics:
 class ConceptOlmoFlopsEstimator:
     """Analytical FLOPs estimator for ConceptLM V2.2 VQ models.
 
-    The estimator counts GEMMs, causal/sliding attention matrix products, and
-    the learned depth/residual routing reductions. A multiply-add is two FLOPs.
-    Embedding lookups, normalization, activations, softmax, elementwise ops, and
-    communication are omitted, matching the usual transformer MFU convention.
+    The estimator counts GEMMs, causal/sliding attention matrix products, and the learned depth/residual routing
+    reductions. A multiply-add is two FLOPs. Embedding lookups, normalization, activations, softmax, elementwise ops,
+    and communication are omitted, matching the usual transformer MFU convention.
 
-    The requested sequence length represents one unpacked document. Packed
-    batches with multiple document boundaries do less attention work and need
-    their individual lengths for an exact attention count.
+    The requested sequence length represents one unpacked document. Packed batches with multiple document boundaries do
+    less attention work and need their individual lengths for an exact attention count.
     """
 
     def __init__(self, model_config: ConceptOlmoConfigLike):
@@ -146,10 +143,7 @@ class ConceptOlmoFlopsEstimator:
 
         keys_per_query = left_window + 1
         warmup_queries = min(sequence_length, keys_per_query)
-        return (
-            warmup_queries * (warmup_queries + 1) // 2
-            + (sequence_length - warmup_queries) * keys_per_query
-        )
+        return warmup_queries * (warmup_queries + 1) // 2 + (sequence_length - warmup_queries) * keys_per_query
 
     @classmethod
     def _attention_forward_flops(
@@ -160,14 +154,10 @@ class ConceptOlmoFlopsEstimator:
     ) -> int:
         # QK^T and attention-value each cost two FLOPs per attended hidden
         # element, hence four FLOPs per causal attention pair.
-        return (
-            4 * cls._causal_attention_pairs(sequence_length, left_window) * hidden_size
-        )
+        return 4 * cls._causal_attention_pairs(sequence_length, left_window) * hidden_size
 
     @staticmethod
-    def _route_forward_flops(
-        sequence_length: int, hidden_size: int, num_sources: int
-    ) -> int:
+    def _route_forward_flops(sequence_length: int, hidden_size: int, num_sources: int) -> int:
         if num_sources <= 0:
             return 0
         # w1: h -> r, w2: r -> r, followed by the weighted reduction of r
@@ -178,14 +168,10 @@ class ConceptOlmoFlopsEstimator:
             + 2 * sequence_length * num_sources * hidden_size
         )
 
-    def _transformer_stack_forward_flops(
-        self, sequence_length: int, num_layers: int
-    ) -> int:
+    def _transformer_stack_forward_flops(self, sequence_length: int, num_layers: int) -> int:
         config = self.config
         hidden_size = config.hidden_size
-        linear_parameters_per_layer = (
-            4 * hidden_size**2 + 3 * hidden_size * config.intermediate_size
-        )
+        linear_parameters_per_layer = 4 * hidden_size**2 + 3 * hidden_size * config.intermediate_size
         linear_flops_per_layer = 2 * sequence_length * linear_parameters_per_layer
 
         total = 0
@@ -193,16 +179,12 @@ class ConceptOlmoFlopsEstimator:
             is_full_attention = (layer_idx + 1) % config.window_attn_skip_freq == 0
             left_window = None if is_full_attention else config.window_size[0]
             total += linear_flops_per_layer
-            total += self._attention_forward_flops(
-                sequence_length, hidden_size, left_window
-            )
+            total += self._attention_forward_flops(sequence_length, hidden_size, left_window)
         return total
 
     def _depth_route_forward_flops(self, sequence_length: int, num_layers: int) -> int:
         return sum(
-            self._route_forward_flops(
-                sequence_length, self.config.hidden_size, layer_idx + 2
-            )
+            self._route_forward_flops(sequence_length, self.config.hidden_size, layer_idx + 2)
             for layer_idx in range(num_layers)
         )
 
@@ -236,13 +218,10 @@ class ConceptOlmoFlopsEstimator:
             concept_length,
             config.concept_special_layers,
         )
-        concept_route_flops += (
-            config.concept_special_layers
-            * self._route_forward_flops(
-                concept_length,
-                hidden_size,
-                config.concept_encoder_layers - 1,
-            )
+        concept_route_flops += config.concept_special_layers * self._route_forward_flops(
+            concept_length,
+            hidden_size,
+            config.concept_encoder_layers - 1,
         )
         concept_prediction_flops = (
             2
@@ -310,17 +289,13 @@ class ConceptOlmoMFUCalculator:
         self.device_name = device_name
         if mfu_config.peak_tflops_per_gpu is None:
             if device_name is None:
-                raise ValueError(
-                    "device_name is required when peak_tflops_per_gpu is not configured"
-                )
+                raise ValueError("device_name is required when peak_tflops_per_gpu is not configured")
             self.peak_tflops_per_gpu = get_peak_tflops_per_gpu(device_name)
             self.peak_tflops_source = "auto"
         else:
             self.peak_tflops_per_gpu = mfu_config.peak_tflops_per_gpu
             self.peak_tflops_source = "configured"
-        self.breakdown = ConceptOlmoFlopsEstimator(model_config).estimate(
-            mfu_config.sequence_length
-        )
+        self.breakdown = ConceptOlmoFlopsEstimator(model_config).estimate(mfu_config.sequence_length)
 
     @property
     def model_flops_per_step(self) -> int:

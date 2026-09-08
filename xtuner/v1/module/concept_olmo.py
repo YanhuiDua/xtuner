@@ -68,9 +68,8 @@ class DepthDD(nn.Module):
 class _CompiledRouteReduce(torch.autograd.Function):
     """Use complementary kernels for the two directions of route reduction.
 
-    The fixed-length addcmul chain is substantially faster than a Triton
-    reduction in forward, while spelling out the analytical backward avoids
-    the slice/select-heavy graph produced by autograd for that chain.
+    The fixed-length addcmul chain is substantially faster than a Triton reduction in forward, while spelling out the
+    analytical backward avoids the slice/select-heavy graph produced by autograd for that chain.
     """
 
     @staticmethod
@@ -257,7 +256,7 @@ class EncoderStageGroup(nn.Sequential):
     def __init__(self, stages: list[tuple[int, EncoderStage]]):
         super().__init__(OrderedDict((str(index), stage) for index, stage in stages))
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -283,7 +282,7 @@ class ConceptStageGroup(nn.Sequential):
     def __init__(self, stages: list[tuple[int, ConceptStage]]):
         super().__init__(OrderedDict((str(index), stage) for index, stage in stages))
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -312,7 +311,7 @@ class DecoderStageGroup(nn.Sequential):
         super().__init__(OrderedDict((str(index), stage) for index, stage in stages))
         self.stage_indices = tuple(index for index, _ in stages)
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],

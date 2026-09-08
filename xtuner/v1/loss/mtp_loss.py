@@ -162,23 +162,31 @@ class MTPLossContext(LMHeadLossContext):
         hidden_states: torch.Tensor,
         head_weight: torch.Tensor,
         head_bias: torch.Tensor | None = None,
+        valid_vocab_size: int | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, dict[str, Any]]]:
         if self.loss_cfg.detach_mtp_lm_head_weight:
             head_weight = head_weight.detach()
             head_bias = head_bias.detach() if head_bias is not None else None
         # Dispatch to eager_mode/chunk_mode via base class, which calls loss_fn per chunk
-        return super().forward(hidden_states, head_weight, head_bias)
+        return super().forward(hidden_states, head_weight, head_bias, valid_vocab_size=valid_vocab_size)
 
-    def loss_fn(
+    def loss_fn(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
         head_weight: torch.Tensor,
         head_bias: torch.Tensor | None,
         loss_kwargs: MTPLossKwargs,  # type: ignore[override]
+        valid_vocab_size: int | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, dict[str, Any]]]:
         if loss_kwargs.logprobs is not None:
             return self._kl_loss_fn(hidden_states, head_weight, head_bias, loss_kwargs)
-        return super().loss_fn(hidden_states, head_weight, head_bias, loss_kwargs)
+        return super().loss_fn(
+            hidden_states,
+            head_weight,
+            head_bias,
+            loss_kwargs,
+            valid_vocab_size=valid_vocab_size,
+        )
 
     def _kl_loss_fn(
         self,

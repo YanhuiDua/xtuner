@@ -24,6 +24,7 @@ from xtuner.v1.utils import get_logger, is_local_rank0, log_rank0
 from xtuner.v1.utils.executor import SharedPoolExecutor
 
 from .jsonl import JsonlDataset
+from .megatron_indexed import MegatronIndexedDataset
 from .utils import (
     _get_mmap_dir,
     ndarray_to_mmap,
@@ -314,7 +315,7 @@ def get_pack_infos_by_expand_soft_split(
 class ExpandSoftPackDataset(_LegacySoftPackDataset):
     def __init__(
         self,
-        datasets: Sequence[JsonlDataset],
+        datasets: Sequence[JsonlDataset | MegatronIndexedDataset],
         pack_max_length: int = 2048,
         global_pack: bool = False,
         pack_extra_buffer_size: int = 1000,
@@ -666,7 +667,7 @@ class HardPackDataset(_LegacySoftPackDataset):
 class MLLMPretrainHybridPackDataset(TorchDataset):
     def __init__(
         self,
-        datasets: list[JsonlDataset],
+        datasets: Sequence[JsonlDataset | MegatronIndexedDataset],
         pack_max_length: int = 2048,
         global_pack: bool = False,
         pack_workers: int = 8,

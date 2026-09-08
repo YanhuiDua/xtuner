@@ -19,6 +19,7 @@ from xtuner.v1.utils import get_logger, log_rank0, profile_time
 
 from .data_item import DataItem, LongTextDataItem
 from .jsonl import JsonlDataset
+from .megatron_indexed import MegatronIndexedDataset
 from .utils import get_longest
 
 
@@ -76,7 +77,7 @@ class PresetPackDataset(tud.Dataset):
 
     def __init__(
         self,
-        datasets: list[JsonlDataset],
+        datasets: list[JsonlDataset | MegatronIndexedDataset],
         pack_config_path: str,
         pack_max_length: int,
         short_pack_strategy: Literal["error", "padding"] = "error",

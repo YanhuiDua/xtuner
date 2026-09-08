@@ -186,12 +186,10 @@ class GatedDeltaNet(nn.Module):
         self.in_proj_b = build_linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = build_linear(self.hidden_size, self.num_v_heads, bias=False)
 
-    def get_muon_split_sizes(self) -> dict[nn.Parameter, tuple[int, ...]]:
-        """Return the logical Q, K, and V row blocks for MuonSplit."""
-
     @torch.no_grad()
     def init_extra_weights(self) -> set[str]:
-        """Initialize Qwen3.5 GatedDeltaNet parameters that are not standard weights or biases."""
+        """Initialize Qwen3.5 GatedDeltaNet parameters that are not standard
+        weights or biases."""
 
         def init_a_log(param: torch.Tensor) -> None:
             nn.init.uniform_(param, a=0.0, b=16.0)
@@ -209,7 +207,8 @@ class GatedDeltaNet(nn.Module):
         return {"A_log", "dt_bias"}
 
     def get_muon_split_sizes(self) -> dict[nn.Parameter, tuple[int, ...]]:
-        """Return the logical Q, K, and V row blocks for Muon orthogonalization.
+        """Return the logical Q, K, and V row blocks for Muon
+        orthogonalization.
 
         Returns:
             dict[nn.Parameter, tuple[int, ...]]: Q, K, and V row split sizes keyed by the fused parameter.
@@ -527,6 +526,7 @@ class GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         seq_ctx: SequenceContext,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        mudd_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> AttnOutputs: ...
 
     __call__ = nn.Module.__call__

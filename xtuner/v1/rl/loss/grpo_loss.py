@@ -138,12 +138,13 @@ class GRPOLossContext(BaseRLLossContext):
             loss_kwargs.global_grad_tokens = global_grad_tokens
         return loss_ctx_list
 
-    def loss_fn(
+    def loss_fn(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor,
         head_weight: torch.Tensor,
         head_bias: torch.Tensor | None,
         loss_kwargs: GRPOLossKwargs,
+        valid_vocab_size: int | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, dict[str, Any]]]:
         """Step 2.a and 2.b in the loss calculation in
         xtuner/v1/loss/base_loss_ctx.py."""

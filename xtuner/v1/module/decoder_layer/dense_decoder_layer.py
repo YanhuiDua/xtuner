@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, TypedDict
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,18 @@ from xtuner.v1.ops.act_fn import get_act_fn
 from xtuner.v1.utils import ForwardState
 
 from ..linear import build_linear
+
+
+class DenseDecoderLayerOutput(TypedDict):
+    """Single-input output contract used by decoder-layer adapters."""
+
+    hidden_states: torch.Tensor
+
+
+class DenseDecoderLayerMicroBatchOutput(TypedDict):
+    """Multi-input output contract used by decoder-layer adapters."""
+
+    hidden_states: list[torch.Tensor]
 
 
 class DenseMLP(nn.Module):

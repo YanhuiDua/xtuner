@@ -1,6 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from pathlib import Path
-from typing import Self, TypedDict, cast
+from typing import Any, Self, TypedDict, cast
 
 import torch
 import torch.distributed as dist
@@ -160,12 +160,12 @@ class Dense(BaseModel):
 
         return DenseModelOutputs(**output)
 
-    def build_loss_ctx_batch(
+    def build_loss_ctx_batch(  # type: ignore[override]
         self,
         data_batch: list[dict],
         sp_mesh: DeviceMesh | None = None,
-    ) -> list[DenseLossContextDict]:  # type: ignore[override]
-        res: list[dict] = super().build_loss_ctx_batch(data_batch, sp_mesh)
+    ) -> list[DenseLossContextDict]:
+        res: list[dict[str, Any]] = super().build_loss_ctx_batch(data_batch, sp_mesh)
         cu_seq_lens_list = [data["seq_ctx"].cu_seq_lens_k for data in data_batch]
 
         if self.config.mtp_config is not None:
@@ -177,12 +177,13 @@ class Dense(BaseModel):
                 )
                 mtp_loss_ctx_list = self._build_loss_ctx(mtp_loss_cfg, data_batch, sp_mesh)
                 if mtp_loss_ctx_list is not None:
-                    mtp_loss_ctx_list = MTPLossContext.build_batches(
-                        cast(list[MTPLossContext], mtp_loss_ctx_list),
+                    mtp_ctx_list = cast(list[MTPLossContext], mtp_loss_ctx_list)
+                    MTPLossContext.build_batches(
+                        cast(Any, mtp_ctx_list),
                         cu_seq_lens_list=cu_seq_lens_list,
                         sp_mesh=sp_mesh,
                     )
-                    for i, mtp_loss_ctx in enumerate(mtp_loss_ctx_list):
+                    for i, mtp_loss_ctx in enumerate(mtp_ctx_list):
                         res[i].setdefault("mtp", []).append(mtp_loss_ctx)
 
         for loss_ctx_dict in res:
@@ -375,10 +376,9 @@ class Dense(BaseModel):
             num_recompute_mtp_layers = int(len(self.mtp_block.layers) * self.fsdp_config.recompute_ratio)
             for mtp_idx, mtp_layer in enumerate(self.mtp_block.layers):
                 if mtp_idx < num_recompute_mtp_layers:
-                    mtp_layer = checkpoint_wrapper(
+                    mtp_layer = apply_activation_checkpointing(
                         mtp_layer,
-                        checkpoint_impl=CheckpointImpl.REENTRANT,
-                        checkpoint_fn=pytree_reentrant_checkpoint,
+                        preserve_rng_state=checkpoint_preserve_rng_state,
                     )
                 self.mtp_block.layers[mtp_idx] = mtp_layer
                 self._fully_shard(
