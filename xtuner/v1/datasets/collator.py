@@ -150,9 +150,7 @@ def single_sequence_sft_llm_collator(
     """
 
     if not pack_to_max_length:
-        raise ValueError(
-            "single_sequence_sft_llm_collator requires pack_to_max_length=True"
-        )
+        raise ValueError("single_sequence_sft_llm_collator requires pack_to_max_length=True")
 
     ret: list[ColateItem] = []
     for instance in instances:

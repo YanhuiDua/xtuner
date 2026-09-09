@@ -35,7 +35,7 @@ class GLM52DenseDecoderLayer(DenseDecoderLayer):
     """Dense decoder layer that threads GLM-5.2 DSA IDs explicitly."""
 
     @override
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor | list[torch.Tensor],
         *,
@@ -127,7 +127,7 @@ class GLM52MoEDecoderLayer(MoEDecoderLayer):
     """MoE decoder layer that threads GLM-5.2 DSA IDs explicitly."""
 
     @override
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor | list[torch.Tensor],
         *,

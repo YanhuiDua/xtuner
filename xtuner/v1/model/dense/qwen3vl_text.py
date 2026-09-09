@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.loss import BaseLossContext
 from xtuner.v1.model.base import ModelOutputs
+
 from .dense import DenseModelOutputs
 from .qwen3 import Qwen3Dense, Qwen3Dense4BConfig, Qwen3Dense8BConfig
 

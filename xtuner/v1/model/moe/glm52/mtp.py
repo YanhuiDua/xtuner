@@ -21,7 +21,7 @@ class GLM52MTPLayer(MTPLayer):
     """MTP layer whose wrapped GLM-5.2 decoder consumes explicit DSA IDs."""
 
     @override
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         hidden_states: torch.Tensor | list[torch.Tensor],
         *,

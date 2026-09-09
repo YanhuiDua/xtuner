@@ -472,6 +472,7 @@ class MultiHeadAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         seq_ctx: SequenceContext,
+        mudd_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> AttnOutputs: ...
 
     __call__ = nn.Module.__call__

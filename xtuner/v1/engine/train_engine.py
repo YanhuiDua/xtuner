@@ -245,8 +245,9 @@ class TrainEngine:
 
         try:
             if fsdp_accumulation_no_sync:
-                self.model.set_requires_gradient_sync(False)
-                self.model.set_reshard_after_backward(False)
+                model = cast(Any, self.model)
+                model.set_requires_gradient_sync(False)
+                model.set_reshard_after_backward(False)
 
             for i in range(0, len(data_batches), intra_layer_micro_batch):
                 is_last_micro_batch = micro_batch_iter == iters_per_step - 1
@@ -255,8 +256,9 @@ class TrainEngine:
                     # full parameters and accumulate full gradients locally;
                     # the final backward performs the only gradient reduction
                     # and reshards parameters for the optimizer step.
-                    self.model.set_requires_gradient_sync(True)
-                    self.model.set_reshard_after_backward(True)
+                    model = cast(Any, self.model)
+                    model.set_requires_gradient_sync(True)
+                    model.set_reshard_after_backward(True)
 
                 ProberList.set_micro_batch_iter(micro_batch_iter)
                 micro_batch_iter += 1
@@ -286,8 +288,9 @@ class TrainEngine:
             if fsdp_accumulation_no_sync:
                 # Keep the model reusable if forward/backward raises before the
                 # final micro-batch restores the normal FSDP2 state.
-                self.model.set_requires_gradient_sync(True)
-                self.model.set_reshard_after_backward(True)
+                model = cast(Any, self.model)
+                model.set_requires_gradient_sync(True)
+                model.set_reshard_after_backward(True)
 
         batch_forward_info = self.model.post_micro_batch_forward(micro_batch_results)
         return TrainStepInfo(total_loss=total_loss.item(), **data_batch_info, **batch_forward_info)
@@ -325,9 +328,7 @@ class TrainEngine:
                     for p in group["params"]
                 }
                 clip_grads = [
-                    cast(DTensor, p.grad)
-                    for p in trainable_params
-                    if id(p) in clip_param_ids and p.grad is not None
+                    cast(DTensor, p.grad) for p in trainable_params if id(p) in clip_param_ids and p.grad is not None
                 ]
                 clip_all_grads = len(clip_param_ids) == len(trainable_params) and clip_param_ids == {
                     id(p) for p in trainable_params
@@ -352,11 +353,7 @@ class TrainEngine:
             # Fused AdamW can apply the reciprocal coefficient inside its
             # kernel. Defer only when every trainable parameter is covered by
             # the clipping policy; mixed policies must use eager clipping.
-            if (
-                self.optim_cfg.fused_grad_clip
-                and clip_all_grads
-                and not ProberList.prober_list
-            ):
+            if self.optim_cfg.fused_grad_clip and clip_all_grads and not ProberList.prober_list:
                 self._defer_grad_clip_to_optimizer = True
                 finite = torch.isfinite(total_grad_norm)
                 self._optimizer_grad_scale = torch.where(

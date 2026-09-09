@@ -23,8 +23,8 @@ from .collator import (
     fake_collator,
     intern_s1_vl_sft_collator,
     qwen3_vl_sft_collator,
-    single_sequence_sft_llm_collator,
     sft_llm_collator,
+    single_sequence_sft_llm_collator,
 )
 from .dataloader import BaseDataloader, Dataloader
 from .jsonl import JsonlDataset
@@ -126,15 +126,14 @@ def build_datasets(
         _dataset_config = config["dataset"]
         assert isinstance(_dataset_config, DatasetConfig)
         _tokenize_fn_name = config["tokenize_fn"]
-        anno_path = _dataset_config.anno_path
+        anno_path = Path(_dataset_config.anno_path)
         if _dataset_config.class_name == "MegatronIndexedDataset":
             all_anno_path = resolve_megatron_prefixes(anno_path)
-        elif os.path.isfile(anno_path):
+        elif anno_path.is_file():
             all_anno_path = [anno_path]
         else:
             all_anno_path = [
-                os.path.join(anno_path, f)
-                for f in list_dir_or_file(anno_path, suffix=".jsonl", list_dir=False, recursive=True)
+                anno_path / f for f in list_dir_or_file(anno_path, suffix=".jsonl", list_dir=False, recursive=True)
             ]
         all_anno_path.sort()
         for anno_path in all_anno_path:

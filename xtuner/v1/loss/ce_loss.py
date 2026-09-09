@@ -216,7 +216,6 @@ class LMHeadLossContext(BaseLossContext):
         shifted_labels = shifted_labels.flatten()
         loss_weight = loss_weight.flatten()
 
-<<<<<<< HEAD
         # ``reduction="none"`` already returns zero for ignored targets, even
         # when an entire chunk is ignored. Avoid checking the number of valid
         # targets in Python because converting that CUDA scalar to ``bool``

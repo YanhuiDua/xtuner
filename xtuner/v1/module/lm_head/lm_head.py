@@ -65,9 +65,7 @@ class LMHead(nn.Linear):
             return None, (logits.float(), {})
         elif self.logical_out_features < self.out_features:
             if loss_ctx.__class__ is not LMHeadLossContext:
-                raise NotImplementedError(
-                    "Padded LM heads currently support only the plain CE loss context"
-                )
+                raise NotImplementedError("Padded LM heads currently support only the plain CE loss context")
             return loss_ctx.forward(
                 hidden_states,
                 w,

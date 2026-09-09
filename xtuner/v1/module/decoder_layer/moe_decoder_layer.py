@@ -816,7 +816,8 @@ class MoEDecoderLayer(nn.Module):
         position_embeddings_list: list[tuple[torch.Tensor, torch.Tensor]],
         attention_kwargs_list: list[dict[str, object]] | None = None,
     ) -> MoEDecoderLayerMicroBatchOutput:
-        """Execute intra-layer micro-batches without the EP dispatcher pipeline."""
+        """Execute intra-layer micro-batches without the EP dispatcher
+        pipeline."""
         origin_shape = hidden_states_list[0].shape
         assert all(hidden_states.shape == origin_shape for hidden_states in hidden_states_list), (
             "All hidden states should have the same shape"

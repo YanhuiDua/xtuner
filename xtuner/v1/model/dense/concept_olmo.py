@@ -5,7 +5,7 @@ import re
 from contextlib import AbstractContextManager, nullcontext
 from itertools import accumulate
 from pathlib import Path
-from typing import Literal, Self, cast
+from typing import Any, Literal, Self, cast
 
 import torch
 import torch.distributed as dist
@@ -13,7 +13,6 @@ import torch.distributed.nn.functional as distF
 import torch.nn.functional as F
 from pydantic import Field, model_validator
 from torch import nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
@@ -31,7 +30,7 @@ from xtuner.v1.model.base import (
     TorchCompileOption,
     TransformerConfig,
 )
-from xtuner.v1.model.utils import checkpoint_wrapper
+from xtuner.v1.model.utils import apply_activation_checkpointing
 from xtuner.v1.module import (
     CheckpointRMSNorm,
     ConceptQuantizer,
@@ -317,45 +316,10 @@ class ConceptLMV22VQ(BaseModel):
         return [key]
 
     @override
-    def safetensors_to_params(
-        self,
-        safetensors: list[torch.Tensor],
-        local_tensor: torch.Tensor,
-        param_name: str,
-        start: int | None,
-        end: int | None,
-        dim: int | None,
-    ) -> None:
-        if param_name == "fusion_norm_alpha":
-            safetensors = [safetensors[0].reshape(1)]
-        if param_name == "lm_head.weight" and self.lm_head.out_features > self.config.vocab_size:
-            if len(safetensors) != 1:
-                raise ValueError("The padded LM head must map to exactly one HuggingFace tensor")
-            loaded_tensor = safetensors[0]
-            if loaded_tensor.shape[0] != self.config.vocab_size:
-                raise ValueError(
-                    f"Expected an LM head with {self.config.vocab_size} rows, got {loaded_tensor.shape[0]}"
-                )
-            if loaded_tensor.shape[1:] != local_tensor.shape[1:]:
-                raise ValueError(
-                    f"LM head shape mismatch: checkpoint {loaded_tensor.shape}, local {local_tensor.shape}"
-                )
-            local_tensor.zero_()
-            if start is None or end is None:
-                local_tensor[: self.config.vocab_size].copy_(loaded_tensor)
-            else:
-                loaded_end = min(end, self.config.vocab_size)
-                if start < loaded_end:
-                    local_tensor[: loaded_end - start].copy_(loaded_tensor[start:loaded_end])
-            return
-        super().safetensors_to_params(
-            safetensors=safetensors,
-            local_tensor=local_tensor,
-            param_name=param_name,
-            start=start,
-            end=end,
-            dim=dim,
-        )
+    def hf_tensor_to_canonical(self, name: str, loaded_tensor: torch.Tensor) -> torch.Tensor:
+        if name == "fusion_norm_alpha":
+            return loaded_tensor.reshape(1)
+        return loaded_tensor
 
     @override
     def param_to_safetensor(self, safetensor: torch.Tensor, hf_param_name: str) -> torch.Tensor:
@@ -451,7 +415,8 @@ class ConceptLMV22VQ(BaseModel):
 
     @staticmethod
     def _cat_if_multiple(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
-        """Concatenate tensors without copying an already-contiguous singleton."""
+        """Concatenate tensors without copying an already-contiguous
+        singleton."""
         if len(tensors) == 1:
             return tensors[0].contiguous()
         return torch.cat(tensors, dim=dim)
@@ -587,7 +552,7 @@ class ConceptLMV22VQ(BaseModel):
         token_lengths = self._lengths(seq_ctx)
         token_position_embeddings = self.rotary_emb(hidden_states, seq_ctx.position_ids)
 
-        encoder_history = (hidden_states,)
+        encoder_history: tuple[torch.Tensor, ...] = (hidden_states,)
         encoder_raw_states: list[torch.Tensor] = []
         if self.config.stage_group_size == 1:
             for stage_idx, stage in enumerate(self.encoder_stages):
@@ -643,7 +608,7 @@ class ConceptLMV22VQ(BaseModel):
         assert concept_ctx.position_ids is not None
         concept_position_embeddings = self.rotary_emb(concept_hidden, concept_ctx.position_ids)
 
-        concept_history = (concept_hidden,)
+        concept_history: tuple[torch.Tensor, ...] = (concept_hidden,)
         concept_raw_states: list[torch.Tensor] = []
         if self.config.stage_group_size == 1:
             for stage_idx, stage in enumerate(self.concept_stages):
@@ -705,7 +670,7 @@ class ConceptLMV22VQ(BaseModel):
         )
         decoder_concept_states = self._local_token_shard(decoder_concept_states, seq_ctx, hidden_states.shape[1])
 
-        decoder_history = (hidden_states,)
+        decoder_history: tuple[torch.Tensor, ...] = (hidden_states,)
         if self.config.stage_group_size == 1:
             for layer_idx, stage in enumerate(self.decoder_stages):
                 with self._activation_offload_context(hidden_states, layer_idx, "decoder"):
@@ -826,10 +791,9 @@ class ConceptLMV22VQ(BaseModel):
                 stack, stage_idx = stage_locations[global_idx]
                 stage = stack[stage_idx]
                 if global_idx < num_recompute_stages:
-                    stage = checkpoint_wrapper(
+                    stage = apply_activation_checkpointing(
                         stage,
                         preserve_rng_state=checkpoint_preserve_rng_state,
-                        checkpoint_impl=CheckpointImpl.REENTRANT,
                     )
                 stack[stage_idx] = stage
                 self._fully_shard(
@@ -884,14 +848,12 @@ class ConceptLMV22VQ(BaseModel):
                 *self.decoder_stages,
                 self.lm_head,
             ]
-        for current_module, next_module in zip(
-            ordered_forward_modules[:-1], ordered_forward_modules[1:], strict=True
-        ):
+        for current_module, next_module in zip(ordered_forward_modules[:-1], ordered_forward_modules[1:], strict=True):
             current_module.set_modules_to_forward_prefetch([next_module])  # type: ignore[attr-defined]
         first_encoder_module = (
             self.encoder_stage_groups[0] if self.config.stage_group_size > 1 else self.encoder_stages[0]
         )
-        self.set_modules_to_forward_prefetch([self.embed_tokens, first_encoder_module])  # type: ignore[arg-type]
+        cast(Any, self).set_modules_to_forward_prefetch([self.embed_tokens, first_encoder_module])
         self._to_empty_meta()
         return self
 

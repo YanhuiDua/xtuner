@@ -1726,9 +1726,7 @@ class Trainer:
         if mfu_cfg is None:
             return None
         if not isinstance(model_cfg, ConceptLMV22VQConfig):
-            raise ValueError(
-                "MFUConfig currently supports ConceptLMV22VQConfig models only"
-            )
+            raise ValueError("MFUConfig currently supports ConceptLMV22VQConfig models only")
 
         device_name = None
         if mfu_cfg.peak_tflops_per_gpu is None:
@@ -1758,9 +1756,7 @@ class Trainer:
             world_size=self.world_size,
             device_name=device_name,
         )
-        device_info = (
-            f", device={calculator.device_name!r}" if calculator.device_name else ""
-        )
+        device_info = f", device={calculator.device_name!r}" if calculator.device_name else ""
         log_rank0.info(
             f"Concept OLMo MFU logging enabled: sequence_length={mfu_cfg.sequence_length}, "
             f"global_batch_size={self.global_batch_size}, world_size={self.world_size}, "
@@ -1864,9 +1860,7 @@ class Trainer:
         if "mfu" in training_metrics:
             log_scalars.update(
                 {
-                    "runtime_info/model_flops_per_step": training_metrics[
-                        "model_flops_per_step"
-                    ],
+                    "runtime_info/model_flops_per_step": training_metrics["model_flops_per_step"],
                     "runtime_info/tflops_per_gpu": training_metrics["tflops_per_gpu"],
                     "runtime_info/mfu": training_metrics["mfu"],
                 }
