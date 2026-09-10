@@ -86,7 +86,7 @@ class DenseDecoderLayer(nn.Module):
 
     def forward(
         self,
-        *hidden_states: torch.Tensor,
+        *hidden_states: torch.Tensor | list[torch.Tensor],
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]],
         seq_ctx: SequenceContext | list[SequenceContext],
         mudd_streams: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
@@ -105,10 +105,15 @@ class DenseDecoderLayer(nn.Module):
             seq_ctx (SequenceContext | list[SequenceContext]): Sequence context, aligned with
                 ``hidden_states``.
         Returns:
-            DenseDecoderLayerOutput | DenseDecoderLayerMicroBatchOutput: Output hidden states. A
-            single tensor for a single ``hidden_states`` tensor, a per-micro-batch list for a list
-            of them.
+            A single hidden-state tensor for one input, or a tuple of tensors for multiple
+            micro-batches. A list passed as the first positional argument is accepted for
+            compatibility with callers using the pre-varargs interface.
         """
+        if len(hidden_states) == 1 and isinstance(hidden_states[0], list):
+            hidden_states = tuple(hidden_states[0])
+        if not hidden_states:
+            raise ValueError("DenseDecoderLayer requires at least one hidden-state tensor")
+
         if len(hidden_states) == 1:
             assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
             assert isinstance(seq_ctx, SequenceContext)

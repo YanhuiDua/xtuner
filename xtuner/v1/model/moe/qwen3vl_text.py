@@ -4,7 +4,6 @@ import re
 import torch
 
 from xtuner.v1.data_proto import SequenceContext
-from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayerOutput
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEDecoderLayerOutput
 from xtuner.v1.utils.activation_offload import async_save_on_cpu
 
@@ -132,12 +131,15 @@ class Qwen3VLTextMoE(Qwen3MoE):
 
         for idx, decoder_layer in self.layers.items():
             if int(idx) < self.config.first_k_dense_replace:
-                dense_results: DenseDecoderLayerOutput = decoder_layer(
+                dense_results = decoder_layer(
                     hidden_states,
                     position_embeddings=position_embeddings,
                     seq_ctx=seq_ctx,
                 )
-                hidden_states = dense_results["hidden_states"]
+                if isinstance(dense_results, torch.Tensor):
+                    hidden_states = dense_results
+                else:
+                    hidden_states = dense_results["hidden_states"]
             else:
                 if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1:
                     offload_stream = decoder_layer._get_fsdp_state()._comm_ctx.all_gather_stream

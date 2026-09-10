@@ -44,7 +44,7 @@ with path.open("w", encoding="ascii") as file:
         file.write("\n")
 PY
 else
-    export DATA_PATH="${DATA_PATH:-/mnt/shared-storage-user/llmrazor-share/geruijun/ncp-dataset/megatron_qwen35_8192/indexed}"
+    export DATA_PATH="${DATA_PATH:-$WORK_DIR/data/indexed}"
 fi
 
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"

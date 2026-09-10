@@ -687,7 +687,7 @@ class MLLMPretrainHybridPackDataset(TorchDataset):
         for dset in datasets:
             if isinstance(dset, VLMJsonlDataset):
                 soft_pack_groups.append(dset)
-            elif isinstance(dset, JsonlDataset):
+            elif isinstance(dset, (JsonlDataset, MegatronIndexedDataset)):
                 hard_pack_groups.append(dset)
 
         dataset_list: list[HardPackDataset | ExpandSoftPackDataset] = []

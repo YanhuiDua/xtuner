@@ -9,6 +9,7 @@ from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.module import RMSNorm
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
     MoEDecoderLayerMicroBatchOutput,
+    MoEDecoderLayerOutput,
 )
 from xtuner.v1.module.linear import build_linear
 
@@ -84,11 +85,11 @@ class MTPLayer(nn.Module):
 
     def forward(
         self,
-        *hidden_states: torch.Tensor,
+        *hidden_states: torch.Tensor | list[torch.Tensor],
         future_embeddings: torch.Tensor | list[torch.Tensor],
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]],
         seq_ctx: SequenceContext | list[SequenceContext],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, ...]:
+    ) -> MoEDecoderLayerOutput | MoEDecoderLayerMicroBatchOutput:
         """Forward pass through the MTP layer.
 
         Mirrors :meth:`MoEDecoderLayer.forward`: passing lists runs ``N`` micro-batches together
@@ -109,6 +110,11 @@ class MTPLayer(nn.Module):
             MoEDecoderLayerOutput | MoEDecoderLayerMicroBatchOutput: The wrapped decoder layer's
             outputs with the MTP final layernorm applied to the hidden states.
         """
+        if len(hidden_states) == 1 and isinstance(hidden_states[0], list):
+            hidden_states = tuple(hidden_states[0])
+        if not hidden_states:
+            raise ValueError("MTPLayer requires at least one hidden-state tensor")
+
         if len(hidden_states) == 1:
             assert isinstance(future_embeddings, torch.Tensor), (
                 "future_embeddings should be a Tensor in single-microbatch mode"
@@ -148,7 +154,7 @@ class MTPLayer(nn.Module):
         future_embeddings: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         seq_ctx: SequenceContext,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> MoEDecoderLayerOutput:
         projected = self._preprocess(hidden_states=hidden_states, future_embeddings=future_embeddings)
 
         layer_outputs = self.decoder_layer(
@@ -161,11 +167,21 @@ class MTPLayer(nn.Module):
             hidden_states = layer_outputs
             empty = hidden_states.new_empty(0)
             router_results, router_weights, router_topk_ids = empty, empty, empty
+        elif isinstance(layer_outputs, dict):
+            hidden_states = layer_outputs["hidden_states"]
+            router_results = layer_outputs["router_logits"]
+            router_weights = layer_outputs["router_weights"]
+            router_topk_ids = layer_outputs["router_topk_ids"]
         else:
             hidden_states, router_results, router_weights, router_topk_ids = layer_outputs
 
         hidden_states = self.final_layernorm(hidden_states)
-        return hidden_states, router_results, router_weights, router_topk_ids
+        return {
+            "hidden_states": hidden_states,
+            "router_logits": router_results,
+            "router_weights": router_weights,
+            "router_topk_ids": router_topk_ids,
+        }
 
     def _micro_batch_forward(
         self,
@@ -174,8 +190,9 @@ class MTPLayer(nn.Module):
         future_embeddings_list: list[torch.Tensor],
         position_embeddings_list: list[tuple[torch.Tensor, torch.Tensor]],
         seq_ctx_list: list[SequenceContext],
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> MoEDecoderLayerMicroBatchOutput:
         n = len(hidden_states_list)
+        assert n > 0, "MTP micro-batch input cannot be empty"
         assert len(future_embeddings_list) == n and len(position_embeddings_list) == n and len(seq_ctx_list) == n, (
             "All per-microbatch inputs must share the same length"
         )
@@ -186,28 +203,40 @@ class MTPLayer(nn.Module):
             self._preprocess(hidden_states=h, future_embeddings=e)
             for h, e in zip(hidden_states_list, future_embeddings_list)
         ]
-        layer_results: MoEDecoderLayerMicroBatchOutput = self.decoder_layer(
-            *projected_list,
+        layer_results = self.decoder_layer(
+            projected_list,
             position_embeddings=position_embeddings_list,
             seq_ctx=seq_ctx_list,
         )
-        assert isinstance(layer_results, tuple)
-        if len(layer_results) == n:
-            hidden_out = [self.final_layernorm(h) for h in layer_results]
-            empty = hidden_out[0].new_empty(0)
-            router_logits = [empty] * n
-            router_weights = [empty] * n
-            router_topk_ids = [empty] * n
+        if isinstance(layer_results, dict):
+            hidden_out = [self.final_layernorm(h) for h in layer_results["hidden_states"]]
+            router_logits = layer_results["router_logits"]
+            router_weights = layer_results["router_weights"]
+            router_topk_ids = layer_results["router_topk_ids"]
         else:
-            assert len(layer_results) == 4 * n, (
-                "Multi-microbatch MTP requires the wrapped decoder layer to return either "
-                f"{n} dense outputs or {4 * n} MoE outputs, got {len(layer_results)}"
-            )
-            hidden_out = [self.final_layernorm(h) for h in layer_results[:n]]
-            router_logits = list(layer_results[n : 2 * n])
-            router_weights = list(layer_results[2 * n : 3 * n])
-            router_topk_ids = list(layer_results[3 * n :])
-        return tuple(hidden_out + router_logits + router_weights + router_topk_ids)
+            assert isinstance(layer_results, tuple)
+            if len(layer_results) == n:
+                hidden_out = [self.final_layernorm(h) for h in layer_results]
+                empty = hidden_out[0].new_empty(0)
+                router_logits = [empty] * n
+                router_weights = [empty] * n
+                router_topk_ids = [empty] * n
+            else:
+                assert len(layer_results) == 4 * n, (
+                    "Multi-microbatch MTP requires the wrapped decoder layer to return either "
+                    f"{n} dense outputs or {4 * n} MoE outputs, got {len(layer_results)}"
+                )
+                hidden_out = [self.final_layernorm(h) for h in layer_results[:n]]
+                router_logits = list(layer_results[n : 2 * n])
+                router_weights = list(layer_results[2 * n : 3 * n])
+                router_topk_ids = list(layer_results[3 * n :])
+
+        return {
+            "hidden_states": hidden_out,
+            "router_logits": router_logits,
+            "router_weights": router_weights,
+            "router_topk_ids": router_topk_ids,
+        }
 
     def _preprocess(
         self,

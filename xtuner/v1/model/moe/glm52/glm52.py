@@ -125,6 +125,8 @@ class Glm52MoE(MoE):
             | DenseDecoderLayerMicroBatchOutput
             | MoEDecoderLayerOutput
             | MoEDecoderLayerMicroBatchOutput
+            | torch.Tensor
+            | tuple[torch.Tensor, ...]
             | None
         ),
     ) -> (
@@ -132,6 +134,8 @@ class Glm52MoE(MoE):
         | DenseDecoderLayerMicroBatchOutput
         | MoEDecoderLayerOutput
         | MoEDecoderLayerMicroBatchOutput
+        | torch.Tensor
+        | tuple[torch.Tensor, ...]
     ):
         """Arrange GLM-5.2 DSA dataflow and offload around one decoder
         layer."""

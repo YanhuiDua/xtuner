@@ -401,9 +401,9 @@ class TrainEngine:
             device_clip_coef = clip_coef.to(device)
             if _device_has_foreach_support(device):
                 torch._foreach_mul_(cast(list[torch.Tensor], device_grads), device_clip_coef)
-        else:
-            for grad in device_grads:
-                grad.mul_(device_clip_coef)
+            else:
+                for grad in device_grads:
+                    grad.mul_(device_clip_coef)
 
     def step_optimizer(self, grad_norm):
         """Step the optimizer to update the model parameters."""
