@@ -44,8 +44,7 @@ Closest existing ports: hybrid MoE text in `moe/qwen3_5_text.py` (GatedDeltaNet 
 | Shared experts | MoE shared expert path | OK |
 | LatentMoE down/up (+norm) | — | **New** (expert dim 3584 ≠ hidden 7168) |
 | SiTU-GLU | `silu` / SwiGLU only | **New** activation |
-# AttnRes
-| AttnRes (`attn_res_block_size`) | Implemented | Cross-layer `block_residual` threaded via `_call_decoder_layer` / `_decoder_stack`; per-layer mixer + model-level `output_attn_res_*` before final norm |
+| AttnRes (`attn_res_block_size`) | Implemented | Cross-layer `block_residual` via `_call_decoder_layer` / `_decoder_stack`; output mixer before final norm |
 | HF MoE training | XTuner MoE training path | Hub HF code **raises** in training MoE; XTuner must own train path |
 
 **Implication:** this is not a thin Config+`to_hf_key_list` port. Several module/ops pieces are required even for a correct *structure* load.
