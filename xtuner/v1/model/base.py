@@ -44,7 +44,7 @@ from xtuner.v1.float8.fsdp_utils import (
     WeightWithDynamicTilewiseFloat8CastTensor,
 )
 from xtuner.v1.loss import BaseLossConfig, BaseLossContext, CELossConfig
-from xtuner.v1.module.attention import GatedDeltaNetConfig, MHAConfig, MLAConfig
+from xtuner.v1.module.attention import GatedDeltaNetConfig, KDAConfig, MHAConfig, MLAConfig
 from xtuner.v1.module.mtp import MTPConfig
 from xtuner.v1.module.rope import RopeParametersConfig, RopeScalingConfig
 from xtuner.v1.utils import get_device, get_logger, get_torch_device_module, log_rank0, profile_time_and_memory
@@ -221,7 +221,7 @@ class TransformerConfig(XTunerBaseModelConfig):
     rms_norm_type: Annotated[Literal["default", "zero_centered"], Parameter(group="model")] = "default"
     hidden_act: Annotated[str, Parameter(group="model")]  # key defined in `transformers.activations.ACT2CLS`
     attention: MLAConfig | MHAConfig
-    linear_attention: Annotated[GatedDeltaNetConfig | None, Parameter(group="model")] = None
+    linear_attention: Annotated[GatedDeltaNetConfig | KDAConfig | None, Parameter(group="model")] = None
     mtp_config: MTPConfig | None = None
     mlp_bias: Annotated[bool, Parameter(group="model")] = False
     tie_word_embeddings: Annotated[bool, Parameter(group="model")] = False

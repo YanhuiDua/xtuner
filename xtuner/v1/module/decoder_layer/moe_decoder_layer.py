@@ -17,6 +17,8 @@ from xtuner.v1.module import (
     GatedDeltaNet,
     GatedDeltaNetConfig,
     GreedyRouterConfig,
+    KDAConfig,
+    KimiDeltaAttention,
     MHAConfig,
     MLAConfig,
     MultiHeadAttention,
@@ -76,16 +78,20 @@ class MoEActFnProtocol(Protocol):
 
 class MoEActFnConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    act_type: Literal["clipped_swiglu", "swiglu"] = "swiglu"
+    act_type: Literal["clipped_swiglu", "swiglu", "situ"] = "swiglu"
 
     clip_alpha: float | None = None
     clip_limit: float | None = None
+    situ_beta: float = 1.0
+    situ_linear_beta: float | None = None
 
     def build(self) -> MoEActFnProtocol:
         act_fn = get_act_fn(self.act_type)
 
         if self.act_type == "clipped_swiglu":
             act_fn = partial(act_fn, alpha=self.clip_alpha, limit=self.clip_limit)
+        elif self.act_type == "situ":
+            act_fn = partial(act_fn, beta=self.situ_beta, linear_beta=self.situ_linear_beta)
         return act_fn
 
 
@@ -99,16 +105,25 @@ class MoEMLP(nn.Module):
         hidden_act: str,
         mlp_bias: bool = False,
         float8_cfg: Float8Config | None = None,
+        situ_beta: float = 1.0,
+        situ_linear_beta: float | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = moe_intermediate_size * n_shared_experts
+        self.hidden_act = hidden_act
         self.gate_proj = build_linear(self.hidden_size, self.intermediate_size, bias=mlp_bias, float8_cfg=float8_cfg)
         self.up_proj = build_linear(self.hidden_size, self.intermediate_size, bias=mlp_bias, float8_cfg=float8_cfg)
         self.down_proj = build_linear(self.intermediate_size, self.hidden_size, bias=mlp_bias, float8_cfg=float8_cfg)
-        self.act_fn = get_act_fn(hidden_act)
+        if hidden_act == "situ":
+            self.act_fn = partial(get_act_fn("situ"), beta=situ_beta, linear_beta=situ_linear_beta)
+        else:
+            self.act_fn = get_act_fn(hidden_act)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.hidden_act == "situ":
+            gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
+            return self.down_proj(self.act_fn(gate_up))
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -317,7 +332,7 @@ class MoEDecoderLayer(nn.Module):
         n_shared_experts: int,
         with_shared_expert_gate: bool = False,
         hidden_factor: float = 1.0,
-        attention_config: MHAConfig | MLAConfig | GatedDeltaNetConfig,
+        attention_config: MHAConfig | MLAConfig | GatedDeltaNetConfig | KDAConfig,
         rope_scaling_cfg: RopeScalingConfig | None = None,
         layer_type: Literal["full_attention", "sliding_attention"] | None = None,
         generate_config: GenerateConfig | None = None,
@@ -343,13 +358,15 @@ class MoEDecoderLayer(nn.Module):
         self.n_shared_experts = n_shared_experts
         self.hidden_factor = hidden_factor
 
-        self.self_attn: MultiHeadAttention | MultiLatentAttention | GatedDeltaNet = attention_config.build(
-            hidden_size=hidden_size,
-            layer_idx=layer_idx,
-            generate_config=generate_config,
-            rope_scaling_cfg=rope_scaling_cfg,
-            layer_type=layer_type,
-            float8_cfg=float8_cfg,
+        self.self_attn: MultiHeadAttention | MultiLatentAttention | GatedDeltaNet | KimiDeltaAttention = (
+            attention_config.build(
+                hidden_size=hidden_size,
+                layer_idx=layer_idx,
+                generate_config=generate_config,
+                rope_scaling_cfg=rope_scaling_cfg,
+                layer_type=layer_type,
+                float8_cfg=float8_cfg,
+            )
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
         self.layer_idx = layer_idx

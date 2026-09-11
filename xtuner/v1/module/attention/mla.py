@@ -58,6 +58,7 @@ class MLAConfig(BaseModel):
     qk_rope_head_dim: int
     qk_nope_head_dim: int
     v_head_dim: int
+    use_output_gate: bool = False
 
     def build(
         self,
@@ -190,6 +191,7 @@ class MultiLatentAttention(nn.Module):
         qkv_bias: bool = False,
         qk_norm: bool = False,
         o_bias: bool = False,
+        use_output_gate: bool = False,
         rope_scaling_cfg: RopeScalingConfig | None = None,
         float8_cfg: Float8Config | None = None,
         generate_config: GenerateConfig | None = None,
@@ -212,6 +214,7 @@ class MultiLatentAttention(nn.Module):
         self.qkv_bias = qkv_bias
         self.o_bias = o_bias
         self.qk_norm = qk_norm
+        self.use_output_gate = use_output_gate
         self.float8_cfg = float8_cfg
         self.generate_config = generate_config
         self.q_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -260,6 +263,13 @@ class MultiLatentAttention(nn.Module):
             bias=self.o_bias,
             float8_cfg=self.float8_cfg,
         )
+        if self.use_output_gate:
+            self.g_proj = build_linear(
+                self.hidden_size,
+                self.num_attention_heads * self.v_head_dim,
+                bias=False,
+                float8_cfg=self.float8_cfg,
+            )
 
         self.softmax_scale = self.q_head_dim ** (-0.5)
 
@@ -273,6 +283,11 @@ class MultiLatentAttention(nn.Module):
         self.window_size = (-1, -1)
         if layer_type == "sliding_attention":
             self.window_size = (sliding_window, sliding_window)
+
+    def _apply_output_gate(self, attn_output: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_output_gate:
+            attn_output = attn_output * self.g_proj(hidden_states).sigmoid()
+        return attn_output
 
     def forward_training(
         self,
@@ -340,6 +355,7 @@ class MultiLatentAttention(nn.Module):
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_attention_heads * self.v_head_dim).contiguous()
 
+        attn_output = self._apply_output_gate(attn_output, hidden_states)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -442,6 +458,7 @@ class MultiLatentAttention(nn.Module):
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_attention_heads * self.v_head_dim).contiguous()
 
+        attn_output = self._apply_output_gate(attn_output, hidden_states)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -550,6 +567,7 @@ class MultiLatentAttention(nn.Module):
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
 
+        attn_output = self._apply_output_gate(attn_output, hidden_states)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -631,6 +649,7 @@ class MultiLatentAttention(nn.Module):
             raw_output = raw_output[:, :, : self.v_head_dim]
 
         raw_output = raw_output.reshape(bsz, q_len, self.num_attention_heads * self.v_head_dim).contiguous()
+        raw_output = self._apply_output_gate(raw_output, hidden_states)
         projected_output = self.o_proj(raw_output)
 
         attn_outputs: AttnOutputs = {

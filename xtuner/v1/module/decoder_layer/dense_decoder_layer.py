@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Literal, TypedDict, cast
 
 import torch
@@ -6,7 +7,7 @@ import torch.nn as nn
 from xtuner.v1.config import GenerateConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
-from xtuner.v1.module import AttnOutputs, GatedDeltaNetConfig, MHAConfig, MLAConfig, RMSNorm
+from xtuner.v1.module import AttnOutputs, GatedDeltaNetConfig, KDAConfig, MHAConfig, MLAConfig, RMSNorm
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_act_fn
 from xtuner.v1.utils import ForwardState
@@ -35,14 +36,23 @@ class DenseMLP(nn.Module):
         bias: bool = False,
         hidden_act: str,
         float8_cfg: Float8Config | None = None,
+        situ_beta: float = 1.0,
+        situ_linear_beta: float | None = None,
     ):
         super().__init__()
+        self.hidden_act = hidden_act
         self.gate_proj = build_linear(hidden_size, intermediate_size, bias=bias, float8_cfg=float8_cfg)
         self.up_proj = build_linear(hidden_size, intermediate_size, bias=bias, float8_cfg=float8_cfg)
         self.down_proj = build_linear(intermediate_size, hidden_size, bias=bias, float8_cfg=float8_cfg)
-        self.act_fn = get_act_fn(hidden_act)
+        if hidden_act == "situ":
+            self.act_fn = partial(get_act_fn("situ"), beta=situ_beta, linear_beta=situ_linear_beta)
+        else:
+            self.act_fn = get_act_fn(hidden_act)
 
     def forward(self, x):
+        if self.hidden_act == "situ":
+            gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
+            return self.down_proj(self.act_fn(gate_up))
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -57,7 +67,7 @@ class DenseDecoderLayer(nn.Module):
         hidden_act: str,
         rms_norm_eps: float = 1e-6,
         rms_norm_type: Literal["default", "zero_centered"] = "default",
-        attention_config: MLAConfig | MHAConfig | GatedDeltaNetConfig,
+        attention_config: MLAConfig | MHAConfig | GatedDeltaNetConfig | KDAConfig,
         rope_scaling_cfg: RopeScalingConfig | None = None,
         generate_config: GenerateConfig | None = None,
         float8_cfg: Float8Config | None = None,

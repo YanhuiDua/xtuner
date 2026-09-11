@@ -46,12 +46,30 @@ def native_silu(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x)
 
 
+def native_situ(
+    fused_x: torch.Tensor,
+    split_dim: int = -1,
+    beta: float = 1.0,
+    linear_beta: float | None = None,
+) -> torch.Tensor:
+    """SiTU-GLU: beta * tanh(gate / beta) * sigmoid(gate) * up (optional tanh on up)."""
+    gate, up = torch.chunk(fused_x, 2, dim=split_dim)
+    dtype = fused_x.dtype
+    gate_f = gate.float()
+    up_f = up.float()
+    situ_a = beta * torch.tanh(gate_f / beta) * torch.sigmoid(gate_f)
+    if linear_beta is not None:
+        up_f = linear_beta * torch.tanh(up_f / linear_beta)
+    return (situ_a * up_f).to(dtype)
+
+
 act_fn_type_map_cuda = {
     "swiglu": native_swiglu,
     "clipped_swiglu": native_clipped_swiglu,
     "gelu": native_gelu,
     "gelu_pytorch_tanh": partial(native_gelu, approximate="tanh"),
     "silu": native_silu,
+    "situ": native_situ,
 }
 act_fn_type_map_npu = {
     "swiglu": npu_swiglu,
@@ -59,6 +77,7 @@ act_fn_type_map_npu = {
     "gelu": npu_gelu,
     "gelu_pytorch_tanh": partial(npu_gelu, approximate="tanh"),
     "silu": native_silu,
+    "situ": native_situ,
 }
 
 
