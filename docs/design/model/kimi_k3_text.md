@@ -1,7 +1,7 @@
 # Kimi-K3 text tower (`kimi_linear`) integration design
 
-> Status: **phase-1 implementation in progress** (user confirmed §6).  
-> Scope for this phase (per user): text-only, random bf16 checkpoint, **load 对齐跑通**, no numerical parity, no multimodal, 8-GPU ready layout.
+> Status: **phase-1 + AttnRes forward landed**; 8-GPU smoke script available. Numerical parity still deferred.  
+> Scope: text-only, random bf16 tiny checkpoint, load + AttnRes forward, no numerical parity, no multimodal.
 
 ## 1. Reference and classification
 
@@ -44,7 +44,8 @@ Closest existing ports: hybrid MoE text in `moe/qwen3_5_text.py` (GatedDeltaNet 
 | Shared experts | MoE shared expert path | OK |
 | LatentMoE down/up (+norm) | — | **New** (expert dim 3584 ≠ hidden 7168) |
 | SiTU-GLU | `silu` / SwiGLU only | **New** activation |
-| AttnRes (`attn_res_block_size`) | — | **New** residual mixer across block prefixes; touches decoder + model forward |
+# AttnRes
+| AttnRes (`attn_res_block_size`) | Implemented | Cross-layer `block_residual` threaded via `_call_decoder_layer` / `_decoder_stack`; per-layer mixer + model-level `output_attn_res_*` before final norm |
 | HF MoE training | XTuner MoE training path | Hub HF code **raises** in training MoE; XTuner must own train path |
 
 **Implication:** this is not a thin Config+`to_hf_key_list` port. Several module/ops pieces are required even for a correct *structure* load.
@@ -111,23 +112,18 @@ Explicitly deferred:
 - Vision / projector / compose `kimi_k3`.
 - Chat template + SFT/RL recipes.
 - EP/SP/fp8/compile feature matrix (skill §8).
+- AttnRes on intra-layer micro-batch EP path (single-batch / FSDP path is wired).
 
-## 6. Risks / open decisions (need confirmation)
+### 8-GPU smoke
 
-1. **Tiny vs full-size random weights** — recommend **tiny only** for phase 1; full-size config class registered without dumping all tensors. Confirm?
-2. **KDA as new module** vs force-fit `GatedDeltaNet` with layout transforms — recommend **new KDA module** (cleaner `to_hf_key_list`). Confirm?
-3. **AttnRes / LatentMoE / SiTU / MLA gate** — all needed for a structurally faithful load of even the tiny model if tiny mirrors published features. Tiny will enable the same feature flags at small scale. OK?
-4. **Standalone `kimi_linear` checkpoint layout** (keys as in text tower) vs nested `model.language_model.*` from full `kimi_k3` — phase 1 saves **standalone** text layout. OK?
-5. **HF remote code dependency** — `from_hf` / tests need the downloaded `modeling_*.py` beside the tiny weights (copy from `.cache/kimi_k3_hf`). OK?
-
-## 7. Implementation order (after confirm)
-
-1. Module stubs: SiTU → MLA output_gate → KDA → LatentMoE → AttnRes (each minimal forward).
-2. `KimiLinear` / configs + registration.
-3. Tiny bf16 generator script + local dir.
-4. Load smoke test (8 GPU optional via torchrun).
-5. Commit baseline (per skill §6 commit workflow) — **no parity claim**.
+```bash
+bash examples/v1/scripts/run_kimi_linear_tiny_8gpu.sh
+# or
+torchrun --standalone --nproc-per-node=8 \
+  examples/v1/scripts/smoke_kimi_linear_tiny.py \
+  --ckpt work_dirs/kimi_linear_tiny_bf16 --seq-len 64
+```
 
 ---
 
-**Please confirm §6 (or amend).** After confirmation, implementation starts without further blocking questions unless a structural surprise appears in weight names.
+Phase-1 §6 decisions were confirmed; AttnRes full forward and 8-GPU smoke follow-up are implemented.

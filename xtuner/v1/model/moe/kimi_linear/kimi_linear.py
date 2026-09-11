@@ -3,24 +3,41 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal, cast
 
 import torch
 import torch.nn as nn
 from pydantic import Field, computed_field
 from typing_extensions import Self, override
 
+from xtuner.v1.data_proto import SequenceContext
+from xtuner.v1.loss import BalancingLossContext, ZLossContext
 from xtuner.v1.model.moe.moe import BalancingLossConfig, MoE, MoEConfig
+from xtuner.v1.module import RMSNorm
 from xtuner.v1.module.attention import KDAConfig, MLAConfig
-from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEActFnConfig
+from xtuner.v1.module.decoder_layer.dense_decoder_layer import (
+    DenseDecoderLayerMicroBatchOutput,
+    DenseDecoderLayerOutput,
+)
+from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
+    MoEActFnConfig,
+    MoEDecoderLayerMicroBatchOutput,
+    MoEDecoderLayerOutput,
+)
+from xtuner.v1.module.linear import build_linear
 from xtuner.v1.module.rope import RopeParametersConfig
 from xtuner.v1.module.router.noaux_router import NoAuxRouterConfig
-from xtuner.v1.module import RMSNorm
-from xtuner.v1.module.linear import build_linear
 
-from .decoder_layer import KimiDenseDecoderLayer, KimiMoEDecoderLayer
+from .decoder_layer import (
+    KimiDenseDecoderLayer,
+    KimiDenseDecoderLayerOutput,
+    KimiMoEDecoderLayer,
+    KimiMoEDecoderLayerOutput,
+    apply_attn_res,
+)
 
 
 class KimiLinear(MoE):
@@ -33,6 +50,140 @@ class KimiLinear(MoE):
         if config.attn_res_block_size is not None:
             self.output_attn_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.output_attn_res_proj = build_linear(config.hidden_size, 1, bias=False)
+
+    def _apply_output_attn_res(
+        self, hidden_states: torch.Tensor, block_residual: torch.Tensor | None
+    ) -> torch.Tensor:
+        if block_residual is None or self.config.attn_res_block_size is None:
+            return hidden_states
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        return apply_attn_res(
+            hidden_states.view(-1, hidden_size),
+            block_residual,
+            self.output_attn_res_proj,
+            self.output_attn_res_norm,
+        ).view(batch_size, seq_len, hidden_size)
+
+    @override
+    def _call_decoder_layer(
+        self,
+        *,
+        decoder_layer: torch.nn.Module,
+        layer_idx: int,
+        hidden_states: torch.Tensor | list[torch.Tensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]],
+        seq_ctx: SequenceContext | list[SequenceContext],
+        previous_layer_results: (
+            DenseDecoderLayerOutput
+            | DenseDecoderLayerMicroBatchOutput
+            | MoEDecoderLayerOutput
+            | MoEDecoderLayerMicroBatchOutput
+            | None
+        ),
+    ) -> (
+        DenseDecoderLayerOutput
+        | DenseDecoderLayerMicroBatchOutput
+        | MoEDecoderLayerOutput
+        | MoEDecoderLayerMicroBatchOutput
+    ):
+        is_micro_batch = isinstance(hidden_states, list)
+        block_residual: torch.Tensor | list[torch.Tensor | None] | None = None
+        if previous_layer_results is not None and "block_residual" in previous_layer_results:
+            block_residual = previous_layer_results["block_residual"]  # type: ignore[index]
+        elif self.config.attn_res_block_size is not None:
+            # First layer: empty block residual matching HF init shape.
+            if is_micro_batch:
+                block_residual = []
+                for hs in cast(list[torch.Tensor], hidden_states):
+                    b, s, h = hs.shape
+                    block_residual.append(hs.new_zeros(b * s, 0, h))
+            else:
+                hs = cast(torch.Tensor, hidden_states)
+                b, s, h = hs.shape
+                block_residual = hs.new_zeros(b * s, 0, h)
+
+        activation_offload = int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1
+        offload_tensors: list[torch.Tensor] = []
+        if activation_offload and layer_idx >= self.config.first_k_dense_replace:
+            offload_tensors = list(hidden_states) if is_micro_batch else [cast(torch.Tensor, hidden_states)]
+
+        offload_block_idx = sum(
+            self.config.first_k_dense_replace <= int(previous_idx) < layer_idx for previous_idx in self.layers
+        )
+        decoder_forward = cast(Callable[..., object], decoder_layer)
+        with self._saved_tensors_offload_ctx(offload_block_idx, offload_tensors):
+            return decoder_forward(  # type: ignore[return-value]
+                hidden_states,
+                position_embeddings=position_embeddings,
+                seq_ctx=seq_ctx,
+                block_residual=block_residual,
+            )
+
+    @override
+    def _decoder_stack(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        seq_ctx: SequenceContext,
+        output: dict,
+        keep_router: bool,
+        balancing_ctx: BalancingLossContext | None,
+        z_ctx: ZLossContext | None,
+        nonpad_indices: torch.Tensor,
+        non_pad_token: int,
+        num_tokens_global: torch.Tensor | None,
+        z_world_size: int,
+    ) -> torch.Tensor:
+        previous_layer_results: (
+            KimiDenseDecoderLayerOutput | KimiMoEDecoderLayerOutput | DenseDecoderLayerOutput | MoEDecoderLayerOutput | None
+        ) = None
+        block_residual: torch.Tensor | None = None
+
+        for idx, decoder_layer in self.layers.items():
+            layer_idx = int(idx)
+            layer_results = self._call_decoder_layer(
+                decoder_layer=decoder_layer,
+                layer_idx=layer_idx,
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                seq_ctx=seq_ctx,
+                previous_layer_results=previous_layer_results,
+            )
+            previous_layer_results = cast(
+                KimiDenseDecoderLayerOutput | KimiMoEDecoderLayerOutput,
+                layer_results,
+            )
+            block_residual = previous_layer_results.get("block_residual")  # type: ignore[assignment]
+
+            if layer_idx < self.config.first_k_dense_replace:
+                dense_results = cast(KimiDenseDecoderLayerOutput, layer_results)
+                hidden_states = dense_results["hidden_states"]
+            else:
+                moe_results = cast(KimiMoEDecoderLayerOutput, layer_results)
+                hidden_states = moe_results["hidden_states"]
+                router_results = moe_results["router_logits"]
+                router_weights = moe_results["router_weights"]
+                router_topk_ids = moe_results["router_topk_ids"]
+                if keep_router:
+                    output["router_logits"][f"layer{idx}"] = self._maybe_offload_router(router_results)
+                    output["router_weights"][f"layer{idx}"] = self._maybe_offload_router(router_weights)
+                hidden_states = self.aux_loss.accumulate(
+                    selected_router_weights=router_weights.index_select(0, nonpad_indices).contiguous().float(),
+                    selected_router_logits=router_results.index_select(0, nonpad_indices).contiguous().float(),
+                    selected_experts=router_topk_ids.index_select(0, nonpad_indices).contiguous(),
+                    hidden_states=hidden_states,
+                    balancing_ctx=balancing_ctx,
+                    z_ctx=z_ctx,
+                    num_tokens_local=non_pad_token,
+                    num_tokens_global=num_tokens_global,
+                    world_size=z_world_size,
+                )
+
+            if self.config.return_hidden_states:
+                output["hidden_states"].append(hidden_states)
+
+        return self._apply_output_attn_res(hidden_states, block_residual)
 
     @override
     def build_layers(self, config: MoEConfig) -> nn.ModuleDict:
