@@ -353,6 +353,7 @@ class KimiLinearConfig(MoEConfig):
             qk_nope_head_dim=text.qk_nope_head_dim,
             v_head_dim=text.v_head_dim,
             use_output_gate=bool(getattr(text, "mla_use_output_gate", False)),
+            use_nope=bool(getattr(text, "mla_use_nope", False)),
         )
         linear_attention = KDAConfig(
             num_heads=linear_cfg.get("num_heads", text.num_attention_heads),
@@ -409,8 +410,71 @@ class KimiLinearConfig(MoEConfig):
 
     @property
     def hf_config(self):
-        # trust_remote_code model — no built-in HF config class
-        return None
+        """Build a serializable HF config for ``save_hf`` (trust_remote_code model)."""
+        from transformers import PretrainedConfig
+
+        assert isinstance(self.router, NoAuxRouterConfig), (
+            "Only support saving NoAuxRouter to HF KimiLinear format."
+        )
+        linear_attn = self.linear_attention
+        rope_theta = (
+            self.rope_parameters_cfg.rope_theta if self.rope_parameters_cfg is not None else 10000.0
+        )
+        return PretrainedConfig(
+            model_type="kimi_linear",
+            architectures=["KimiLinearForCausalLM"],
+            vocab_size=self.vocab_size,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            moe_intermediate_size=self.moe_intermediate_size,
+            num_hidden_layers=self.num_hidden_layers,
+            num_attention_heads=self.attention.num_attention_heads,
+            num_key_value_heads=self.attention.num_attention_heads,
+            num_experts=self.n_routed_experts,
+            num_experts_per_token=self.num_experts_per_tok,
+            num_shared_experts=self.n_shared_experts,
+            first_k_dense_replace=self.first_k_dense_replace,
+            hidden_act=self.hidden_act,
+            activation_situ_beta=self.activation_situ_beta,
+            activation_situ_linear_beta=self.activation_situ_linear_beta,
+            routed_expert_hidden_size=self.routed_expert_hidden_size,
+            latent_moe_use_norm=self.latent_moe_use_norm,
+            attn_res_block_size=self.attn_res_block_size,
+            rms_norm_eps=self.rms_norm_eps,
+            max_position_embeddings=self.max_position_embeddings,
+            pad_token_id=self.pad_token_id,
+            eos_token_id=self.eos_token_id,
+            tie_word_embeddings=self.tie_word_embeddings,
+            rope_theta=rope_theta,
+            q_lora_rank=self.attention.q_lora_rank,
+            kv_lora_rank=self.attention.kv_lora_rank,
+            qk_nope_head_dim=self.attention.qk_nope_head_dim,
+            qk_rope_head_dim=self.attention.qk_rope_head_dim,
+            v_head_dim=self.attention.v_head_dim,
+            mla_use_nope=True,
+            mla_use_output_gate=self.attention.use_output_gate,
+            moe_router_activation_func="sigmoid" if self.router.scoring_func == "sigmoid" else "softmax",
+            moe_renormalize=self.router.norm_topk_prob,
+            routed_scaling_factor=self.router.router_scaling_factor,
+            use_grouped_topk=False,
+            num_expert_group=self.router.n_group,
+            topk_group=self.router.topk_group,
+            topk_method="noaux_tc",
+            linear_attn_config={
+                "kda_layers": list(self.kda_layers),
+                "full_attn_layers": list(self.full_attn_layers),
+                "num_heads": linear_attn.num_heads if linear_attn else self.attention.num_attention_heads,
+                "head_dim": linear_attn.head_dim if linear_attn else 128,
+                "short_conv_kernel_size": linear_attn.conv_kernel_size if linear_attn else 4,
+                "use_full_rank_gate": bool(linear_attn.use_full_rank_gate) if linear_attn else True,
+                "gate_lower_bound": linear_attn.gate_lower_bound if linear_attn else -5.0,
+            },
+            auto_map={
+                "AutoConfig": "configuration_kimi_k3.KimiLinearConfig",
+                "AutoModelForCausalLM": "modeling_kimi_linear.KimiLinearForCausalLM",
+            },
+            torch_dtype="bfloat16",
+        )
 
 
 class KimiLinearTinyConfig(KimiLinearConfig):
@@ -446,6 +510,7 @@ class KimiLinearTinyConfig(KimiLinearConfig):
         qk_nope_head_dim=48,
         v_head_dim=48,
         use_output_gate=True,
+        use_nope=True,
     )
     linear_attention: KDAConfig | None = KDAConfig(
         num_heads=4,
@@ -501,6 +566,7 @@ class KimiLinearK3TextConfig(KimiLinearConfig):
         qk_nope_head_dim=128,
         v_head_dim=128,
         use_output_gate=True,
+        use_nope=True,
     )
     linear_attention: KDAConfig | None = KDAConfig(
         num_heads=96,

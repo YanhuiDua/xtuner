@@ -189,16 +189,16 @@ class KimiDeltaAttention(nn.Module):
         return {"A_log", "dt_bias"}
 
     def _causal_conv(self, conv: nn.Conv1d, x: torch.Tensor, seq_idx: torch.Tensor) -> torch.Tensor:
-        # x: (B, L, C) -> conv expects (B, C, L)
-        weight = conv.weight.squeeze(1)
+        # x is already channel-last (B, L, C). The custom op transposes internally when
+        # seq_idx is set, matching GatedDeltaNet: pass (B, L, C), get (B, L, C) back.
+        weight = conv.weight
         bias = conv.bias
         if isinstance(weight, DTensor):
-            weight = weight.to_local()
+            weight = weight.full_tensor()
         if bias is not None and isinstance(bias, DTensor):
-            bias = bias.to_local()
-        x_t = x.transpose(1, 2).contiguous()
-        y = self.causal_conv1d_fn(x_t, weight, bias, activation="silu", seq_idx=seq_idx)
-        return y.transpose(1, 2).contiguous()
+            bias = bias.full_tensor()
+        weight = weight.squeeze(1)
+        return self.causal_conv1d_fn(x.contiguous(), weight, bias, activation="silu", seq_idx=seq_idx)
 
     def _fallback_kda(
         self,

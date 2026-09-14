@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """8-GPU torchrun smoke for Kimi Linear tiny (AttnRes + LatentMoE load/forward).
 
-Usage:
+Generate the tiny checkpoint in a single process before torchrun (save_hf must
+not run inside an already-initialized process group):
+
+  PYTHONPATH=. python .dev_scripts/gen_kimi_linear_tiny_bf16.py work_dirs/kimi_linear_tiny_bf16
   torchrun --standalone --nproc-per-node=8 \\
     examples/v1/scripts/smoke_kimi_linear_tiny.py \\
     [--ckpt work_dirs/kimi_linear_tiny_bf16] [--seq-len 64]
+
+Or use examples/v1/scripts/run_kimi_linear_tiny_8gpu.sh, which generates first.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ def parse_args() -> argparse.Namespace:
         "--ckpt",
         type=Path,
         default=None,
-        help="Optional tiny bf16 checkpoint dir (generated if missing)",
+        help="Optional tiny bf16 checkpoint dir (from_hf if present; else init_weights)",
     )
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--seed", type=int, default=0)
@@ -42,7 +47,7 @@ def main() -> None:
 
     from xtuner.v1.config import FSDPConfig
     from xtuner.v1.data_proto import SequenceContext
-    from xtuner.v1.loss import CELossConfig
+    from xtuner.v1.loss import CELossConfig, CELossContext
     from xtuner.v1.model.moe.kimi_linear import KimiLinearTinyConfig
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -61,24 +66,6 @@ def main() -> None:
     torch.manual_seed(args.seed + rank)
 
     ckpt = args.ckpt or (repo / "work_dirs" / "kimi_linear_tiny_bf16")
-    if rank == 0:
-        if not ckpt.exists() or not any(ckpt.glob("*.safetensors")) and not (ckpt / "model.safetensors.index.json").exists():
-            # Generate tiny weights on rank0 only
-            from importlib.util import module_from_spec, spec_from_file_location
-
-            gen_path = repo / ".dev_scripts" / "gen_kimi_linear_tiny_bf16.py"
-            spec = spec_from_file_location("gen_kimi_linear_tiny_bf16", gen_path)
-            assert spec and spec.loader
-            mod = module_from_spec(spec)
-            # Call main via subprocess-like argv
-            old_argv = sys.argv
-            try:
-                sys.argv = [str(gen_path), str(ckpt)]
-                spec.loader.exec_module(mod)
-                mod.main()
-            finally:
-                sys.argv = old_argv
-    dist.barrier()
 
     cfg = KimiLinearTinyConfig()
     with torch.device("meta"):
@@ -110,6 +97,8 @@ def main() -> None:
     labels = ids.clone()
     seq_ctx = SequenceContext.from_input_ids(input_ids=(ids,))
     loss_ctx = CELossConfig().build(data={"shifted_labels": labels}, sp_mesh=None)
+    assert loss_ctx is not None
+    loss_ctx = CELossContext.build_batches([loss_ctx])[0]
 
     model.train()
     out = model(seq_ctx=seq_ctx, loss_ctx={"lm": loss_ctx})
