@@ -94,7 +94,6 @@ jobs:
 
     - name: unit-test
       run: |
-        source /etc/profile.d/ssh-init.sh
         export PYTHONPYCACHEPREFIX=/tmp
         if [ "${{ needs.detect_changes.outputs.only_rl }}" = "true" ]; then
           test_target="tests/rl"
