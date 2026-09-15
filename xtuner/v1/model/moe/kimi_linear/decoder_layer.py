@@ -24,8 +24,24 @@ from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
     MoEDecoderLayerOutput,
     MoEMLP,
 )
+from xtuner.v1.module.attention.kda import KimiDeltaAttention
 from xtuner.v1.module.linear import build_linear
 from xtuner.v1.utils import ForwardState
+
+
+def _run_self_attn(
+    attn: nn.Module,
+    hidden_states: torch.Tensor,
+    seq_ctx: SequenceContext,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+) -> AttnOutputs:
+    if isinstance(attn, KimiDeltaAttention):
+        return attn(hidden_states=hidden_states, seq_ctx=seq_ctx)
+    return attn(
+        hidden_states=hidden_states,
+        position_embeddings=position_embeddings,
+        seq_ctx=seq_ctx,
+    )
 
 
 def apply_attn_res(
@@ -191,10 +207,8 @@ class KimiDenseDecoderLayer(DenseDecoderLayer):
             prefix_sum = None
 
         hidden_states = self.input_layernorm(hidden_states)
-        attn_outputs: AttnOutputs = self.self_attn(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            seq_ctx=seq_ctx,
+        attn_outputs: AttnOutputs = _run_self_attn(
+            self.self_attn, hidden_states, seq_ctx, position_embeddings
         )
         attn_out = attn_outputs["projected_output"]
         if prefix_sum is not None:
@@ -378,10 +392,8 @@ class KimiMoEDecoderLayer(MoEDecoderLayer):
 
         # Attention (no classic residual — AttnRes owns the mix)
         hidden_states = self.input_layernorm(hidden_states)
-        attn_outputs: AttnOutputs = self.self_attn(
-            hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
-            seq_ctx=seq_ctx,
+        attn_outputs: AttnOutputs = _run_self_attn(
+            self.self_attn, hidden_states, seq_ctx, position_embeddings
         )
         attn_out = attn_outputs["projected_output"]
         if prefix_sum is not None:

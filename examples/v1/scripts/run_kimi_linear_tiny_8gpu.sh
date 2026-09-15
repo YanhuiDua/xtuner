@@ -9,6 +9,8 @@ export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 CKPT="${CKPT:-${REPO_ROOT}/work_dirs/kimi_linear_tiny_bf16}"
 WORK_DIR="${WORK_DIR:-${REPO_ROOT}/work_dirs/kimi_linear_tiny_8gpu_smoke}"
 SEQ_LEN="${SEQ_LEN:-64}"
+STEPS="${STEPS:-5}"
+LR="${LR:-1e-3}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29511}"
@@ -38,4 +40,8 @@ torchrun \
   "${REPO_ROOT}/examples/v1/scripts/smoke_kimi_linear_tiny.py" \
   --ckpt "${CKPT}" \
   --seq-len "${SEQ_LEN}" \
+  --steps "${STEPS}" \
+  --lr "${LR}" \
   2>&1 | tee -a "${WORK_DIR}/smoke.log"
+
+# todo: check环境变量的含义，是否设置正确

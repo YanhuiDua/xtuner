@@ -477,6 +477,7 @@ class KimiLinearConfig(MoEConfig):
         )
 
 
+# 虚拟的小尺寸模型
 class KimiLinearTinyConfig(KimiLinearConfig):
     """Tiny random-weight config for load / smoke tests."""
 
@@ -535,6 +536,7 @@ class KimiLinearTinyConfig(KimiLinearConfig):
     tie_word_embeddings: bool = False
 
 
+# text tower的配置（完整模型2.8T）
 class KimiLinearK3TextConfig(KimiLinearConfig):
     """Published Kimi-K3 text-tower dimensions (structure only; weights separate)."""
 
