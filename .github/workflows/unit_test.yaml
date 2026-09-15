@@ -2,7 +2,7 @@ name: unit_test
 on:
   pull_request:
     branches:
-      - "main"
+      - "master"
     paths-ignore:
       - "docs/**"
       - "**.md"
