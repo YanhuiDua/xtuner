@@ -310,13 +310,16 @@ def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7, num_experts: int = 1)
         (2.8366, -3.0525, 1.2012),
     ]
 
-    X = G.to(dtype=torch.bfloat16)
-    original_shape = X.shape
+    # Normalize in FP32, then use BF16 for the Newton-Schulz iteration.  The
+    # previous order (cast first, normalize second) made the scale depend on
+    # BF16 quantization of the input update.
+    G = G.float()
+    original_shape = G.shape
 
     # Unified reshape: (num_experts * M, N) -> (num_experts, M, N)
     # For num_experts=1, this is (M, N) -> (1, M, N), adding a batch dim
-    N = X.size(-1)
-    X = X.view(num_experts, -1, N)
+    N = G.size(-1)
+    X = G.view(num_experts, -1, N)
 
     # Transpose if rows > cols for numerical stability
     need_transpose = X.size(-2) > X.size(-1)
@@ -325,7 +328,8 @@ def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7, num_experts: int = 1)
 
     # Normalize each expert matrix independently
     # norm shape: (num_experts, 1, 1) - each expert has its own normalization factor
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + epsilon)
+    norm = X.norm(dim=(-2, -1), keepdim=True).clamp_min(epsilon)
+    X = (X / norm).to(dtype=torch.bfloat16)
 
     # Allocate buffers for 3D tensors
     X = X.contiguous()

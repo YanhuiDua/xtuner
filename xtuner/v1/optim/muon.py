@@ -1582,13 +1582,16 @@ def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7, num_experts: i
         (2.8366, -3.0525, 1.2012),
     ]
 
-    X = G.to(dtype=torch.bfloat16)
-    original_shape = X.shape
+    # Compute the input scale in FP32 before converting to BF16.  Computing
+    # the norm after the cast makes the normalization factor depend on BF16
+    # quantization (and can noticeably distort small updates).
+    G = G.float()
+    original_shape = G.shape
 
     # Unified handling: reshape to (num_experts, M, N) for both cases
     # For regular case (num_experts=1), this adds a batch dimension of size 1
-    N = X.size(-1)
-    X = X.view(num_experts, -1, N)
+    N = G.size(-1)
+    X = G.view(num_experts, -1, N)
 
     # Transpose if needed (when rows > cols) for numerical stability in NS iteration
     # This ensures X @ X.mT produces a smaller square matrix
@@ -1598,7 +1601,8 @@ def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7, num_experts: i
 
     # Ensure spectral norm is at most 1 for each expert matrix independently
     # norm shape: (num_experts, 1, 1) - each expert has its own normalization factor
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + epsilon)
+    norm = X.norm(dim=(-2, -1), keepdim=True).clamp_min(epsilon)
+    X = (X / norm).to(dtype=torch.bfloat16)
 
     # Newton-Schulz iteration: orthogonalize each expert matrix
     # Using batch matrix multiplication (@) to process all experts in parallel
