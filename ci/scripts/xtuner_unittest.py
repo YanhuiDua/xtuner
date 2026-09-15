@@ -65,6 +65,7 @@ def main():
         cpus_per_task=120,  # 更多CPU资源（基于test_clusterx_sft.py）
         memory_per_task="800",  # 更大内存（基于test_clusterx_sft.py的1800G配置）
         num_nodes=args.nodes,
+        priority=1,
         no_env=True,  # 不继承环境变量，使用自定义环境
     )
 
