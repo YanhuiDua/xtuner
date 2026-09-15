@@ -94,6 +94,8 @@ jobs:
 
     - name: unit-test
       run: |
+        export KUBEBRAIN_CLUSTER_ENTRY=http://wangyixiuan-cpu.linzhouhan.ailab-llmarchitecture.svc.pjlab.local:11451
+        export KUBEBRAIN_NAMESPACE=ailab-llmarchitecture 
         export PYTHONPYCACHEPREFIX=/tmp
         if [ "${{ needs.detect_changes.outputs.only_rl }}" = "true" ]; then
           test_target="tests/rl"
