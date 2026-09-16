@@ -22,6 +22,51 @@ except ImportError:
 _COMPILED_ROUTES: dict[tuple[int, int, bool], Callable] = {}
 
 
+# The fused route needs its endpoints as one contiguous ``[rows, num_sources, hidden]``
+# block. Building that with ``torch.stack`` allocates a fresh block per layer, and the
+# block grows by one source per layer, so a single forward asks the caching allocator
+# for ~32 ever-larger blocks of up to a couple of GiB. Under
+# ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` those large blocks are returned to
+# the driver once they fall out of the cache and have to be mapped again on the next
+# step; the mapping blocks the caller for 10-160 ms, which is long enough to miss the
+# next layer's FSDP all-gather and stall the whole step. One long-lived buffer per
+# (device, dtype, hidden_size) keeps the allocation out of the hot path: the route
+# writes into a strided window of it and the kernel is told the row stride.
+_STACK_SCRATCH: dict[tuple[int, torch.dtype, int], tuple[int, int, Tensor]] = {}
+
+
+def _stack_scratch(rows: int, num_sources: int, hidden_size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    """Return a reusable ``[rows, >=num_sources, hidden_size]`` endpoint buffer."""
+    key = (device.index if device.index is not None else -1, dtype, hidden_size)
+    entry = _STACK_SCRATCH.get(key)
+    if entry is None or entry[0] != rows or entry[1] < num_sources:
+        capacity = num_sources if entry is None else max(num_sources, entry[1])
+        buffer = torch.empty(rows, capacity, hidden_size, device=device, dtype=dtype)
+        _STACK_SCRATCH[key] = (rows, capacity, buffer)
+        return buffer
+    return entry[2]
+
+
+def _stack_endpoints(sources: list[Tensor]) -> tuple[Tensor, int]:
+    """Copy ``sources`` into the shared scratch.
+
+    Returns the ``[rows, num_sources, hidden]`` window and the stride between rows in
+    the underlying buffer, which the kernels need because the window is a slice of a
+    wider scratch.
+
+    The endpoints keep any leading dimensions, so they are flattened to two dimensions
+    first; that view is free for the contiguous layer outputs this route consumes.
+
+    Only valid inside an ``autograd.Function.forward`` / ``backward`` body, where grad
+    mode is disabled -- ``torch.cat(out=...)`` does not support autograd on its output.
+    """
+    hidden_size = sources[0].shape[-1]
+    rows = sources[0].numel() // hidden_size
+    buffer = _stack_scratch(rows, len(sources), hidden_size, sources[0].device, sources[0].dtype)
+    flat = [source.reshape(rows, hidden_size).unsqueeze(-2) for source in sources]
+    return torch.cat(flat, dim=-2, out=buffer[:rows, : len(sources), :]), buffer.shape[1]
+
+
 def _raise_dynamo_limits() -> None:
     """Give Dynamo room for one graph per layer width without tripping its guard."""
     for name, floor in (
@@ -122,6 +167,7 @@ if _HAS_TRITON:
         inv_rms_ptr,
         eps,
         N: tl.constexpr,
+        NST: tl.constexpr,
         H: tl.constexpr,
         BLOCK_H: tl.constexpr,
         PREPOST: tl.constexpr,
@@ -134,7 +180,7 @@ if _HAS_TRITON:
             source_norm = tl.load(source_norm_ptr + offs_h, mask=h_mask, other=0.0).to(tl.float32)
         acc = tl.zeros((4, BLOCK_H), dtype=tl.float32)
         for n in tl.static_range(N):
-            x = tl.load(stacked_ptr + row * N * H + n * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+            x = tl.load(stacked_ptr + row * NST * H + n * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
             if PREPOST:
                 inv_rms = tl.rsqrt(tl.sum(x * x, axis=0) / H + eps)
                 # Hand the per-source normalization to the backward pass, which
@@ -283,6 +329,12 @@ class _MUDDCombineTriton(torch.autograd.Function):
     model holds ~560 hidden-sized slices for the whole backward -- at
     8192x4096 bf16 that is ~35 GiB per sequence, which dominated the route's
     footprint and made the route, not the layers, the memory ceiling.
+
+    The forward's own stack lives in a shared scratch buffer (see
+    :func:`_stack_endpoints`) instead of a fresh allocation per layer, so the route
+    never asks the allocator for a growing multi-GiB block while the step sits at its
+    memory high-water mark. The backward keeps a private stack because ``grad_stacked``
+    is handed back as the endpoint gradients.
     """
 
     @staticmethod
@@ -296,9 +348,8 @@ class _MUDDCombineTriton(torch.autograd.Function):
         prepost: bool,
         *sources: Tensor,
     ) -> Tensor:
-        stacked = torch.stack(sources, dim=-2)
-        num_sources, hidden_size = stacked.shape[-2], stacked.shape[-1]
-        rows = stacked.numel() // (num_sources * hidden_size)
+        stacked, row_stride = _stack_endpoints(list(sources))
+        rows, num_sources, hidden_size = stacked.shape
         out = torch.empty(rows, 4, hidden_size, device=stacked.device, dtype=stacked.dtype)
         # Per-source inverse RMS from the forward, reused by the backward so its
         # loops stay free of cross-lane reductions. 4 bytes per source per row.
@@ -306,7 +357,7 @@ class _MUDDCombineTriton(torch.autograd.Function):
         block_h = triton.next_power_of_2(hidden_size)
         _mudd_combine_fwd_kernel[(rows,)](
             current_raw.reshape(rows, hidden_size),
-            stacked.reshape(rows, num_sources, hidden_size),
+            stacked,
             weights.reshape(rows, 4, num_sources),
             source_norm,
             post_norm,
@@ -314,6 +365,7 @@ class _MUDDCombineTriton(torch.autograd.Function):
             inv_rms,
             eps,
             N=num_sources,
+            NST=row_stride,
             H=hidden_size,
             BLOCK_H=block_h,
             PREPOST=prepost,
@@ -322,7 +374,7 @@ class _MUDDCombineTriton(torch.autograd.Function):
         ctx.save_for_backward(current_raw, weights, source_norm, post_norm, inv_rms, *sources)
         ctx.eps = eps
         ctx.prepost = prepost
-        return out.reshape(*stacked.shape[:-2], 4, hidden_size)
+        return out.reshape(*sources[0].shape[:-1], 4, hidden_size)
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):

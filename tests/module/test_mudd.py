@@ -15,6 +15,9 @@ TestQwen35MUDDStack
     test_zero_init_stack_reads_back_layer_output: 零初始化时 finish_layer 后 final_read 严格等于当层输出。
 TestQwen35MUDDRouteFusedParity
     test_fused_eager_matches_loop_reference: 融合 eager 路径与逐 source 循环参考实现输出一致。
+TestQwen35MUDDStackScratch
+    test_stack_endpoints_reuse_one_buffer: 融合路径的端点栈复用同一个 scratch，宽度变化只换窗口不换缓冲。
+    test_scratch_never_enters_the_state_dict: scratch 不落在模块属性/state_dict 上。
 TestQwen35MUDDRouteCompile
     test_compile_matches_eager_fused: compile 路径与融合 eager 路径输出一致。
     test_compile_zero_init_is_identity: compile 路径零初始化时四路输出严格等于 raw 当前层输出。
@@ -24,6 +27,7 @@ TestQwen35MUDDRouteTritonKernel
     test_triton_kernel_backward_matches_loop_reference: Triton kernel 反向梯度与循环参考实现一致。
     test_triton_kernel_zero_init_is_identity: Triton kernel 零初始化时四路输出严格等于 raw 当前层输出。
     test_triton_kernel_handles_multiple_widths: Triton kernel 可处理多种 source 宽度且输出正确。
+    test_triton_kernel_shares_one_stack_scratch: 多种宽度共用一份 scratch 缓冲且结果仍与参考一致。
     test_triton_kernel_bf16_smoke: bf16 下前向/反向可运行且梯度有限。
 """
 
@@ -221,6 +225,38 @@ class TestQwen35MUDDRouteFusedParity:
             torch.testing.assert_close(output, reference, rtol=1e-4, atol=1e-6)
 
 
+class TestQwen35MUDDStackScratch:
+    """The fused route copies its endpoints into one shared scratch instead of stacking per layer."""
+
+    def test_stack_endpoints_reuse_one_buffer(self):
+        import xtuner.v1.module.mudd as mudd_mod
+
+        mudd_mod._STACK_SCRATCH.clear()
+        generator = torch.Generator().manual_seed(0)
+        wide = [torch.randn(2, 3, HIDDEN_SIZE, generator=generator) for _ in range(5)]
+        narrow = [torch.randn(2, 3, HIDDEN_SIZE, generator=generator) for _ in range(2)]
+
+        window, row_stride = mudd_mod._stack_endpoints(wide)
+        assert window.shape == (6, 5, HIDDEN_SIZE)
+        assert row_stride == 5
+        flat_wide = [tensor.reshape(6, HIDDEN_SIZE) for tensor in wide]
+        assert torch.equal(window, torch.stack(flat_wide, dim=-2))
+
+        # A narrower route reuses the same buffer: no second allocation, same row stride.
+        small, small_stride = mudd_mod._stack_endpoints(narrow)
+        assert small_stride == 5
+        assert small.data_ptr() == window.data_ptr()
+        assert small.shape == (6, 2, HIDDEN_SIZE)
+        flat_narrow = [tensor.reshape(6, HIDDEN_SIZE) for tensor in narrow]
+        assert torch.equal(small, torch.stack(flat_narrow, dim=-2))
+        assert len(mudd_mod._STACK_SCRATCH) == 1
+
+    def test_scratch_never_enters_the_state_dict(self):
+        route = _build_route(num_sources=3)
+        assert not any("scratch" in key for key in route.state_dict())
+        assert not hasattr(route, "_STACK_SCRATCH")
+
+
 def _compile_available() -> bool:
     try:
         probe = torch.compile(lambda x: x * 2, fullgraph=True)
@@ -408,6 +444,31 @@ class TestQwen35MUDDRouteTritonKernel:
             assert len(outputs) == len(expected) == 4
             for output, reference_output in zip(outputs, expected):
                 torch.testing.assert_close(output, reference_output, rtol=1e-4, atol=1e-6)
+
+    def test_triton_kernel_shares_one_stack_scratch(self):
+        if not _triton_kernel_available():
+            pytest.skip("triton or CUDA unavailable in this environment")
+        import xtuner.v1.module.mudd as mudd_mod
+
+        mudd_mod._STACK_SCRATCH.clear()
+        for num_sources in (2, 7):
+            reference = _build_route(num_sources=num_sources)
+            _perturb_route(reference, seed=5)
+            route = _build_kernel_route_like(reference).cuda()
+            reference = reference.cuda()
+            current_raw, sources = _build_inputs(num_sources=num_sources)
+            current_raw = current_raw.cuda()
+            sources = [source.cuda() for source in sources]
+            outputs = route(current_raw, sources)
+            expected = _loop_reference(reference, current_raw, sources)
+            for output, reference_output in zip(outputs, expected):
+                torch.testing.assert_close(output, reference_output, rtol=1e-4, atol=1e-6)
+
+        # One buffer serves every width, sized for the widest route seen so far.
+        assert len(mudd_mod._STACK_SCRATCH) == 1
+        rows, capacity, buffer = next(iter(mudd_mod._STACK_SCRATCH.values()))
+        assert (rows, capacity) == (6, 7)
+        assert tuple(buffer.shape) == (6, 7, HIDDEN_SIZE)
 
     def test_triton_kernel_bf16_smoke(self):
         if not _triton_kernel_available():
