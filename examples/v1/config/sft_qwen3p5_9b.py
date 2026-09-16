@@ -33,7 +33,7 @@ work_dir = Path(
 data_path = Path(
     os.environ.get(
         "DATA_PATH",
-        "/mnt/shared-storage-user/llmrazor-share/geruijun/ncp-dataset/megatron_qwen35_8192/indexed",
+        work_dir / "data/indexed",
     )
 )
 seq_len = int(os.environ.get("SEQ_LEN", "8192"))

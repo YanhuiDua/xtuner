@@ -322,6 +322,18 @@ class ConceptLMV22VQ(BaseModel):
         return loaded_tensor
 
     @override
+    def _init_load_spec(self) -> None:
+        super()._init_load_spec()
+        if self.lm_head.out_features == self.config.vocab_size:
+            return
+
+        load_spec = self.load_spec_mapping["lm_head.weight"]
+        assert load_spec.global_shape[0] == self.lm_head.out_features
+        origin_shape = load_spec.origin_shape or load_spec.global_shape
+        assert self.config.vocab_size <= origin_shape[0] <= load_spec.global_shape[0]
+        load_spec.origin_shape = (self.config.vocab_size, *origin_shape[1:])
+
+    @override
     def param_to_safetensor(self, safetensor: torch.Tensor, hf_param_name: str) -> torch.Tensor:
         if hf_param_name == "fusion_norm_alpha":
             return safetensor.squeeze(0)
@@ -854,6 +866,7 @@ class ConceptLMV22VQ(BaseModel):
             self.encoder_stage_groups[0] if self.config.stage_group_size > 1 else self.encoder_stages[0]
         )
         cast(Any, self).set_modules_to_forward_prefetch([self.embed_tokens, first_encoder_module])
+        self._init_load_spec()
         self._to_empty_meta()
         return self
 

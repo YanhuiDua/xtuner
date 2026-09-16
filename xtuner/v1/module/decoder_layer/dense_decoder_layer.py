@@ -1,4 +1,4 @@
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, cast
 
 import torch
 import torch.nn as nn
@@ -86,7 +86,7 @@ class DenseDecoderLayer(nn.Module):
 
     def forward(
         self,
-        *hidden_states: torch.Tensor,
+        *hidden_states: torch.Tensor | list[torch.Tensor],
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | list[tuple[torch.Tensor, torch.Tensor]],
         seq_ctx: SequenceContext | list[SequenceContext],
         mudd_streams: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
@@ -105,15 +105,22 @@ class DenseDecoderLayer(nn.Module):
             seq_ctx (SequenceContext | list[SequenceContext]): Sequence context, aligned with
                 ``hidden_states``.
         Returns:
-            DenseDecoderLayerOutput | DenseDecoderLayerMicroBatchOutput: Output hidden states. A
-            single tensor for a single ``hidden_states`` tensor, a per-micro-batch list for a list
-            of them.
+            A single hidden-state tensor for one input, or a tuple of tensors for multiple
+            micro-batches. A list passed as the first positional argument is accepted for
+            compatibility with callers using the pre-varargs interface.
         """
-        if len(hidden_states) == 1:
+        if len(hidden_states) == 1 and isinstance(hidden_states[0], list):
+            normalized_hidden_states: tuple[torch.Tensor, ...] = tuple(hidden_states[0])
+        else:
+            normalized_hidden_states = tuple(cast(torch.Tensor, hidden) for hidden in hidden_states)
+        if not normalized_hidden_states:
+            raise ValueError("DenseDecoderLayer requires at least one hidden-state tensor")
+
+        if len(normalized_hidden_states) == 1:
             assert isinstance(position_embeddings, tuple) and len(position_embeddings) == 2
             assert isinstance(seq_ctx, SequenceContext)
             return self._forward(
-                hidden_states=hidden_states[0],
+                hidden_states=normalized_hidden_states[0],
                 position_embeddings=position_embeddings,
                 seq_ctx=seq_ctx,
                 mudd_streams=mudd_streams,
@@ -121,16 +128,16 @@ class DenseDecoderLayer(nn.Module):
 
         if mudd_streams is not None:
             raise NotImplementedError("MUDD does not support intra-layer micro-batching")
-        assert isinstance(position_embeddings, list) and len(position_embeddings) == len(hidden_states)
-        assert isinstance(seq_ctx, list) and len(seq_ctx) == len(hidden_states)
-        assert all(hidden.shape == hidden_states[0].shape for hidden in hidden_states)
+        assert isinstance(position_embeddings, list) and len(position_embeddings) == len(normalized_hidden_states)
+        assert isinstance(seq_ctx, list) and len(seq_ctx) == len(normalized_hidden_states)
+        assert all(hidden.shape == normalized_hidden_states[0].shape for hidden in normalized_hidden_states)
         return tuple(
             self._forward(
                 hidden_states=hidden,
                 position_embeddings=position_embedding,
                 seq_ctx=context,
             )
-            for hidden, position_embedding, context in zip(hidden_states, position_embeddings, seq_ctx)
+            for hidden, position_embedding, context in zip(normalized_hidden_states, position_embeddings, seq_ctx)
         )
 
     def _forward(

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.distributed.nn.functional as distF
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
@@ -26,7 +27,7 @@ from xtuner.v1.model import (
 )
 from xtuner.v1.module import ConceptStage, DecoderStage, DepthDD, EncoderStage, MHAConfig, ResidualRoute
 from xtuner.v1.module.rope import RopeParametersConfig
-from xtuner.v1.utils.load_spec import LoadEnum
+from xtuner.v1.utils.load_spec import ShardDescriptor
 
 
 MODEL_PATH = os.getenv("CONCEPT_OLMO_STAGE2_V1_PATH")
@@ -200,6 +201,26 @@ def _initialize(model: torch.nn.Module) -> None:
             parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.02)
 
 
+@pytest.fixture
+def load_spec_process_group() -> dist.ProcessGroup:
+    initialized_here = False
+    if not dist.is_initialized():
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29557")
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+        initialized_here = True
+
+    process_group = dist.group.WORLD
+    assert process_group is not None
+    try:
+        yield process_group
+    finally:
+        if initialized_here:
+            dist.destroy_process_group()
+
+
 def test_config_alias_and_meta_layout():
     config = get_model_config("concept-olmo-stage2-v1")
     assert isinstance(config, ConceptOlmoStage2V1Config)
@@ -221,10 +242,10 @@ def test_config_alias_and_meta_layout():
     assert model.to_hf_key_list("prediction_heads.bias") == [
         f"concept_predictor.prediction_heads.{index}.bias" for index in range(32)
     ]
-    assert model.load_spec_mapping["prediction_heads.weight"].load_enum is LoadEnum.FUSED
-    assert model.load_spec_mapping["prediction_heads.weight"].dim == 0
-    assert model.load_spec_mapping["prediction_heads.bias"].load_enum is LoadEnum.FUSED
-    assert model.load_spec_mapping["prediction_heads.bias"].dim == 0
+    assert model.load_spec_mapping["prediction_heads.weight"].is_fused
+    assert model.load_spec_mapping["prediction_heads.weight"].fused_dim == 0
+    assert model.load_spec_mapping["prediction_heads.bias"].is_fused
+    assert model.load_spec_mapping["prediction_heads.bias"].fused_dim == 0
     assert model.lm_head.weight.shape == (config.vocab_size, 4096)
     assert model.lm_head.logical_out_features == config.vocab_size
     assert model.to_hf_key_list("encoder_stages.3.transformer.self_attention.linear_qkv.weight") == [
@@ -258,7 +279,10 @@ def test_config_alias_and_meta_layout():
     assert grouped_hf_keys == ungrouped_hf_keys
 
 
-def test_lm_head_vocab_padding_checkpoint_conversion():
+def test_lm_head_vocab_padding_checkpoint_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+    load_spec_process_group: dist.ProcessGroup,
+):
     config = _tiny_config().model_copy(
         update={"vocab_size": 126, "lm_head_vocab_padding_multiple": 8}
     )
@@ -266,27 +290,32 @@ def test_lm_head_vocab_padding_checkpoint_conversion():
     checkpoint_weight = torch.randn(config.vocab_size, config.hidden_size)
     local_weight = torch.empty(128, config.hidden_size)
 
-    model.safetensors_to_params(
-        [checkpoint_weight],
-        local_weight,
-        param_name="lm_head.weight",
-        start=None,
-        end=None,
-        dim=None,
-    )
+    load_spec = model.load_spec_mapping["lm_head.weight"]
+    assert load_spec.origin_shape == (config.vocab_size, config.hidden_size)
+    load_plan = load_spec.plan_hf_load()
+    assert load_plan.hf_keys == ["output_layer.weight"]
+    load_plan.load_into([checkpoint_weight], local_weight, model.hf_tensor_to_canonical)
     torch.testing.assert_close(local_weight[: config.vocab_size], checkpoint_weight)
-    torch.testing.assert_close(local_weight[config.vocab_size :], torch.zeros_like(local_weight[-2:]))
+    torch.testing.assert_close(
+        local_weight[config.vocab_size :],
+        torch.zeros_like(local_weight[config.vocab_size :]),
+    )
     saved_weight = model.param_to_safetensor(local_weight, "output_layer.weight")
     torch.testing.assert_close(saved_weight, checkpoint_weight)
 
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 8)
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: 7)
+    sharded_load_spec = load_spec.model_copy(
+        update={
+            "shards": [ShardDescriptor(dim=0, group=load_spec_process_group)],
+            "local_shape": (16, config.hidden_size),
+        }
+    )
     local_shard = torch.empty(16, config.hidden_size)
-    model.safetensors_to_params(
+    sharded_load_spec.plan_hf_load().load_into(
         [checkpoint_weight],
         local_shard,
-        param_name="lm_head.weight",
-        start=112,
-        end=128,
-        dim=None,
+        model.hf_tensor_to_canonical,
     )
     torch.testing.assert_close(local_shard[:14], checkpoint_weight[112:126])
     torch.testing.assert_close(local_shard[14:], torch.zeros_like(local_shard[14:]))
@@ -337,21 +366,15 @@ def test_fused_prediction_heads_checkpoint_conversion():
     fused_weight = torch.empty(num_codebooks * codebook_size, config.hidden_size)
     fused_bias = torch.empty(num_codebooks * codebook_size)
 
-    model.safetensors_to_params(
+    model.load_spec_mapping["prediction_heads.weight"].plan_hf_load().load_into(
         weights,
         fused_weight,
-        param_name="prediction_heads.weight",
-        start=None,
-        end=None,
-        dim=0,
+        model.hf_tensor_to_canonical,
     )
-    model.safetensors_to_params(
+    model.load_spec_mapping["prediction_heads.bias"].plan_hf_load().load_into(
         biases,
         fused_bias,
-        param_name="prediction_heads.bias",
-        start=None,
-        end=None,
-        dim=0,
+        model.hf_tensor_to_canonical,
     )
     torch.testing.assert_close(fused_weight, torch.cat(weights))
     torch.testing.assert_close(fused_bias, torch.cat(biases))
@@ -833,17 +856,31 @@ def test_checkpoint_config_and_key_coverage():
 
 @pytest.mark.skipif(MODEL_PATH is None, reason="CONCEPT_OLMO_STAGE2_V1_PATH is not set")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the full checkpoint")
-def test_full_checkpoint_forward_bitwise(monkeypatch):
+def test_full_checkpoint_padded_lm_head_forward_bitwise(monkeypatch):
     assert MODEL_PATH is not None
     monkeypatch.setenv("XTUNER_HF_IMPL", "true")
     config = ConceptLMV22VQConfig.from_hf(MODEL_PATH)
-    config.compile_cfg = False
+    config = config.model_copy(
+        update={
+            "compile_cfg": False,
+            "lm_head_vocab_padding_multiple": 8,
+        }
+    )
     with torch.device("meta"):
         model = config.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
     loaded, unloaded, missing = model.from_hf(MODEL_PATH)
     assert len(loaded) == 631
     assert not unloaded
     assert not missing
+    load_spec = model.load_spec_mapping["lm_head.weight"]
+    assert load_spec.origin_shape == (config.vocab_size, config.hidden_size)
+    expected_physical_vocab_size = (
+        (config.vocab_size + config.lm_head_vocab_padding_multiple - 1)
+        // config.lm_head_vocab_padding_multiple
+        * config.lm_head_vocab_padding_multiple
+    )
+    assert model.lm_head.weight.shape[0] == expected_physical_vocab_size
+    assert torch.count_nonzero(model.lm_head.weight[config.vocab_size :]).item() == 0
 
     input_ids = torch.arange(1, 9, device="cuda", dtype=torch.long).unsqueeze(0)
     seq_ctx = SequenceContext.from_input_ids((input_ids,), device="cuda")

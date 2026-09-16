@@ -564,9 +564,8 @@ class LoadSpec(BaseModel):
             This is the runtime shape and may include padding introduced by XTuner float8 weights.
         fused_dim (int | None): HF key concatenation dim when ``len(global_hf_keys) > 1``; ``None`` otherwise.
         shards (list[ShardDescriptor]): Partitions applied to the full tensor in outer-to-inner order.
-        origin_shape (tuple[int, ...] | None): Checkpoint-visible global shape after trimming runtime-only padding.
-            The current caller sets it from fp8 tensor metadata; ``None`` means the runtime shape is already the
-            checkpoint shape.
+        origin_shape (tuple[int, ...] | None): Checkpoint-visible global shape after trimming runtime-only or
+            model-specific logical padding. ``None`` means the runtime shape is already the checkpoint shape.
         local_shape (tuple[int, ...] | None): Runtime local-tensor shape. It is recorded explicitly for layouts such
             as InterleavedShard and checked against the shape derived from ``global_shape`` and ``shards``.
     """
@@ -615,8 +614,8 @@ class LoadSpec(BaseModel):
             name (str): Fully-qualified parameter or buffer name on the xtuner side.
             hf_keys (list[str]): HF key list corresponding to ``tensor``.
             tensor (torch.Tensor | DTensor): Runtime tensor whose DTensor placements should be captured.
-            origin_shape (tuple[int, ...] | None): Optional checkpoint-visible shape after trimming runtime-only
-                padding.
+            origin_shape (tuple[int, ...] | None): Optional checkpoint-visible shape after trimming runtime-only or
+                model-specific logical padding.
 
         Returns:
             LoadSpec: Spec derived from the runtime tensor layout.
@@ -648,8 +647,8 @@ class LoadSpec(BaseModel):
     def plan_hf_load(self) -> HFLoadPlan:
         """Build a safetensors read plan from this layout spec.
 
-        Runtime-only padding currently comes from XTuner float8 weights. In that case, ``origin_shape`` is used as
-        the checkpoint-visible full tensor shape, while ``global_shape`` and ``shards`` still describe the padded
+        ``origin_shape`` is used as the checkpoint-visible full tensor shape when runtime-only or model-specific
+        padding makes it smaller than ``global_shape``. ``global_shape`` and ``shards`` still describe the padded
         runtime layout that this rank owns.
 
         Returns:

@@ -486,7 +486,7 @@ class Dense(BaseModel):
         )
         mtp_losses = torch.tensor(0.0, device=DEVICE)
         for mtp_output, mtp_ctx in zip(mtp_outputs, mtp_loss_ctx_list):
-            mtp_hidden_states = mtp_output[0]
+            mtp_hidden_states = mtp_output["hidden_states"]
             mtp_loss, _ = self.lm_head(mtp_hidden_states, cast(MTPLossContext, mtp_ctx))
             mtp_losses += mtp_loss
 

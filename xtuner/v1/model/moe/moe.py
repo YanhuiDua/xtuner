@@ -836,8 +836,11 @@ class MoE(BaseModel):
             if layer_idx < self.config.first_k_dense_replace:
                 # Keep each micro-batch in its own SequenceContext while issuing
                 # one outer layer call, so FSDP materializes dense weights once.
-                dense_results = cast(DenseDecoderLayerMicroBatchOutput, layer_results)
-                hidden_states_list = dense_results["hidden_states"]
+                if isinstance(layer_results, tuple):
+                    hidden_states_list = list(layer_results)
+                else:
+                    dense_results = cast(DenseDecoderLayerMicroBatchOutput, layer_results)
+                    hidden_states_list = dense_results["hidden_states"]
                 continue
 
             layer_results = cast(MoEDecoderLayerMicroBatchOutput, layer_results)
@@ -1053,8 +1056,14 @@ class MoE(BaseModel):
             )
             previous_layer_results = cast(DenseDecoderLayerOutput | MoEDecoderLayerOutput, layer_results)
             if layer_idx < self.config.first_k_dense_replace:
-                dense_results = cast(DenseDecoderLayerOutput, layer_results)
-                hidden_states = dense_results["hidden_states"]
+                if isinstance(layer_results, torch.Tensor):
+                    hidden_states = layer_results
+                elif isinstance(layer_results, tuple):
+                    assert len(layer_results) == 1
+                    hidden_states = layer_results[0]
+                else:
+                    dense_results = cast(DenseDecoderLayerOutput, layer_results)
+                    hidden_states = dense_results["hidden_states"]
             else:
                 layer_results = cast(MoEDecoderLayerOutput, layer_results)
                 hidden_states = layer_results["hidden_states"]
@@ -1094,6 +1103,8 @@ class MoE(BaseModel):
             | DenseDecoderLayerMicroBatchOutput
             | MoEDecoderLayerOutput
             | MoEDecoderLayerMicroBatchOutput
+            | torch.Tensor
+            | tuple[torch.Tensor, ...]
             | None
         ),
     ) -> (
@@ -1101,6 +1112,8 @@ class MoE(BaseModel):
         | DenseDecoderLayerMicroBatchOutput
         | MoEDecoderLayerOutput
         | MoEDecoderLayerMicroBatchOutput
+        | torch.Tensor
+        | tuple[torch.Tensor, ...]
     ):
         """Call one decoder layer and contain its activation-offload window.
 
@@ -1108,6 +1121,12 @@ class MoE(BaseModel):
         consume private cross-layer fields without widening the common decoder API.
         """
         if layer_idx < self.config.first_k_dense_replace:
+            if isinstance(hidden_states, list):
+                return decoder_layer(
+                    *hidden_states,
+                    position_embeddings=position_embeddings,
+                    seq_ctx=seq_ctx,
+                )
             return decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
