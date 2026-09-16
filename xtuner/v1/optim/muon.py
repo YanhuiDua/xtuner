@@ -611,7 +611,9 @@ class Muon(Optimizer):
             lr = torch.tensor(group["lr"])
             mu = torch.tensor(group["mu"])
             weight_decay = torch.tensor(group["weight_decay"])
-            epsilon = torch.tensor(group["epsilon"])
+            # Newton-Schulz normalises with clamp_min(epsilon), which rejects a CPU
+            # scalar tensor; keep it a float the way the AdamW batch path does.
+            epsilon = float(group["epsilon"])
 
             nesterov = group["nesterov"]
             flatten = group["flatten"]
