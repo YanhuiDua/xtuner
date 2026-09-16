@@ -38,7 +38,6 @@ export PYTEST_ADDOPTS='-o cache_dir=/tmp/.pytest_cache'
 # Some DDP test will cost more than 300s, set it to 600 avoid timeout error.
 export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=600
 
-proxy_off
 pip install -e .[all]
 
 TORCH_VERSION=$(python -c "import torch;print(torch.__version__.split('+')[0])")
