@@ -10,88 +10,102 @@ import torch.nn as nn
 from cyclopts import Parameter
 from einops import rearrange
 from pydantic import BaseModel, ConfigDict
-from torch.distributed.tensor import DTensor
 
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
+from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
+from xtuner.v1.ops.gated_deltanet.dtensor import dtensor_full_tensor, materialize_depthwise_conv1d_weight_bias
+from xtuner.v1.ops.gated_deltanet.fused_rms_norm_gated import (
+    FusedRMSNormGated,
+    _fused_rms_norm_gated_import_error,
+    has_fused_rms_norm_gated,
+)
 from xtuner.v1.utils import init_params
 
 from ..linear import build_linear
 from .attn_outputs import AttnOutputs
 
 
+# Separate call-site wrappers so Dynamo caches each SP collective independently (same as GDN).
+def _all_to_all_conv_pre_q(x, scatter_dim, gather_dim, mesh):
+    return ulysses_all_to_all(x, scatter_dim=scatter_dim, gather_dim=gather_dim, mesh=mesh)
+
+
+def _all_to_all_conv_pre_k(x, scatter_dim, gather_dim, mesh):
+    return ulysses_all_to_all(x, scatter_dim=scatter_dim, gather_dim=gather_dim, mesh=mesh)
+
+
+def _all_to_all_conv_pre_v(x, scatter_dim, gather_dim, mesh):
+    return ulysses_all_to_all(x, scatter_dim=scatter_dim, gather_dim=gather_dim, mesh=mesh)
+
+
+def _all_to_all_g(x, scatter_dim, gather_dim, mesh):
+    return ulysses_all_to_all(x, scatter_dim=scatter_dim, gather_dim=gather_dim, mesh=mesh)
+
+
+def _all_to_all_beta(x, scatter_dim, gather_dim, mesh):
+    return ulysses_all_to_all(x, scatter_dim=scatter_dim, gather_dim=gather_dim, mesh=mesh)
+
+
+def _all_to_all_out(x, scatter_dim, gather_dim, mesh):
+    return ulysses_all_to_all(x, scatter_dim=scatter_dim, gather_dim=gather_dim, mesh=mesh)
+
+
+_fla_kda_import_error: BaseException | None = None
+chunk_kda = None  # type: ignore[assignment]
+KDAShortConvolution = None  # type: ignore[assignment,misc]
+_fla_causal_conv1d = None  # type: ignore[assignment]
+
 try:
-    from fla.modules import FusedRMSNormGated as FLA_FusedRMSNormGated
     from fla.modules import ShortConvolution as FLAShortConvolution
-    from fla.ops.kda import chunk_kda
-except ImportError as e:
-    raise ImportError("Please run `pip install -U fla-core`") from e
+    from fla.modules.conv.causal_conv1d import causal_conv1d as _fla_causal_conv1d_impl
+    from fla.ops.kda import chunk_kda as _chunk_kda
 
+    if not has_fused_rms_norm_gated or FusedRMSNormGated is None:
+        raise ImportError("FusedRMSNormGated unavailable") from _fused_rms_norm_gated_import_error
 
-class FusedRMSNormGated(FLA_FusedRMSNormGated):
-    def forward(
-        self,
-        x: torch.Tensor,
-        g: torch.Tensor,
-        residual: torch.Tensor | None = None,
-        prenorm: bool = False,
-        residual_in_fp32: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        from ...ops.gated_deltanet.rms_norm_gated import rms_norm_gated
+    _fla_causal_conv1d = _fla_causal_conv1d_impl
 
-        weight = self.weight
-        if isinstance(weight, DTensor):
-            weight = weight.to_local()
-        return rms_norm_gated(
-            x,
-            g,
-            weight,
-            self.bias,
-            self.activation,
-            residual=residual,
-            eps=self.eps,
-            prenorm=prenorm,
-            residual_in_fp32=residual_in_fp32,
-        )
+    class KDAShortConvolution(FLAShortConvolution):  # type: ignore[no-redef]
+        """HF ``ShortConvolution``; always routes through FLA ``causal_conv1d``."""
 
+        def materialize_weight_bias(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+            return materialize_depthwise_conv1d_weight_bias(self.weight, self.bias)
 
-class KDAShortConvolution(FLAShortConvolution):
-    """HF ``ShortConvolution`` with FSDP DTensor weights gathered for the kernel."""
-
-    def forward(  # type: ignore[override]
-        self,
-        x: torch.Tensor,
-        cache: torch.Tensor | None = None,
-        output_final_state: bool = False,
-        cu_seqlens: torch.Tensor | None = None,
-        **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if not isinstance(self.weight, DTensor) and not isinstance(self.bias, DTensor):
-            return super().forward(
-                x,
-                cache=cache,
+        def forward(  # type: ignore[override]
+            self,
+            x: torch.Tensor,
+            cache: torch.Tensor | None = None,
+            output_final_state: bool = False,
+            cu_seqlens: torch.Tensor | None = None,
+            weight: torch.Tensor | None = None,
+            bias: torch.Tensor | None = None,
+            **kwargs: Any,
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            assert _fla_causal_conv1d is not None
+            if weight is None:
+                weight, bias = self.materialize_weight_bias()
+            elif weight.ndim == 3:
+                weight = rearrange(weight, "d 1 w -> d w")
+            return _fla_causal_conv1d(
+                x=x,
+                weight=weight,
+                bias=bias,
+                initial_state=cache,
                 output_final_state=output_final_state,
+                activation=self.activation,
+                backend=getattr(self, "backend", "triton"),
                 cu_seqlens=cu_seqlens,
                 **kwargs,
             )
 
-        from fla.modules.conv.causal_conv1d import causal_conv1d
-
-        weight = self.weight.full_tensor() if isinstance(self.weight, DTensor) else self.weight
-        bias = self.bias
-        if bias is not None and isinstance(bias, DTensor):
-            bias = bias.full_tensor()
-        return causal_conv1d(
-            x=x,
-            weight=rearrange(weight, "d 1 w -> d w"),
-            bias=bias,
-            initial_state=cache,
-            output_final_state=output_final_state,
-            activation=self.activation,
-            backend=getattr(self, "backend", "triton"),
-            cu_seqlens=cu_seqlens,
-            **kwargs,
-        )
+    chunk_kda = _chunk_kda
+except (ImportError, ModuleNotFoundError) as e:
+    has_fla_kda = False
+    _fla_kda_import_error = e
+else:
+    has_fla_kda = True
+    _fla_kda_import_error = None
 
 
 class KDAConfig(BaseModel):
@@ -135,6 +149,13 @@ class KimiDeltaAttention(nn.Module):
         float8_cfg: Float8Config | None = None,
     ) -> None:
         super().__init__()
+        if not has_fla_kda:
+            assert _fla_kda_import_error is not None
+            raise ImportError("Please run `pip install -U fla-core`") from _fla_kda_import_error
+        assert FusedRMSNormGated is not None
+        assert KDAShortConvolution is not None
+        assert chunk_kda is not None
+
         self.name = f"layers.{layer_idx}.self_attn"
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -195,7 +216,144 @@ class KimiDeltaAttention(nn.Module):
         return {"A_log", "dt_bias"}
 
     def _maybe_full(self, param: torch.Tensor) -> torch.Tensor:
-        return param.full_tensor() if isinstance(param, DTensor) else param
+        return dtensor_full_tensor(param)
+
+    def _sp_short_conv(
+        self,
+        conv: KDAShortConvolution,
+        x_local: torch.Tensor,
+        *,
+        all_to_all_fn,
+        sp_mesh,
+        sp_rank: int,
+        sp_size: int,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Gather full sequence / shard channels, run the same short-conv entry as non-SP."""
+        # (B, L/sp, C) -> (B, C, L/sp) -> all_to_all -> (B, C/sp, L) -> (B, L, C/sp)
+        x = x_local.transpose(1, 2)
+        x = all_to_all_fn(x, scatter_dim=1, gather_dim=2, mesh=sp_mesh)
+        x = x.transpose(1, 2).contiguous()
+
+        weight, bias = conv.materialize_weight_bias()
+        weight = weight.chunk(sp_size, dim=0)[sp_rank]
+        if bias is not None:
+            bias = bias.chunk(sp_size, dim=0)[sp_rank]
+
+        out, _ = conv(
+            x,
+            cache=None,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+            weight=weight,
+            bias=bias,
+        )
+        return out
+
+    def forward_for_sp(
+        self,
+        hidden_states: torch.Tensor,
+        seq_ctx: SequenceContext,
+    ) -> AttnOutputs:
+        """Sequence-parallel KDA aligned with GatedDeltaNet ``forward_for_sp``."""
+        batch_size, seq_len, _ = hidden_states.shape
+        assert batch_size == 1, "KDA currently supports packed batch size 1"
+        assert seq_ctx.sequence_parallel_mesh is not None, "sequence_parallel_mesh is required for forward_for_sp"
+        sp_mesh = seq_ctx.sequence_parallel_mesh
+        sp_size = sp_mesh.size()
+        sp_rank = seq_ctx.sp_rank
+        assert self.num_heads % sp_size == 0, (
+            f"KDA num_heads ({self.num_heads}) must be divisible by sp_size ({sp_size})"
+        )
+
+        cu_seqlens = seq_ctx.cu_seq_lens_q
+        projection_size = self.num_heads * self.head_dim
+
+        q = self._sp_short_conv(
+            self.q_conv1d,
+            self.q_proj(hidden_states),
+            all_to_all_fn=_all_to_all_conv_pre_q,
+            sp_mesh=sp_mesh,
+            sp_rank=sp_rank,
+            sp_size=sp_size,
+            cu_seqlens=cu_seqlens,
+        )
+        k = self._sp_short_conv(
+            self.k_conv1d,
+            self.k_proj(hidden_states),
+            all_to_all_fn=_all_to_all_conv_pre_k,
+            sp_mesh=sp_mesh,
+            sp_rank=sp_rank,
+            sp_size=sp_size,
+            cu_seqlens=cu_seqlens,
+        )
+        v = self._sp_short_conv(
+            self.v_conv1d,
+            self.v_proj(hidden_states),
+            all_to_all_fn=_all_to_all_conv_pre_v,
+            sp_mesh=sp_mesh,
+            sp_rank=sp_rank,
+            sp_size=sp_size,
+            cu_seqlens=cu_seqlens,
+        )
+
+        # Local seq, full heads → all_to_all → full seq, head shard (same as GDN g/beta).
+        g = self.f_b_proj(self.f_a_proj(hidden_states))
+        g = g.view(batch_size, seq_len, projection_size).transpose(1, 2)  # (B, H*D, L/sp)
+        g = _all_to_all_g(g, scatter_dim=1, gather_dim=2, mesh=sp_mesh)
+        g = g.transpose(1, 2).view(batch_size, seq_len * sp_size, self.num_heads // sp_size, self.head_dim)
+
+        beta = self.b_proj(hidden_states).float().transpose(1, 2)  # (B, H, L/sp)
+        beta = _all_to_all_beta(beta, scatter_dim=1, gather_dim=2, mesh=sp_mesh)
+        beta = beta.transpose(1, 2)  # (B, L, H/sp)
+
+        q = q.view(batch_size, seq_len * sp_size, self.num_heads // sp_size, self.head_dim)
+        k = k.view(batch_size, seq_len * sp_size, self.num_heads // sp_size, self.head_dim)
+        v = v.view(batch_size, seq_len * sp_size, self.num_heads // sp_size, self.head_dim)
+
+        a_log = self._maybe_full(self.A_log).chunk(sp_size, dim=0)[sp_rank]
+        dt_bias = (
+            self._maybe_full(self.dt_bias)
+            .view(self.num_heads, self.head_dim)
+            .chunk(sp_size, dim=0)[sp_rank]
+            .reshape(-1)
+        )
+
+        o, _ = chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=self.gate_lower_bound is not None,
+            lower_bound=self.gate_lower_bound,
+            transpose_state_layout=True,
+            cu_seqlens=cu_seqlens,
+        )
+
+        # (B, L, H/sp, D) -> (B, L/sp, H, D)
+        o = _all_to_all_out(o, scatter_dim=1, gather_dim=2, mesh=sp_mesh)
+
+        if self.use_full_rank_gate:
+            g_out = self.g_proj(hidden_states)
+        else:
+            g_out = self.g_b_proj(self.g_a_proj(hidden_states))
+        g_out = g_out.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        o = self.o_norm(o, g_out)
+        raw_output = o.reshape(batch_size, seq_len, -1)
+        projected_output = self.o_proj(raw_output)
+        return {
+            "raw_output": raw_output,
+            "projected_output": projected_output,
+            "softmax_lse": None,
+        }
 
     def forward(
         self,
@@ -205,6 +363,9 @@ class KimiDeltaAttention(nn.Module):
     ) -> AttnOutputs:
         # Decoder layers may still pass rotary / mudd kwargs used by MLA.
         del kwargs
+        if seq_ctx.sequence_parallel_mesh is not None and seq_ctx.sequence_parallel_mesh.size() > 1:
+            return self.forward_for_sp(hidden_states, seq_ctx)
+
         batch_size, seq_len, _ = hidden_states.shape
         assert batch_size == 1, "KDA currently supports packed batch size 1"
 

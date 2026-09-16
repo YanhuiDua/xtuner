@@ -14,7 +14,6 @@ from pydantic import Field, computed_field
 from typing_extensions import Self, override
 
 from xtuner.v1.data_proto import SequenceContext
-from xtuner.v1.loss import BalancingLossContext, ZLossContext
 from xtuner.v1.model.moe.moe import BalancingLossConfig, MoE, MoEConfig
 from xtuner.v1.module import RMSNorm
 from xtuner.v1.module.attention import KDAConfig, MLAConfig
@@ -33,11 +32,16 @@ from xtuner.v1.module.router.noaux_router import NoAuxRouterConfig
 
 from .decoder_layer import (
     KimiDenseDecoderLayer,
-    KimiDenseDecoderLayerOutput,
     KimiMoEDecoderLayer,
-    KimiMoEDecoderLayerOutput,
     apply_attn_res,
 )
+
+
+def _kimi_hybrid_layer_ids(num_hidden_layers: int) -> tuple[list[int], list[int]]:
+    """Hub schedule (1-based): 3×KDA + 1×MLA repeating; last layer always MLA."""
+    kda = [i for i in range(1, num_hidden_layers + 1) if i % 4 != 0 and i != num_hidden_layers]
+    full = [i for i in range(1, num_hidden_layers + 1) if i not in set(kda)]
+    return kda, full
 
 
 class KimiLinear(MoE):
@@ -47,9 +51,12 @@ class KimiLinear(MoE):
     def __init__(self, config: "KimiLinearConfig"):
         super().__init__(config)
         self.config: KimiLinearConfig
-        if config.attn_res_block_size is not None:
-            self.output_attn_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.output_attn_res_proj = build_linear(config.hidden_size, 1, bias=False)
+
+    @override
+    def _configure_model_specific_layers(self) -> None:
+        if self.config.attn_res_block_size is not None:
+            self.output_attn_res_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+            self.output_attn_res_proj = build_linear(self.config.hidden_size, 1, bias=False)
 
     def _apply_output_attn_res(
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor | None
@@ -63,6 +70,15 @@ class KimiLinear(MoE):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
         ).view(batch_size, seq_len, hidden_size)
+
+    def _seed_block_residual(
+        self, hidden_states: torch.Tensor | list[torch.Tensor]
+    ) -> torch.Tensor | list[torch.Tensor]:
+        """HF AttnRes empty buffer: ``(T, 0, H)`` per micro-batch (``T = B * S``)."""
+        if isinstance(hidden_states, list):
+            return [cast(torch.Tensor, self._seed_block_residual(hs)) for hs in hidden_states]
+        b, s, h = hidden_states.shape
+        return hidden_states.new_zeros(b * s, 0, h)
 
     @override
     def _call_decoder_layer(
@@ -86,33 +102,25 @@ class KimiLinear(MoE):
         | MoEDecoderLayerOutput
         | MoEDecoderLayerMicroBatchOutput
     ):
-        is_micro_batch = isinstance(hidden_states, list)
-        block_residual: torch.Tensor | list[torch.Tensor | None] | None = None
         if previous_layer_results is not None and "block_residual" in previous_layer_results:
             block_residual = previous_layer_results["block_residual"]  # type: ignore[index]
         elif self.config.attn_res_block_size is not None:
-            # First layer: empty block residual matching HF init shape.
-            if is_micro_batch:
-                block_residual = []
-                for hs in cast(list[torch.Tensor], hidden_states):
-                    b, s, h = hs.shape
-                    block_residual.append(hs.new_zeros(b * s, 0, h))
-            else:
-                hs = cast(torch.Tensor, hidden_states)
-                b, s, h = hs.shape
-                block_residual = hs.new_zeros(b * s, 0, h)
+            block_residual = self._seed_block_residual(hidden_states)
+        else:
+            block_residual = None
 
-        activation_offload = int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1
         offload_tensors: list[torch.Tensor] = []
-        if activation_offload and layer_idx >= self.config.first_k_dense_replace:
-            offload_tensors = list(hidden_states) if is_micro_batch else [cast(torch.Tensor, hidden_states)]
+        if (
+            int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1
+            and layer_idx >= self.config.first_k_dense_replace
+        ):
+            offload_tensors = list(hidden_states) if isinstance(hidden_states, list) else [hidden_states]
 
         offload_block_idx = sum(
             self.config.first_k_dense_replace <= int(previous_idx) < layer_idx for previous_idx in self.layers
         )
-        decoder_forward = cast(Callable[..., object], decoder_layer)
         with self._saved_tensors_offload_ctx(offload_block_idx, offload_tensors):
-            return decoder_forward(  # type: ignore[return-value]
+            return cast(Callable[..., object], decoder_layer)(  # type: ignore[return-value]
                 hidden_states,
                 position_embeddings=position_embeddings,
                 seq_ctx=seq_ctx,
@@ -120,69 +128,34 @@ class KimiLinear(MoE):
             )
 
     @override
-    def _decoder_stack(
+    def _post_decoder_stack(
         self,
-        *,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        seq_ctx: SequenceContext,
-        output: dict,
-        keep_router: bool,
-        balancing_ctx: BalancingLossContext | None,
-        z_ctx: ZLossContext | None,
-        nonpad_indices: torch.Tensor,
-        non_pad_token: int,
-        num_tokens_global: torch.Tensor | None,
-        z_world_size: int,
-    ) -> torch.Tensor:
+        hidden_states: torch.Tensor | list[torch.Tensor],
         previous_layer_results: (
-            KimiDenseDecoderLayerOutput | KimiMoEDecoderLayerOutput | DenseDecoderLayerOutput | MoEDecoderLayerOutput | None
-        ) = None
-        block_residual: torch.Tensor | None = None
+            DenseDecoderLayerOutput
+            | DenseDecoderLayerMicroBatchOutput
+            | MoEDecoderLayerOutput
+            | MoEDecoderLayerMicroBatchOutput
+            | None
+        ),
+    ) -> torch.Tensor | list[torch.Tensor]:
+        block_residual = None
+        if previous_layer_results is not None and "block_residual" in previous_layer_results:
+            block_residual = previous_layer_results["block_residual"]  # type: ignore[index]
 
-        for idx, decoder_layer in self.layers.items():
-            layer_idx = int(idx)
-            layer_results = self._call_decoder_layer(
-                decoder_layer=decoder_layer,
-                layer_idx=layer_idx,
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                seq_ctx=seq_ctx,
-                previous_layer_results=previous_layer_results,
-            )
-            previous_layer_results = cast(
-                KimiDenseDecoderLayerOutput | KimiMoEDecoderLayerOutput,
-                layer_results,
-            )
-            block_residual = previous_layer_results.get("block_residual")  # type: ignore[assignment]
-
-            if layer_idx < self.config.first_k_dense_replace:
-                dense_results = cast(KimiDenseDecoderLayerOutput, layer_results)
-                hidden_states = dense_results["hidden_states"]
+        if isinstance(hidden_states, list):
+            br_list: list[torch.Tensor | None]
+            if block_residual is None:
+                br_list = [None] * len(hidden_states)
+            elif isinstance(block_residual, list):
+                br_list = list(block_residual)
             else:
-                moe_results = cast(KimiMoEDecoderLayerOutput, layer_results)
-                hidden_states = moe_results["hidden_states"]
-                router_results = moe_results["router_logits"]
-                router_weights = moe_results["router_weights"]
-                router_topk_ids = moe_results["router_topk_ids"]
-                if keep_router:
-                    output["router_logits"][f"layer{idx}"] = self._maybe_offload_router(router_results)
-                    output["router_weights"][f"layer{idx}"] = self._maybe_offload_router(router_weights)
-                hidden_states = self.aux_loss.accumulate(
-                    selected_router_weights=router_weights.index_select(0, nonpad_indices).contiguous().float(),
-                    selected_router_logits=router_results.index_select(0, nonpad_indices).contiguous().float(),
-                    selected_experts=router_topk_ids.index_select(0, nonpad_indices).contiguous(),
-                    hidden_states=hidden_states,
-                    balancing_ctx=balancing_ctx,
-                    z_ctx=z_ctx,
-                    num_tokens_local=non_pad_token,
-                    num_tokens_global=num_tokens_global,
-                    world_size=z_world_size,
-                )
+                br_list = [block_residual] * len(hidden_states)
+            return [
+                self._apply_output_attn_res(hs, br) for hs, br in zip(hidden_states, br_list)
+            ]
 
-            if self.config.return_hidden_states:
-                output["hidden_states"].append(hidden_states)
-
+        assert block_residual is None or isinstance(block_residual, torch.Tensor)
         return self._apply_output_attn_res(hidden_states, block_residual)
 
     @override
@@ -304,9 +277,6 @@ class KimiLinearConfig(MoEConfig):
     routed_expert_hidden_size: int | None = None
     latent_moe_use_norm: bool = False
     attn_res_block_size: int | None = None
-    # Hybrid attention schedule from HF linear_attn_config
-    kda_layers: list[int] = Field(default_factory=list)
-    full_attn_layers: list[int] = Field(default_factory=list)
     moe_act_fn_cfg: MoEActFnConfig = MoEActFnConfig(
         act_type="situ", situ_beta=4.0, situ_linear_beta=25.0
     )
@@ -316,14 +286,15 @@ class KimiLinearConfig(MoEConfig):
 
     @computed_field  # type: ignore[prop-decorator]
     def layers_type(self) -> list[Literal["full_attention", "linear_attention"]]:
-        types: list[Literal["full_attention", "linear_attention"]] = []
-        for i in range(self.num_hidden_layers):
-            # HF uses 1-based layer indices in kda_layers / full_attn_layers
-            if (i + 1) in self.kda_layers:
-                types.append("linear_attention")
-            else:
-                types.append("full_attention")
-        return types
+        # Hub Kimi-K3: full attn when 1-based index % 4 == 0, or the final layer.
+        return [
+            (
+                "full_attention"
+                if (i + 1) % 4 == 0 or (i + 1) == self.num_hidden_layers
+                else "linear_attention"
+            )
+            for i in range(self.num_hidden_layers)
+        ]
 
     @classmethod
     def from_hf(cls, hf_path: str | Path) -> Self:
@@ -340,8 +311,6 @@ class KimiLinearConfig(MoEConfig):
             text = hf_config
 
         linear_cfg = getattr(text, "linear_attn_config", None) or {}
-        kda_layers = list(linear_cfg.get("kda_layers", []))
-        full_attn_layers = list(linear_cfg.get("full_attn_layers", []))
 
         rope_parameters_cfg = RopeParametersConfig.from_hf_config(text)
         attention = MLAConfig(
@@ -389,8 +358,6 @@ class KimiLinearConfig(MoEConfig):
             attn_res_block_size=getattr(text, "attn_res_block_size", None),
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
-            kda_layers=kda_layers,
-            full_attn_layers=full_attn_layers,
             router=NoAuxRouterConfig(
                 scoring_func="sigmoid" if text.moe_router_activation_func == "sigmoid" else "softmax",
                 router_scaling_factor=text.routed_scaling_factor,
@@ -417,6 +384,7 @@ class KimiLinearConfig(MoEConfig):
             "Only support saving NoAuxRouter to HF KimiLinear format."
         )
         linear_attn = self.linear_attention
+        kda_layers, full_attn_layers = _kimi_hybrid_layer_ids(self.num_hidden_layers)
         rope_theta = (
             self.rope_parameters_cfg.rope_theta if self.rope_parameters_cfg is not None else 10000.0
         )
@@ -451,7 +419,7 @@ class KimiLinearConfig(MoEConfig):
             qk_nope_head_dim=self.attention.qk_nope_head_dim,
             qk_rope_head_dim=self.attention.qk_rope_head_dim,
             v_head_dim=self.attention.v_head_dim,
-            mla_use_nope=True,
+            mla_use_nope=self.attention.use_nope,
             mla_use_output_gate=self.attention.use_output_gate,
             moe_router_activation_func="sigmoid" if self.router.scoring_func == "sigmoid" else "softmax",
             moe_renormalize=self.router.norm_topk_prob,
@@ -461,8 +429,8 @@ class KimiLinearConfig(MoEConfig):
             topk_group=self.router.topk_group,
             topk_method="noaux_tc",
             linear_attn_config={
-                "kda_layers": list(self.kda_layers),
-                "full_attn_layers": list(self.full_attn_layers),
+                "kda_layers": kda_layers,
+                "full_attn_layers": full_attn_layers,
                 "num_heads": linear_attn.num_heads if linear_attn else self.attention.num_attention_heads,
                 "head_dim": linear_attn.head_dim if linear_attn else 128,
                 "short_conv_kernel_size": linear_attn.conv_kernel_size if linear_attn else 4,
@@ -500,8 +468,6 @@ class KimiLinearTinyConfig(KimiLinearConfig):
     routed_expert_hidden_size: int | None = 128
     latent_moe_use_norm: bool = True
     attn_res_block_size: int | None = 2
-    kda_layers: list[int] = Field(default_factory=lambda: [1, 2, 3])
-    full_attn_layers: list[int] = Field(default_factory=lambda: [4])
     attention: MLAConfig = MLAConfig(
         num_attention_heads=4,
         head_dim=64,
@@ -556,9 +522,6 @@ class KimiLinearK3TextConfig(KimiLinearConfig):
     routed_expert_hidden_size: int | None = 3584
     latent_moe_use_norm: bool = True
     attn_res_block_size: int | None = 12
-    # Subset listed in Hub config; full lists applied via from_hf
-    kda_layers: list[int] = Field(default_factory=list)
-    full_attn_layers: list[int] = Field(default_factory=list)
     attention: MLAConfig = MLAConfig(
         num_attention_heads=96,
         head_dim=192,

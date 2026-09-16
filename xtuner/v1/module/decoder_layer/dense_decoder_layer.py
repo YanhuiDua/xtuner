@@ -9,7 +9,7 @@ from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
 from xtuner.v1.module import AttnOutputs, GatedDeltaNetConfig, KDAConfig, MHAConfig, MLAConfig, RMSNorm
 from xtuner.v1.module.rope import RopeScalingConfig
-from xtuner.v1.ops.act_fn import get_act_fn
+from xtuner.v1.ops.act_fn import get_mlp_act_fn
 from xtuner.v1.utils import ForwardState
 
 from ..linear import build_linear
@@ -40,21 +40,13 @@ class DenseMLP(nn.Module):
         situ_linear_beta: float | None = None,
     ):
         super().__init__()
-        self.hidden_act = hidden_act
         self.gate_proj = build_linear(hidden_size, intermediate_size, bias=bias, float8_cfg=float8_cfg)
         self.up_proj = build_linear(hidden_size, intermediate_size, bias=bias, float8_cfg=float8_cfg)
         self.down_proj = build_linear(intermediate_size, hidden_size, bias=bias, float8_cfg=float8_cfg)
-        if hidden_act == "situ":
-            self.act_fn = partial(get_act_fn("situ"), beta=situ_beta, linear_beta=situ_linear_beta)
-        else:
-            self.act_fn = get_act_fn(hidden_act)
+        self.act_fn = get_mlp_act_fn(hidden_act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta)
 
     def forward(self, x):
-        if self.hidden_act == "situ":
-            gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
-            return self.down_proj(self.act_fn(gate_up))
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        return self.down_proj(self.act_fn(self.gate_proj(x), self.up_proj(x)))
 
 
 class DenseDecoderLayer(nn.Module):
@@ -73,9 +65,12 @@ class DenseDecoderLayer(nn.Module):
         float8_cfg: Float8Config | None = None,
         layer_type: Literal["full_attention", "sliding_attention"] | None = None,
         layer_idx: int = 0,
+        situ_beta: float = 1.0,
+        situ_linear_beta: float | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.layer_idx = layer_idx
         self.self_attn = attention_config.build(
             hidden_size=hidden_size,
             layer_type=layer_type,
@@ -84,15 +79,39 @@ class DenseDecoderLayer(nn.Module):
             generate_config=generate_config,
             float8_cfg=float8_cfg,
         )
-        self.mlp = DenseMLP(
+        self.mlp = self.build_mlp(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             bias=mlp_bias,
             hidden_act=hidden_act,
             float8_cfg=float8_cfg,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
+
+    def build_mlp(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        bias: bool,
+        hidden_act: str,
+        float8_cfg: Float8Config | None,
+        situ_beta: float = 1.0,
+        situ_linear_beta: float | None = None,
+    ) -> DenseMLP:
+        """Construct the dense FFN; subclasses may override."""
+        return DenseMLP(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            bias=bias,
+            hidden_act=hidden_act,
+            float8_cfg=float8_cfg,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
 
     def forward(
         self,

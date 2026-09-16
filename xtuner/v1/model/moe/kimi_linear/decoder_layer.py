@@ -3,45 +3,26 @@
 
 from __future__ import annotations
 
+from typing import Callable, Protocol
+
 import torch
 import torch.nn as nn
 from typing_extensions import override
 
 from xtuner.v1.data_proto import SequenceContext
-from xtuner.v1.float8.config import Float8Config
 from xtuner.v1.module import AttnOutputs, RMSNorm, RouterResults
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import (
     DenseDecoderLayer,
     DenseDecoderLayerMicroBatchOutput,
     DenseDecoderLayerOutput,
-    DenseMLP,
 )
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import (
-    MoEActFnConfig,
-    MoEBlock,
     MoEDecoderLayer,
     MoEDecoderLayerMicroBatchOutput,
     MoEDecoderLayerOutput,
-    MoEMLP,
 )
-from xtuner.v1.module.attention.kda import KimiDeltaAttention
 from xtuner.v1.module.linear import build_linear
 from xtuner.v1.utils import ForwardState
-
-
-def _run_self_attn(
-    attn: nn.Module,
-    hidden_states: torch.Tensor,
-    seq_ctx: SequenceContext,
-    position_embeddings: tuple[torch.Tensor, torch.Tensor],
-) -> AttnOutputs:
-    if isinstance(attn, KimiDeltaAttention):
-        return attn(hidden_states=hidden_states, seq_ctx=seq_ctx)
-    return attn(
-        hidden_states=hidden_states,
-        position_embeddings=position_embeddings,
-        seq_ctx=seq_ctx,
-    )
 
 
 def apply_attn_res(
@@ -69,6 +50,80 @@ def apply_attn_res(
     return hidden_states.to(v.dtype)
 
 
+class _AttnResLayer(Protocol):
+    attn_res_block_size: int | None
+    layer_idx: int
+    self_attention_res_proj: nn.Linear
+    self_attention_res_norm: RMSNorm
+    mlp_res_proj: nn.Linear
+    mlp_res_norm: RMSNorm
+    input_layernorm: RMSNorm
+    post_attention_layernorm: RMSNorm
+    self_attn: nn.Module
+
+
+def run_attn_res_forward(
+    layer: _AttnResLayer,
+    *,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    seq_ctx: SequenceContext,
+    block_residual: torch.Tensor | None,
+    ffn_fn: Callable[[torch.Tensor], tuple[torch.Tensor, dict]],
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """Single AttnRes orchestration shared by dense and MoE decoder layers.
+
+    ``ffn_fn`` runs after ``post_attention_layernorm`` and returns
+    ``(ffn_hidden_states, extras)`` — extras carry MoE router fields (empty for dense).
+    """
+    assert layer.attn_res_block_size is not None
+    batch_size, seq_len, hidden_size = hidden_states.shape
+    prefix_sum: torch.Tensor | None = hidden_states
+
+    if block_residual is None:
+        block_residual = hidden_states.new_zeros(batch_size * seq_len, 0, hidden_size)
+
+    if block_residual.shape[1] > 0:
+        assert prefix_sum is not None
+        hidden_states = apply_attn_res(
+            prefix_sum.view(-1, hidden_size),
+            block_residual,
+            layer.self_attention_res_proj,
+            layer.self_attention_res_norm,
+        ).view(batch_size, seq_len, hidden_size)
+
+    if layer.layer_idx % layer.attn_res_block_size == 0:
+        assert prefix_sum is not None
+        block_residual = torch.cat(
+            [block_residual, prefix_sum.view(-1, hidden_size).unsqueeze(1)],
+            dim=1,
+        )
+        prefix_sum = None
+
+    # Attention (no classic residual — AttnRes owns the mix)
+    hidden_states = layer.input_layernorm(hidden_states)
+    attn_outputs: AttnOutputs = layer.self_attn(
+        hidden_states=hidden_states,
+        position_embeddings=position_embeddings,
+        seq_ctx=seq_ctx,
+    )
+    attn_out = attn_outputs["projected_output"]
+    prefix_sum = attn_out if prefix_sum is None else prefix_sum + attn_out
+
+    hidden_states = apply_attn_res(
+        prefix_sum.view(-1, hidden_size),
+        block_residual,
+        layer.mlp_res_proj,
+        layer.mlp_res_norm,
+    ).view(batch_size, seq_len, hidden_size)
+
+    hidden_states = layer.post_attention_layernorm(hidden_states)
+    ffn_out, extras = ffn_fn(hidden_states)
+    # AttnRes: accumulate FFN into prefix_sum (no classic residual add).
+    prefix_sum = ffn_out if prefix_sum is None else prefix_sum + ffn_out
+    return prefix_sum, block_residual, extras
+
+
 class KimiDenseDecoderLayerOutput(DenseDecoderLayerOutput):
     block_residual: torch.Tensor | None
 
@@ -91,28 +146,14 @@ class KimiDenseDecoderLayer(DenseDecoderLayer):
     def __init__(
         self,
         *args,
-        situ_beta: float = 1.0,
-        situ_linear_beta: float | None = None,
         attn_res_block_size: int | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.layer_idx = int(kwargs.get("layer_idx", 0))
         self.attn_res_block_size = attn_res_block_size
-        hidden_act = kwargs["hidden_act"]
-        if hidden_act == "situ":
-            self.mlp = DenseMLP(
-                hidden_size=kwargs["hidden_size"],
-                intermediate_size=kwargs["intermediate_size"],
-                bias=kwargs.get("mlp_bias", False),
-                hidden_act="situ",
-                float8_cfg=kwargs.get("float8_cfg"),
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
         if attn_res_block_size is not None:
             eps = kwargs.get("rms_norm_eps", 1e-6)
-            hs = kwargs["hidden_size"]
+            hs = self.hidden_size
             self.self_attention_res_norm = RMSNorm(hs, eps=eps)
             self.mlp_res_norm = RMSNorm(hs, eps=eps)
             self.self_attention_res_proj = build_linear(hs, 1, bias=False)
@@ -165,68 +206,17 @@ class KimiDenseDecoderLayer(DenseDecoderLayer):
             )
             return {"hidden_states": out, "block_residual": block_residual}
 
-        return self._forward_attn_residual(
+        def _dense_ffn(hs: torch.Tensor) -> tuple[torch.Tensor, dict]:
+            return self.mlp(hs), {}
+
+        prefix_sum, block_residual, _ = run_attn_res_forward(
+            self,
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             seq_ctx=seq_ctx,
             block_residual=block_residual,
-            mlp_fn=self.mlp,
+            ffn_fn=_dense_ffn,
         )
-
-    def _forward_attn_residual(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        seq_ctx: SequenceContext,
-        block_residual: torch.Tensor | None,
-        mlp_fn: nn.Module,
-    ) -> KimiDenseDecoderLayerOutput:
-        assert self.attn_res_block_size is not None
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        prefix_sum: torch.Tensor | None = hidden_states
-
-        if block_residual is None:
-            block_residual = hidden_states.new_zeros(batch_size * seq_len, 0, hidden_size)
-
-        if block_residual.shape[1] > 0:
-            assert prefix_sum is not None
-            hidden_states = apply_attn_res(
-                prefix_sum.view(-1, hidden_size),
-                block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-            ).view(batch_size, seq_len, hidden_size)
-
-        if self.layer_idx % self.attn_res_block_size == 0:
-            assert prefix_sum is not None
-            block_residual = torch.cat(
-                [block_residual, prefix_sum.view(-1, hidden_size).unsqueeze(1)],
-                dim=1,
-            )
-            prefix_sum = None
-
-        hidden_states = self.input_layernorm(hidden_states)
-        attn_outputs: AttnOutputs = _run_self_attn(
-            self.self_attn, hidden_states, seq_ctx, position_embeddings
-        )
-        attn_out = attn_outputs["projected_output"]
-        if prefix_sum is not None:
-            prefix_sum = prefix_sum + attn_out
-        else:
-            prefix_sum = attn_out
-
-        hidden_states = apply_attn_res(
-            prefix_sum.view(-1, hidden_size),
-            block_residual,
-            self.mlp_res_proj,
-            self.mlp_res_norm,
-        ).view(batch_size, seq_len, hidden_size)
-
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = mlp_fn(hidden_states)
-
-        prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
         return {"hidden_states": prefix_sum, "block_residual": block_residual}
 
 
@@ -236,68 +226,18 @@ class KimiMoEDecoderLayer(MoEDecoderLayer):
     def __init__(
         self,
         *args,
-        routed_expert_hidden_size: int | None = None,
-        latent_moe_use_norm: bool = False,
-        situ_beta: float = 1.0,
-        situ_linear_beta: float | None = None,
         attn_res_block_size: int | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.routed_expert_hidden_size = routed_expert_hidden_size
-        self.latent_moe_use_norm = latent_moe_use_norm
         self.attn_res_block_size = attn_res_block_size
-
-        float8_cfg: Float8Config | None = kwargs.get("float8_cfg")
-        moe_act_fn_cfg: MoEActFnConfig = kwargs["moe_act_fn_cfg"]
-        moe_intermediate_size = kwargs["moe_intermediate_size"]
-        n_routed_experts = kwargs["n_routed_experts"]
-        n_shared_experts = kwargs["n_shared_experts"]
-        hidden_act = kwargs["hidden_act"]
-        mlp_bias = kwargs.get("mlp_bias", False)
-        moe_bias = kwargs.get("moe_bias", False)
-        rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
-
-        if n_shared_experts > 0 and hidden_act == "situ":
-            self.shared_experts = MoEMLP(
-                hidden_size=self.hidden_size,
-                n_shared_experts=n_shared_experts,
-                moe_intermediate_size=moe_intermediate_size,
-                hidden_act=hidden_act,
-                mlp_bias=mlp_bias,
-                float8_cfg=float8_cfg,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-            )
-
-        if routed_expert_hidden_size is not None:
-            self.routed_expert_down_proj = build_linear(
-                self.hidden_size, routed_expert_hidden_size, bias=False, float8_cfg=float8_cfg
-            )
-            self.routed_expert_up_proj = build_linear(
-                routed_expert_hidden_size, self.hidden_size, bias=False, float8_cfg=float8_cfg
-            )
-            if latent_moe_use_norm:
-                self.routed_expert_norm = RMSNorm(routed_expert_hidden_size, eps=rms_norm_eps)
-            self.experts = MoEBlock(
-                hidden_size=routed_expert_hidden_size,
-                moe_intermediate_size=moe_intermediate_size,
-                n_routed_experts=n_routed_experts,
-                moe_bias=moe_bias,
-                ep_mesh=self.ep_mesh,
-                expert_tp_mesh=kwargs.get("expert_tp_mesh"),
-                float8_cfg=float8_cfg,
-                moe_act_fn_cfg=moe_act_fn_cfg,
-                ep_tp_mesh=kwargs.get("ep_tp_mesh"),
-                expert_backend=kwargs.get("expert_backend", "grouped_gemm"),
-                sonicmoe_cfg=kwargs.get("sonicmoe_cfg"),
-            )
-
         if attn_res_block_size is not None:
-            self.self_attention_res_norm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
-            self.mlp_res_norm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
-            self.self_attention_res_proj = build_linear(self.hidden_size, 1, bias=False)
-            self.mlp_res_proj = build_linear(self.hidden_size, 1, bias=False)
+            eps = kwargs.get("rms_norm_eps", 1e-6)
+            hs = self.hidden_size
+            self.self_attention_res_norm = RMSNorm(hs, eps=eps)
+            self.mlp_res_norm = RMSNorm(hs, eps=eps)
+            self.self_attention_res_proj = build_linear(hs, 1, bias=False)
+            self.mlp_res_proj = build_linear(hs, 1, bias=False)
 
     @override
     def forward(  # type: ignore[override]
@@ -346,87 +286,35 @@ class KimiMoEDecoderLayer(MoEDecoderLayer):
                 hidden_states=hidden_states,
                 seq_ctx=seq_ctx,
                 position_embeddings=position_embeddings,
-                residual_after_attn=True,
             )
             out["block_residual"] = block_residual
             return out
 
-        return self._forward_attn_residual(
+        def _moe_ffn(hs: torch.Tensor) -> tuple[torch.Tensor, dict]:
+            moe_out = self._moe_experts_forward(hidden_states=hs)
+            combined = moe_out["combined_hidden_states"]
+            # Shared experts see post-norm MoE input (HF identity).
+            if self.n_shared_experts > 0:
+                combined = combined + self._shared_experts_forward(hidden_states=hs)
+            router_results = moe_out["router_results"]
+            return combined, {
+                "router_logits": router_results["logits"],
+                "router_weights": router_results["router_weights"],
+                "router_topk_ids": router_results["topk_ids"],
+            }
+
+        prefix_sum, block_residual, extras = run_attn_res_forward(
+            self,
             hidden_states=hidden_states,
-            seq_ctx=seq_ctx,
             position_embeddings=position_embeddings,
+            seq_ctx=seq_ctx,
             block_residual=block_residual,
+            ffn_fn=_moe_ffn,
         )
-
-    def _forward_attn_residual(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        seq_ctx: SequenceContext,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        block_residual: torch.Tensor | None,
-    ) -> KimiMoEDecoderLayerOutput:
-        assert self.attn_res_block_size is not None
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        prefix_sum: torch.Tensor | None = hidden_states
-
-        if block_residual is None:
-            block_residual = hidden_states.new_zeros(batch_size * seq_len, 0, hidden_size)
-
-        if block_residual.shape[1] > 0:
-            assert prefix_sum is not None
-            hidden_states = apply_attn_res(
-                prefix_sum.view(-1, hidden_size),
-                block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
-            ).view(batch_size, seq_len, hidden_size)
-
-        if self.layer_idx % self.attn_res_block_size == 0:
-            assert prefix_sum is not None
-            block_residual = torch.cat(
-                [block_residual, prefix_sum.view(-1, hidden_size).unsqueeze(1)],
-                dim=1,
-            )
-            prefix_sum = None
-
-        # Attention (no classic residual — AttnRes owns the mix)
-        hidden_states = self.input_layernorm(hidden_states)
-        attn_outputs: AttnOutputs = _run_self_attn(
-            self.self_attn, hidden_states, seq_ctx, position_embeddings
-        )
-        attn_out = attn_outputs["projected_output"]
-        if prefix_sum is not None:
-            prefix_sum = prefix_sum + attn_out
-        else:
-            prefix_sum = attn_out
-
-        hidden_states = apply_attn_res(
-            prefix_sum.view(-1, hidden_size),
-            block_residual,
-            self.mlp_res_proj,
-            self.mlp_res_norm,
-        ).view(batch_size, seq_len, hidden_size)
-
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        moe_out = self._moe_experts_forward(hidden_states=hidden_states)
-        router_results = moe_out["router_results"]
-        combined = moe_out["combined_hidden_states"]
-
-        # Shared experts see post-norm MoE input (HF identity), then accumulate into prefix.
-        if self.n_shared_experts > 0:
-            combined = combined + self._shared_experts_forward(hidden_states=hidden_states)
-
-        # AttnRes: no classic residual add; accumulate MLP/MoE into prefix_sum.
-        # HF uses hidden_factor only in classic path; keep identity scale here.
-        prefix_sum = combined if prefix_sum is None else prefix_sum + combined
-
         return {
             "hidden_states": prefix_sum,
-            "router_logits": router_results["logits"],
-            "router_weights": router_results["router_weights"],
-            "router_topk_ids": router_results["topk_ids"],
             "block_residual": block_residual,
+            **extras,
         }
 
     def _forward_moe_body(
@@ -435,10 +323,8 @@ class KimiMoEDecoderLayer(MoEDecoderLayer):
         hidden_states: torch.Tensor,
         seq_ctx: SequenceContext,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        residual_after_attn: bool,
     ) -> KimiMoEDecoderLayerOutput:
         """Classic residual MoE path (AttnRes disabled)."""
-        del residual_after_attn
         residual, hidden_states, router_results, attn_outputs = self._pre_moe_forward(
             hidden_states=hidden_states,
             seq_ctx=seq_ctx,
@@ -465,64 +351,12 @@ class KimiMoEDecoderLayer(MoEDecoderLayer):
         }
 
     def _moe_experts_forward(self, *, hidden_states: torch.Tensor) -> dict:
-        """Gate + LatentMoE down/experts/up (+ optional shared is caller-side)."""
-        origin_shape = hidden_states.shape
+        """Gate + LatentMoE routed path (shared experts stay caller-side)."""
         router_results: RouterResults = self.gate(hidden_states)
-        expert_in = hidden_states
-        if self.routed_expert_hidden_size is not None:
-            expert_in = self.routed_expert_down_proj(expert_in)
-
-        if self.experts.uses_sonicmoe:
-            raise NotImplementedError("Kimi LatentMoE does not support sonicmoe yet")
-
-        assert self.dispatcher is not None
-        pre_dispatched = self.dispatcher.dispatch_preprocess(
-            hidden_states=expert_in.view(-1, expert_in.shape[-1]),
-            topk_ids=router_results["topk_ids"],
-            topk_weights=router_results["topk_weights"],
+        combined_hidden_states = self._dispatch_experts_combine(
+            hidden_states=hidden_states,
+            router_results=router_results,
         )
-        dispatched = self.dispatcher.dispatch(
-            pre_dispatched=pre_dispatched,
-            topk_weights=router_results["topk_weights"],
-            decoding=False,
-        )
-        post_dispatched = self.dispatcher.dispatch_postprocess(
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-        )
-        experts_out = self.experts(
-            post_dispatched["hidden_states"],
-            post_dispatched["tokens_per_expert"],
-            decoding=False,
-        )
-        pre_combined = self.dispatcher.combine_preprocess(
-            hidden_states=experts_out,
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-            post_dispatched=post_dispatched,
-            decoding=False,
-        )
-        combined = self.dispatcher.combine(
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-            post_dispatched=post_dispatched,
-            pre_combined=pre_combined,
-            decoding=False,
-        )
-        post_combined = self.dispatcher.combine_postprocess(
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-            post_dispatched=post_dispatched,
-            pre_combined=pre_combined,
-            combined=combined,
-        )
-        combined_hidden_states = post_combined["hidden_states"].view(origin_shape[0], origin_shape[1], -1)
-
-        if self.routed_expert_hidden_size is not None:
-            if self.latent_moe_use_norm:
-                combined_hidden_states = self.routed_expert_norm(combined_hidden_states)
-            combined_hidden_states = self.routed_expert_up_proj(combined_hidden_states)
-
         return {
             "combined_hidden_states": combined_hidden_states,
             "router_results": router_results,

@@ -24,7 +24,7 @@ Full published text dims (from Hub `config.json` → `text_config`):
 | `hidden_size` | 7168 |
 | `num_hidden_layers` | 93 |
 | `first_k_dense_replace` | 1 |
-| Attention mix | 69 KDA + 24 Gated MLA (`linear_attn_config.kda_layers` / `full_attn_layers`) |
+| Attention mix | 69 KDA + 24 Gated MLA (Hub lists; XTuner schedule is the matching formula below) |
 | MLA | `q_lora_rank=1536`, `kv_lora_rank=512`, `qk_nope=128`, `qk_rope=64`, `v=128`, `mla_use_nope=True`, **`mla_use_output_gate=True`** |
 | MoE | 896 experts, top-16, shared 2, `topk_method=noaux_tc`, sigmoid, **LatentMoE** (`routed_expert_hidden_size=3584`, `latent_moe_use_norm=True`) |
 | Act | **`situ`** (`activation_situ_beta=4`, `activation_situ_linear_beta=25`) |
@@ -37,27 +37,28 @@ Closest existing ports: hybrid MoE text in `moe/qwen3_5_text.py` (GatedDeltaNet 
 
 | HF piece | Closest XTuner | Gap for Kimi |
 |---|---|---|
-| Hybrid layer dispatch (`kda` vs MLA) | `MoE.build_layers` + `layers_type` / `linear_attention` | OK if KDA maps to a linear-attn config |
-| MLA | `MLAConfig` / `MultiLatentAttention` | **Missing output gate** (`g_proj` + sigmoid before `o_proj`) |
-| KDA (`KimiDeltaAttention`) | `GatedDeltaNet` (Qwen3.5 style) | **Not the same module**: separate `q/k/v` + 3× conv1d, low-rank `f_a/f_b` for decay, optional **full-rank** `g_proj`, `dt_bias` shape differs |
+| Hybrid layer dispatch (`kda` vs MLA) | `MoE.build_layers` + `layers_type` / `linear_attention` | **Landed**: formula `full` iff 1-based `i % 4 == 0` or last layer (same as Hub 69/24); not driven by HF lists |
+| MLA | `MLAConfig` / `MultiLatentAttention` | **Landed**: `use_output_gate` / `use_nope` |
+| KDA (`KimiDeltaAttention`) | `GatedDeltaNet` (Qwen3.5 style) | **Landed** as separate `kda.py` (not GDN); Ulysses SP `forward_for_sp` present |
 | Router `noaux_tc` + sigmoid | `NoAuxRouterConfig` | Likely reusable; verify group/topk fields |
 | Shared experts | MoE shared expert path | OK |
-| LatentMoE down/up (+norm) | — | **New** (expert dim 3584 ≠ hidden 7168) |
-| SiTU-GLU | `silu` / SwiGLU only | **New** activation |
-| AttnRes (`attn_res_block_size`) | Implemented | Cross-layer `block_residual` via `_call_decoder_layer` / `_decoder_stack`; output mixer before final norm |
+| LatentMoE down/up (+norm) | `MoEDecoderLayer` | **Landed**: ctor `routed_expert_hidden_size` + `_project_to/from_experts` |
+| SiTU-GLU | `ops/act_fn.py` | **Landed**: `situ_glu` / `get_mlp_act_fn`; fused `native_situ` for experts |
+| AttnRes (`attn_res_block_size`) | Implemented | Cross-layer `block_residual` via `_call_decoder_layer` / `_seed_block_residual`; output mixer in `_post_decoder_stack` |
 | HF MoE training | XTuner MoE training path | Hub HF code **raises** in training MoE; XTuner must own train path |
 
 **Implication:** this is not a thin Config+`to_hf_key_list` port. Several module/ops pieces are required even for a correct *structure* load.
 
 ## 3. Proposed code layout (three seams)
 
-### 3.1 Model / config — `xtuner/v1/model/moe/kimi_linear.py`
+### 3.1 Model / config — `xtuner/v1/model/moe/kimi_linear/`
 
-- `KimiLinear(MoE)` — override `to_hf_key_list` (and layout hooks if LatentMoE / KDA renames need them). HF sparse block is named `block_sparse_moe` (not always under `mlp.`); mapping must match Hub text-tower keys when saving a **standalone** `kimi_linear` dir.
-- `KimiLinearConfig(MoEConfig)` — `from_hf` via `AutoConfig(..., trust_remote_code=True)` asserting `model_type == "kimi_linear"` **or** accepting a `kimi_k3` dir and reading `text_config` only. `hf_config` returns **`None`** (remote-code contract).
+- `KimiLinear(MoE)` — override `to_hf_key_list` (and layout hooks if LatentMoE / KDA renames need them). HF sparse block is named `block_sparse_moe` (not always under `mlp.`); mapping must match Hub text-tower keys when saving a **standalone** `kimi_linear` dir. AttnRes output modules via `_configure_model_specific_layers`; stack hooks `_call_decoder_layer` / `_post_decoder_stack`.
+- `KimiLinearConfig(MoEConfig)` — `from_hf` via `AutoConfig(..., trust_remote_code=True)` asserting `model_type == "kimi_linear"` **or** accepting a `kimi_k3` dir and reading `text_config` only. `hf_config` builds a serializable `PretrainedConfig` for `save_hf` (remote-code `auto_map`). Hybrid `layers_type` uses the formula in §2 (not HF `kda_layers` lists).
 - Size configs:
   - `KimiLinearTinyConfig` — **phase-1 smoke** (see §4).
   - `KimiLinearK3TextConfig` — published dims (structure registration; full random weight dump optional / deferred — too large).
+- Decoder: `decoder_layer.py` — `KimiDenseDecoderLayer` / `KimiMoEDecoderLayer` (AttnRes only; MLP/experts via base `build_*` + LatentMoE / SiTU ctor args).
 
 Register in `xtuner/v1/model/__init__.py`:
 
@@ -68,11 +69,12 @@ Register in `xtuner/v1/model/__init__.py`:
 
 | New / extend | Location | Notes |
 |---|---|---|
-| `KimiDeltaAttention` / `KDAConfig` | `xtuner/v1/module/attention/` | Prefer **new** module rather than overloading Qwen3.5 `GatedDeltaNet` (different weight layout). Wire as `linear_attention` alternative via config type. |
-| MLA `output_gate` | extend `MLAConfig` + `MultiLatentAttention` | Flag + `g_proj`; default off for DeepSeek. |
-| SiTU | `xtuner/v1/module/` or act registry used by MLP/experts | Match HF `SituAndMul`. |
-| LatentMoE | MoE expert block / decoder | `routed_expert_{down,up}_proj` + optional RMSNorm around experts. |
-| AttnRes | decoder layer + MoE/model forward | Carry `block_residual` across layers; output mixer on final norm path. |
+| `KimiDeltaAttention` / `KDAConfig` | `xtuner/v1/module/attention/kda.py` | Separate from Qwen3.5 `GatedDeltaNet`; FLA `causal_conv1d` + `chunk_kda`; SP via `forward_for_sp`. |
+| MLA `output_gate` | `MLAConfig` + `MultiLatentAttention` | Flag + `g_proj`; default off for DeepSeek. |
+| SiTU | `xtuner/v1/ops/act_fn.py` | `situ_glu` for dense/shared MLP; fused `native_situ` for routed experts. |
+| LatentMoE | `MoEDecoderLayer` | `routed_expert_{down,up}_proj` + optional RMSNorm; `build_experts` at latent dim. |
+| AttnRes | `kimi_linear/decoder_layer.py` + `MoE._post_decoder_stack` | Carry `block_residual` (incl. micro-batch); seed `(T, 0, H)`; output mixer before final norm. |
+| Shared FLA gated RMSNorm | `ops/gated_deltanet/fused_rms_norm_gated.py` | Shared by GDN and KDA (DTensor `to_local`). |
 
 Ops: reuse fla / causal_conv1d paths where KDA calls the same kernels; add `XTUNER_HF_IMPL` branches only when numerical parity starts (deferred).
 
@@ -110,8 +112,8 @@ Explicitly deferred:
 - Full-size random or Hub MXFP4 load.
 - Vision / projector / compose `kimi_k3`.
 - Chat template + SFT/RL recipes.
-- EP/SP/fp8/compile feature matrix (skill §8).
-- AttnRes on intra-layer micro-batch EP path (single-batch / FSDP path is wired).
+- EP/fp8/compile feature matrix (skill §8); KDA SP is implemented but not covered by dedicated tests.
+- Behavioral unit coverage beyond structure + FSDP smoke (AttnRes mixer on/off, LatentMoE dims, SiTU vs SiLU, KDA SP).
 
 ### 8-GPU smoke
 
@@ -125,4 +127,4 @@ torchrun --standalone --nproc-per-node=8 \
 
 ---
 
-Phase-1 §6 decisions were confirmed; AttnRes full forward and 8-GPU smoke follow-up are implemented.
+Phase-1 §6 decisions were confirmed; AttnRes full forward (incl. micro-batch hooks) and 8-GPU smoke follow-up are implemented.
