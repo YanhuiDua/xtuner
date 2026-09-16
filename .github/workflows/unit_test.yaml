@@ -100,6 +100,6 @@ jobs:
         pytest_command="pytest tests --ignore=tests/rl"
         echo "pytest_command=$pytest_command"
         source /mnt/shared-storage-user/llmrazor-share/qa-llm-cicd/miniconda3/bin/activate
-        conda activate clusterx
+        conda activate clusterx-ncp
         unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
         python ci/scripts/xtuner_unittest.py "$IMAGE_INNER/$IMAGE" "source ${{env.WORKSPACE_PREFIX}}/BASE_ENV.sh;source ci/scripts/CI_ENV.sh" "$pytest_command"
