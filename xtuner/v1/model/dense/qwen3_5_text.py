@@ -62,6 +62,17 @@ class Qwen3_5_VLTextDenseConfig(TransformerConfig):
         ],
     )
     mudd_enabled: bool = False
+    # The fused Triton route kernel is the supported path: measured against the compiled
+    # route it is faster per step (2.540s vs 4.655s at the doc configuration) and peaks
+    # lower (119.56 GB vs 123.75 GB), with no one-off compilation cost. It falls back to
+    # the eager route wherever Triton or CUDA is unavailable, so it is safe as a default.
+    mudd_route_kernel: bool = True
+    # Kept for reproducing the reference implementation's route formulation; opt-in only.
+    mudd_compile: bool = False
+    # The route always follows the PrePostDANorm contract; this only selects whether
+    # the router's own input norm carries a learnable scale. The reference
+    # implementation's best-validated configuration runs it affine-free.
+    mudd_router_norm_affine: bool = False
 
     @computed_field
     def layers_type(self) -> list[Literal["full_attention", "linear_attention"]]:

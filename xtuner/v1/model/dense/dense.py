@@ -76,7 +76,14 @@ class Dense(BaseModel):
         self.rotary_emb = self.build_rotary_embedding(config)
         self.embed_tokens = self.build_embeddings(config)
         self.mudd = (
-            Qwen35MUDD(config.hidden_size, config.num_hidden_layers, config.rms_norm_eps)
+            Qwen35MUDD(
+                config.hidden_size,
+                config.num_hidden_layers,
+                config.rms_norm_eps,
+                compile_route=bool(getattr(config, "mudd_compile", False)),
+                route_kernel=bool(getattr(config, "mudd_route_kernel", True)),
+                router_norm_affine=bool(getattr(config, "mudd_router_norm_affine", False)),
+            )
             if bool(getattr(config, "mudd_enabled", False))
             else None
         )
