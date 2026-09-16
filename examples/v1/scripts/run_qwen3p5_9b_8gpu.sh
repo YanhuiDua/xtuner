@@ -51,7 +51,11 @@ else
 fi
 
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# expandable_segments returns the route's multi-GiB combine buffers to the driver
+# between steps and re-maps them on the next use; that mapping stalls the caller long
+# enough to miss the next layer's FSDP all-gather and costs ~2.8x step time on the
+# MUDD+MTP configuration (measured on 8xH200). See dev_notes/features/MUDD.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
