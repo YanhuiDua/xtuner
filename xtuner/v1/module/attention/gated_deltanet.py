@@ -227,6 +227,26 @@ class GatedDeltaNet(nn.Module):
         key_input: torch.Tensor,
         value_input: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # ``in_proj_qkv`` is laid out as [Q | K | V] and each routed source feeds
+        # exactly one block. Projecting every source with the whole fused weight
+        # (the previous behavior) computed all three blocks three times over and
+        # discarded two thirds of each result; slicing the weight rows first keeps
+        # the total projection work equal to the non-MUDD path. The per-source
+        # gradients still accumulate into the single fused parameter.
+        weight = self.in_proj_qkv.weight
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+        # Row slicing is only equivalent for the plain bf16 linear (the float8
+        # variants apply their scaling inside the module) over an unsharded fused
+        # weight; otherwise keep the previous whole-weight projections.
+        if weight.shape[0] == self.key_dim * 2 + self.value_dim and (
+            self.float8_cfg is None or self.float8_cfg.scaling_granularity_gemm is None
+        ):
+            return (
+                F.linear(query_input, weight[: self.key_dim]),
+                F.linear(key_input, weight[self.key_dim : 2 * self.key_dim]),
+                F.linear(value_input, weight[2 * self.key_dim :]),
+            )
         return (
             self.in_proj_qkv(query_input)[..., : self.key_dim],
             self.in_proj_qkv(key_input)[..., self.key_dim : 2 * self.key_dim],
