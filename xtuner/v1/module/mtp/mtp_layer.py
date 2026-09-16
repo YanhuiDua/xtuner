@@ -1,6 +1,6 @@
 """Multi-Token Prediction (MTP) Layer implementation."""
 
-from typing import Literal
+from typing import Literal, cast
 
 import torch
 import torch.nn as nn
@@ -111,11 +111,13 @@ class MTPLayer(nn.Module):
             outputs with the MTP final layernorm applied to the hidden states.
         """
         if len(hidden_states) == 1 and isinstance(hidden_states[0], list):
-            hidden_states = tuple(hidden_states[0])
-        if not hidden_states:
+            normalized_hidden_states: tuple[torch.Tensor, ...] = tuple(hidden_states[0])
+        else:
+            normalized_hidden_states = tuple(cast(torch.Tensor, hidden) for hidden in hidden_states)
+        if not normalized_hidden_states:
             raise ValueError("MTPLayer requires at least one hidden-state tensor")
 
-        if len(hidden_states) == 1:
+        if len(normalized_hidden_states) == 1:
             assert isinstance(future_embeddings, torch.Tensor), (
                 "future_embeddings should be a Tensor in single-microbatch mode"
             )
@@ -126,7 +128,7 @@ class MTPLayer(nn.Module):
                 "position_embeddings should be a (cos, sin) tuple in single-microbatch mode"
             )
             return self._forward(
-                hidden_states=hidden_states[0],
+                hidden_states=normalized_hidden_states[0],
                 future_embeddings=future_embeddings,
                 position_embeddings=position_embeddings,
                 seq_ctx=seq_ctx,
@@ -142,7 +144,7 @@ class MTPLayer(nn.Module):
             "position_embeddings should be a list aligned with hidden_states in multi-microbatch mode"
         )
         return self._micro_batch_forward(
-            hidden_states_list=list(hidden_states),
+            hidden_states_list=list(normalized_hidden_states),
             future_embeddings_list=future_embeddings,
             position_embeddings_list=position_embeddings,
             seq_ctx_list=seq_ctx,
