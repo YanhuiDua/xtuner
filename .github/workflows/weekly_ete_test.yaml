@@ -196,7 +196,7 @@ jobs:
           CI_E2E_DEBUG: ${{ github.event.inputs.CI_E2E_DEBUG || 'false' }}
           CI_ETE_TRAIN_IMAGE: ${{ env.CI_ETE_TRAIN_IMAGE }}
         run: |
-          source /mnt/shared-storage-user/opencompass-shared/qa-llm-cicd/miniconda3/bin/activate
+          source /mnt/shared-storage-user/llmrazor-share/qa-llm-cicd/miniconda3/bin/activate
           conda activate clusterx
           conda env list
           unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
