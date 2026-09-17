@@ -92,7 +92,8 @@ jobs:
         sudo git clean -ffdx
     - uses: actions/checkout@v3
 
-    - name: unit-test
+    - id: unit-test
+      name: unit-test
       run: |
         export KUBEBRAIN_CLUSTER_ENTRY=http://wangyixiuan-cpu.linzhouhan.ailab-llmarchitecture.svc.pjlab.local:11451
         export KUBEBRAIN_NAMESPACE=ailab-llmarchitecture 
@@ -103,3 +104,14 @@ jobs:
         conda activate clusterx-ncp
         unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
         python ci/scripts/xtuner_unittest.py "$IMAGE_INNER/$IMAGE" "source ${{env.WORKSPACE_PREFIX}}/BASE_ENV.sh;source ci/scripts/CI_ENV.sh" "$pytest_command"
+    - name: post
+      if: always()
+      env:
+        RJOB_ID: ${{ steps.unit-test.outputs.rjob_id }}
+      run: |
+        echo "rjob_id=${RJOB_ID}"
+        if [ -n "${RJOB_ID}" ]; then
+          export KUBEBRAIN_CLUSTER_ENTRY=http://wangyixiuan-cpu.linzhouhan.ailab-llmarchitecture.svc.pjlab.local:11451
+          export KUBEBRAIN_NAMESPACE=ailab-llmarchitecture 
+          rjob stop ${RJOB_ID} --namespace=ailab-llmarchitecture
+        fi

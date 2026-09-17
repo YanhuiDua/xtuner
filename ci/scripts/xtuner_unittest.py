@@ -37,6 +37,15 @@ def print_job_log(cluster, job_id: str) -> None:
         print(f"获取日志失败: {e}")
 
 
+def export_rjob_id(rjob_id: str) -> None:
+    """Expose the suffixed rjob name to later GitHub Actions steps."""
+    gh_out = os.environ.get("GITHUB_OUTPUT")
+    if not gh_out:
+        return
+    with open(gh_out, "a", encoding="utf-8") as f:
+        f.write(f"rjob_id={rjob_id}\n")
+
+
 def main():
     """主函数"""
     args = parse_args()
@@ -82,6 +91,7 @@ def main():
     cluster = cluster_cls()
     job_schema = cluster.run(params)
     print(f"任务已提交: {job_schema.job_id}")
+    export_rjob_id(job_schema.job_id)
 
     while True:
         time.sleep(10)
