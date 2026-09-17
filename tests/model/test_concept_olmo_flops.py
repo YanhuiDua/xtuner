@@ -182,10 +182,12 @@ def test_trainer_step_log_and_tracker_include_mfu(monkeypatch):
         },
         training_metrics={
             "local_step_consumed_tokens": 8192,
+            "local_step_seqlen_tokens": 8192,
             "local_step_consumed_img_tokens": 0,
             "local_total_consumed_tokens": 24576,
             "approximate_total_consumed_tokens": 196608,
             "tgs": 2048.0,
+            "seqlen_tgs": 2048.0,
             "exp_tgs": 2048.0,
             "eta_seconds": 28.0,
             "eta_hms": "0:00:28",

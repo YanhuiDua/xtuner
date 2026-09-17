@@ -40,7 +40,7 @@ def _stub_sonicmoe_decoder_layer() -> MoEDecoderLayer:
             "router_weights": torch.full((1, 2), marker + 1, dtype=torch.float32),
             "topk_ids": torch.full((1, 1), marker + 2, dtype=torch.int64),
         }
-        return hidden_states + 10, hidden_states + 20, router_results
+        return hidden_states + 10, hidden_states + 20, router_results, {}
 
     def sonicmoe_forward(self, hidden_states, residual, router_results):
         del router_results
@@ -62,17 +62,17 @@ def test_sonicmoe_decoder_preserves_router_result_contract():
         seq_ctx=seq_ctx[0],  # type: ignore[arg-type]
         position_embeddings=position_embeddings[0],
     )
-    assert len(single_output) == 4
-    torch.testing.assert_close(single_output[3], torch.tensor([[3]], dtype=torch.int64))
+    assert set(single_output) == {"hidden_states", "router_logits", "router_weights", "router_topk_ids"}
+    torch.testing.assert_close(single_output["router_topk_ids"], torch.tensor([[3]], dtype=torch.int64))
 
     micro_batch_output = layer._sonicmoe_micro_batch_forward(
         hidden_states,
         seq_ctx_list=seq_ctx,  # type: ignore[arg-type]
         position_embeddings_list=position_embeddings,
     )
-    assert len(micro_batch_output) == 8
-    torch.testing.assert_close(micro_batch_output[6], torch.tensor([[3]], dtype=torch.int64))
-    torch.testing.assert_close(micro_batch_output[7], torch.tensor([[4]], dtype=torch.int64))
+    assert set(micro_batch_output) == {"hidden_states", "router_logits", "router_weights", "router_topk_ids"}
+    torch.testing.assert_close(micro_batch_output["router_topk_ids"][0], torch.tensor([[3]], dtype=torch.int64))
+    torch.testing.assert_close(micro_batch_output["router_topk_ids"][1], torch.tensor([[4]], dtype=torch.int64))
 
 
 def _mock_backend(monkeypatch: pytest.MonkeyPatch, captured: dict | None = None) -> SonicMoEBackend:

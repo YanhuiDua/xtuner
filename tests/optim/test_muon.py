@@ -281,13 +281,16 @@ class ReferenceMuon(torch.optim.Optimizer):
                     U = mom * mu + g
 
                     # Newton-Schulz orthogonalization
-                    X = U.to(dtype=torch.bfloat16)
+                    X = U.to(dtype=torch.bfloat16).float()
                     N = X.size(-1)
                     X = X.view(num_experts, -1, N)
                     need_transpose = X.size(-2) > X.size(-1)
                     if need_transpose:
                         X = X.mT
-                    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
+                    norm = X.norm(dim=(-2, -1), keepdim=True)
+                    X = (X / torch.maximum(norm, torch.tensor(eps, device=X.device, dtype=X.dtype))).to(
+                        dtype=torch.bfloat16
+                    )
                     for a, b, c in self.NS_CONSTS:
                         A = X @ X.mT
                         B = b * A + c * (A @ A)
