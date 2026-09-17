@@ -7,7 +7,6 @@ Yidian集群任务提交脚本
 import sys
 import time
 import os
-import re
 from pathlib import Path
 import argparse
 
@@ -28,6 +27,16 @@ def parse_args():
     return parser.parse_args()
 
 
+def print_job_log(cluster, job_id: str) -> None:
+    """Fetch logs immediately while replicas still exist after Failed."""
+    try:
+        log = cluster.get_log(job_id)
+        print("=== 任务失败日志 ===")
+        print(log)
+    except Exception as e:
+        print(f"获取日志失败: {e}")
+
+
 def main():
     """主函数"""
     args = parse_args()
@@ -38,13 +47,11 @@ def main():
 
     current_dir = os.getcwd()
     cmd = f"cd {current_dir}; {args.env}; {args.cmd}"
-    # print(f"Running command: {cmd}")
 
     assert (
         params_cls is not None and cluster_cls is not None
     ), f"Cluster {CLUSTER} is not available in current ci machine!"
 
-    # 获取GitLab CI环境变量
     commit_id = os.environ.get("GITHUB_SHA", "test")[0:8]
     commit_branch = os.environ.get("GITHUB_HEAD_REF", "test")
     job_id = (
@@ -52,21 +59,18 @@ def main():
         + "-"
         + os.environ.get("GITHUB_RUN_ATTEMPT", "0")
     )
-
-    # 清理分支名中的非法字符，避免Kubernetes标签错误
     commit_branch = commit_branch.replace("/", "-").replace("\\", "-").replace("_", "-")
 
-    # Yidian特定的资源配置（基于test_clusterx_sft.py的成功经验）
     params = params_cls(
         job_name=f"xtuner-ci-{job_id}-{commit_id}",
         image=args.image,
         cmd=cmd,
-        gpus_per_task=8,  # Yidian使用16个GPU per node
-        cpus_per_task=120,  # 更多CPU资源（基于test_clusterx_sft.py）
-        memory_per_task="800",  # 更大内存（基于test_clusterx_sft.py的1800G配置）
+        gpus_per_task=8,
+        cpus_per_task=120,
+        memory_per_task="800",
         num_nodes=args.nodes,
         priority=5,
-        no_env=True,  # 不继承环境变量，使用自定义环境
+        no_env=True,
     )
 
     print(f"创建集群任务: {params.job_name}")
@@ -79,9 +83,8 @@ def main():
     job_schema = cluster.run(params)
     print(f"任务已提交: {job_schema.job_id}")
 
-    # 监控任务状态（与run.py保持一致的逻辑）
     while True:
-        time.sleep(10)  # 增加监控间隔，减少API调用频率
+        time.sleep(10)
 
         job_info = cluster.get_job_info(job_schema.job_id)
         status = job_info.status
@@ -92,17 +95,11 @@ def main():
             print(f"Job {job_schema.job_id} is running...")
         elif status == JobStatus.STOPPED:
             print(f"Job {job_schema.job_id} is stopped...")
+            print_job_log(cluster, job_schema.job_id)
             raise RuntimeError(f"Job {job_schema.job_id} failed with status {status}")
         elif status == JobStatus.FAILED:
             print(f"Job {job_schema.job_id} failed!")
-            # 等待10秒确保日志完全收集
-            time.sleep(10)
-            try:
-                log = cluster.get_log(job_schema.job_id)
-                print("=== 任务失败日志 ===")
-                print(log)
-            except Exception as e:
-                print(f"获取日志失败: {e}")
+            print_job_log(cluster, job_schema.job_id)
             raise RuntimeError(f"Job {job_schema.job_id} failed with status {status}")
         elif status == JobStatus.SUCCEEDED:
             print(f"Job {job_schema.job_id} succeeded!")
