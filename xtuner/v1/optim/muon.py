@@ -861,7 +861,7 @@ def muon_update_batch_async(
     lr_ratio: float,  # Pre-computed lr adjustment ratio
     momentum: Tensor,  # Momentum factor (scalar tensor)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
-    epsilon: Tensor,  # Epsilon (scalar tensor)
+    epsilon: float,  # Epsilon (scalar; Newton-Schulz uses clamp_min, which rejects a CPU tensor)
     nesterov: bool,  # Whether to use Nesterov momentum
     flatten: bool,  # Whether to flatten 3D+ tensors to 2D
     newton_schulz_func: Callable,  # Newton-Schulz function for orthogonalization
@@ -982,7 +982,7 @@ def _agrs_orthogonalize(
     process_group: ProcessGroup,
     newton_schulz_func: Callable,
     flatten: bool,
-    epsilon: Tensor,
+    epsilon: float,
     num_experts: int,
 ) -> Generator[None, None, list[Tensor]]:
     R = len(U)
@@ -1100,7 +1100,7 @@ def _subgroup_orthogonalize(
     process_group: ProcessGroup,
     newton_schulz_func: Callable,
     flatten: bool,
-    epsilon: Tensor,
+    epsilon: float,
     num_experts: int,
 ) -> Generator[None, None, list[Tensor]]:
     # Sub-group all-gather path: reconstruct a complete expert from a small
@@ -1149,7 +1149,7 @@ def _all_to_all_orthogonalize(
     process_group: ProcessGroup,
     newton_schulz_func: Callable,
     flatten: bool,
-    epsilon: Tensor,
+    epsilon: float,
     num_experts: int,
 ) -> Generator[None, None, list[Tensor]]:
     world_size = process_group.size()
@@ -1368,7 +1368,7 @@ def _local_orthogonalize(
     process_group: ProcessGroup | None,
     newton_schulz_func: Callable,
     flatten: bool,
-    epsilon: Tensor,
+    epsilon: float,
     num_experts: int,
 ) -> Generator[None, None, list[Tensor]]:
     world_size = process_group.size() if process_group is not None else 1
@@ -1493,7 +1493,7 @@ def muon_update_newton_schulz(
     X: Tensor,
     newton_schulz_func: Callable,
     flatten: bool,
-    epsilon: Tensor,
+    epsilon: float,
     num_experts: int = 1,
 ) -> Tensor:
     """Flatten the input tensor if needed and call the Newton-Schulz

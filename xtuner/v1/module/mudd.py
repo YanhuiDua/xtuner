@@ -36,7 +36,8 @@ _STACK_SCRATCH: dict[tuple[int, torch.dtype, int], tuple[int, int, Tensor]] = {}
 
 
 def _stack_scratch(rows: int, num_sources: int, hidden_size: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-    """Return a reusable ``[rows, >=num_sources, hidden_size]`` endpoint buffer."""
+    """Return a reusable ``[rows, >=num_sources, hidden_size]`` endpoint
+    buffer."""
     key = (device.index if device.index is not None else -1, dtype, hidden_size)
     entry = _STACK_SCRATCH.get(key)
     if entry is None or entry[0] != rows or entry[1] < num_sources:
@@ -68,7 +69,8 @@ def _stack_endpoints(sources: list[Tensor]) -> tuple[Tensor, int]:
 
 
 def _raise_dynamo_limits() -> None:
-    """Give Dynamo room for one graph per layer width without tripping its guard."""
+    """Give Dynamo room for one graph per layer width without tripping its
+    guard."""
     for name, floor in (
         ("cache_size_limit", 128),
         ("recompile_limit", 128),
@@ -134,7 +136,8 @@ def _compiled_route(
                 normed[source_idx] * weights[..., stream_idx, source_idx].unsqueeze(-1)
                 for source_idx in range(num_sources)
             )
-            normed_update = F.rms_norm(update, (hidden_size,), eps=eps)
+            # ``sum`` is typed as ``Tensor | Literal[0]`` because of its default start.
+            normed_update = F.rms_norm(update, (hidden_size,), eps=eps)  # type: ignore[arg-type]
             streams.append(current_raw + normed_update * post_norm[stream_idx])
         return torch.stack(streams, dim=-2)
 
@@ -148,8 +151,8 @@ def _compiled_route(
 def _invoke_compiled_route(compiled_fn: Callable, *args: Tensor) -> Tensor:
     """Call a compiled route from outside any enclosing Dynamo frame.
 
-    Invoking it from inside a traced region makes Dynamo guard on the call site
-    instead of the graph, which is what exhausts the recompile limit.
+    Invoking it from inside a traced region makes Dynamo guard on the call site instead of the graph, which is what
+    exhausts the recompile limit.
     """
     return compiled_fn(*args)
 
@@ -422,7 +425,8 @@ class _MUDDCombineTriton(torch.autograd.Function):
             grad_source_norm = grad_source_norm.to(source_norm.dtype)
             grad_post_norm = grad_post_norm.to(post_norm.dtype)
         else:
-            grad_current = grad_source_norm = grad_post_norm = None
+            # Unused pointers; the kernel never touches them when PREPOST=False.
+            grad_current = grad_source_norm = grad_post_norm = None  # type: ignore[assignment]
         # One gradient per endpoint; the stack has no node of its own to feed now.
         return grad_current, grad_weights, grad_source_norm, grad_post_norm, None, None, *grad_stacked.unbind(dim=-2)
 
@@ -513,7 +517,8 @@ class Qwen35MUDDRoute(nn.Module):
 
     @torch.no_grad()
     def init_extra_weights(self) -> set[str]:
-        """Initialise the route parameters the generic initializer must not own.
+        """Initialise the route parameters the generic initializer must not
+        own.
 
         ``router_w1``/``router_w2`` are part of the MUDD contract (``router_w2`` must be
         zero so the zero-initialised route is exactly the identity), so they are asserted

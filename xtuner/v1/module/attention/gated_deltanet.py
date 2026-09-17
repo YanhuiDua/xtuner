@@ -236,6 +236,9 @@ class GatedDeltaNet(nn.Module):
         weight = self.in_proj_qkv.weight
         if isinstance(weight, DTensor):
             weight = weight.to_local()
+        # ``in_proj_qkv`` is a module union for the type checker; the fused weight is a
+        # plain tensor once the DTensor shard is localised.
+        assert isinstance(weight, torch.Tensor)
         # Row slicing is only equivalent for the plain bf16 linear (the float8
         # variants apply their scaling inside the module) over an unsharded fused
         # weight; otherwise keep the previous whole-weight projections.
