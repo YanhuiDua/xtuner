@@ -112,6 +112,26 @@ class TestGatedDeltaNetMUDDQKVProjection:
             route.in_proj_qkv.weight.grad, reference_route.in_proj_qkv.weight.grad, rtol=1e-4, atol=1e-6
         )
 
+    def test_row_sliced_projection_bf16_baseline(self):
+        """量化 bf16 下行切片投影相对整权重投影的浮点偏差——模型级 Step-0 对齐阈值即取自此量级。"""
+        route, reference_route = _build_pair()
+        route.in_proj_qkv.to(torch.bfloat16)
+        reference_route.in_proj_qkv.to(torch.bfloat16)
+        query_input, key_input, value_input = (tensor.to(torch.bfloat16) for tensor in _inputs())
+
+        outputs = GatedDeltaNet._mudd_qkv_projection(route, query_input, key_input, value_input)
+        expected = _whole_weight_reference(reference_route, query_input, key_input, value_input)
+
+        max_diff = max(
+            (actual.float() - reference.float()).abs().max().item() for actual, reference in zip(outputs, expected)
+        )
+        scale = max(reference.float().abs().max().item() for reference in expected)
+        # bf16 只有 8 位尾数：逐段 GEMM 与融合 GEMM 的累加顺序不同，差值应停在 bf16 分辨率量级，
+        # 明显低于"接错线"会产生的偏差。
+        assert max_diff <= 1.0e-2 * max(scale, 1.0), (
+            f"bf16 row-sliced projection deviates by {max_diff:.3e} (scale {scale:.3e})"
+        )
+
     def test_row_sliced_projection_skips_whole_weight_calls(self):
         route = _StubRoute(_ExplodingProjection())
         query_input, key_input, value_input = _inputs()
