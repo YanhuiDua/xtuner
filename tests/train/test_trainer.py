@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import weakref
 from concurrent.futures import Future
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -984,6 +985,14 @@ def test_resume_and_load_checkpoint_cfg(tmp_path: Path, capfd):
         patch.object(Dataloader, "load_state_dict") as mock_data_load_state_dict,
         patch.object(FakeEngine, "load_dcp", side_effect=load_dcp) as mock_load_dcp,
         patch.object(SequentialLR, "load_state_dict") as mock_lr_load_state_dict,
+        (
+            patch(
+                "xtuner.v1.train.trainer.DEVICE_MODULE.empty_cache",
+                wraps=torch.cuda.empty_cache,
+            )
+            if DEVICE == "cuda"
+            else nullcontext()
+        ) as mock_empty_cache,
     ):
         trainer = Trainer(
             load_from=fake_hf_model_dir,
@@ -1010,7 +1019,11 @@ def test_resume_and_load_checkpoint_cfg(tmp_path: Path, capfd):
         )
         assert load_artifacts["temporary_state"]() is None
         if DEVICE == "cuda":
-            assert torch.cuda.memory_reserved() < load_artifacts["reserved_memory"]
+            # The temporary allocation can reuse an already-reserved allocator segment.
+            # In that case ``empty_cache`` leaves the reserved total unchanged, so only
+            # require that checkpoint loading does not increase the cached memory.
+            assert torch.cuda.memory_reserved() <= load_artifacts["reserved_memory"]
+            mock_empty_cache.assert_called_once()
             assert "[Checkpoint Resume Memory]" in capfd.readouterr().err
         assert trainer._engine.optimizer_device_calls == ["cpu"]
         # assert trainer._load_checkpoint_cfg.load_dataset is False

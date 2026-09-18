@@ -36,9 +36,7 @@ def _tiny_flops_config() -> SimpleNamespace:
 
 
 def test_concept_olmo_flops_exact_tiny_model():
-    breakdown = ConceptOlmoFlopsEstimator(_tiny_flops_config()).estimate(
-        sequence_length=8
-    )
+    breakdown = ConceptOlmoFlopsEstimator(_tiny_flops_config()).estimate(sequence_length=8)
 
     assert breakdown.concept_sequence_length == 2
     assert breakdown.encoder_transformer_flops == 6176
@@ -76,9 +74,7 @@ def test_stage2_v1_mfu_uses_global_step_flops():
     assert calculator.model_flops_per_step == 6_441_807_498_706_944
 
     metrics = calculator.compute(step_time=4.0)
-    assert metrics.tflops_per_gpu == pytest.approx(
-        calculator.model_flops_per_step / 4.0 / 8 / 1e12
-    )
+    assert metrics.tflops_per_gpu == pytest.approx(calculator.model_flops_per_step / 4.0 / 8 / 1e12)
     assert calculator.peak_tflops_per_gpu == 989.0
     assert calculator.peak_tflops_source == "auto"
     assert metrics.mfu == pytest.approx(metrics.tflops_per_gpu / 989.0)

@@ -1602,7 +1602,8 @@ def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7, num_experts: i
     # Ensure spectral norm is at most 1 for each expert matrix independently
     # norm shape: (num_experts, 1, 1) - each expert has its own normalization factor
     norm = X.norm(dim=(-2, -1), keepdim=True)
-    norm = torch.maximum(norm, epsilon.to(device=norm.device, dtype=norm.dtype))
+    epsilon_tensor = torch.as_tensor(epsilon, device=norm.device, dtype=norm.dtype)
+    norm = torch.maximum(norm, epsilon_tensor)
     X = (X / norm).to(dtype=torch.bfloat16)
 
     # Newton-Schulz iteration: orthogonalize each expert matrix

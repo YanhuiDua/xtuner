@@ -9,14 +9,14 @@ import torch
 import torch.distributed as dist
 from packaging.version import Version
 from safetensors import safe_open
-from transformers import __version__ as transformers_version
 
+from transformers import __version__ as transformers_version
+from xtuner._testing import DeterministicDDPTestCase
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.model import Qwen3_5_VLDense4BConfig
 from xtuner.v1.model.compose.qwen3_vl.modeling_vision import init_world_mesh
 from xtuner.v1.model.dense.qwen3_5_text import Qwen3_5_VLTextDense4BConfig
-from xtuner._testing import DeterministicDDPTestCase
 
 
 # Qwen3.5-4B (dense, hybrid linear + full attention VLM)
@@ -36,8 +36,8 @@ class TestQwen3_5_VLDense(DeterministicDDPTestCase):
         # + lm_head are materialized/loaded on GPU (XTuner builds the rest on meta; HF builds a standalone
         # layer), so this runs at any model scale, including models too large to forward end-to-end.
         import torch.nn.functional as F
-        from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
 
+        from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
         from xtuner.v1.utils import HFCheckpointLoader
 
         self.create_pg(device)
@@ -100,7 +100,9 @@ class TestQwen3_5_VLDense(DeterministicDDPTestCase):
 
             x_xt = base.clone().requires_grad_(True)
             o_xt = xt_layer(x_xt, position_embeddings=(cos, sin), seq_ctx=seq_ctx)
-            loss_xt = F.cross_entropy(F.linear(model.norm(o_xt), model.lm_head.weight).reshape(-1, cfg.vocab_size), labels)
+            loss_xt = F.cross_entropy(
+                F.linear(model.norm(o_xt), model.lm_head.weight).reshape(-1, cfg.vocab_size), labels
+            )
             loss_xt.backward()
 
         # forward (layer output), loss, and backward (dL/dx) must all be bitwise.
@@ -122,7 +124,6 @@ class TestQwen3_5_VLDense(DeterministicDDPTestCase):
         self.create_pg(device)
         self._patch_fast_pos_embed_interpolate()
         from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
-
         from xtuner.v1.utils import HFCheckpointLoader
 
         raw_data = {
@@ -445,7 +446,6 @@ class TestQwen3_5_VLDense(DeterministicDDPTestCase):
         # pos_embeds without a cast, so cast the result back to the pos_embed dtype here to
         # avoid an fp32/bf16 LayerNorm mismatch.
         from transformers.vision_utils import get_vision_bilinear_indices_and_weights
-
         from xtuner.v1.model.compose.qwen3_vl.modeling_vision import Qwen3VLVisionModel
 
         def _interp(self, grid_thw):
@@ -461,11 +461,12 @@ class TestQwen3_5_VLDense(DeterministicDDPTestCase):
     def _tokenize_qwen3vl(self, raw_data) -> dict:
         # Tokenize one Qwen3.5-VL image SFT sample and return device-resident model inputs.
         from transformers import AutoTokenizer
-
         from xtuner.v1.datasets import Qwen3VLTokenizeFnConfig
 
         tokenizer = AutoTokenizer.from_pretrained(QWEN3_5_DENSE_4B_PATH)
-        tokenize_fn = Qwen3VLTokenizeFnConfig(processor_path=QWEN3_5_DENSE_4B_PATH, add_vision_id=True).build(tokenizer)
+        tokenize_fn = Qwen3VLTokenizeFnConfig(processor_path=QWEN3_5_DENSE_4B_PATH, add_vision_id=True).build(
+            tokenizer
+        )
         tokenized = tokenize_fn(raw_data)
         return {
             "input_ids": torch.tensor(tokenized["input_ids"])[None].cuda(),
