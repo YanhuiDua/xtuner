@@ -23,6 +23,7 @@ from .dense.concept_olmo import (
     ConceptLMV22VQConfig,
     ConceptOlmoStage2V1Config,
 )
+from .dense.conceptlm_qwen35 import ConceptLMQwen35, ConceptLMQwen35Config
 from .dense.dense import Dense
 from .dense.qwen2 import Qwen2Dense7BConfig, Qwen2DenseConfig
 from .dense.qwen3 import Qwen3Dense0P6BConfig, Qwen3Dense4BConfig, Qwen3Dense8BConfig, Qwen3DenseConfig
@@ -120,6 +121,8 @@ __all__ = [
     "ConceptLMV22VQ",
     "ConceptLMV22VQConfig",
     "ConceptOlmoStage2V1Config",
+    "ConceptLMQwen35",
+    "ConceptLMQwen35Config",
     "Qwen3_5_VLTextDense2BConfig",
     "Qwen3_5_VLTextDense9BConfig",
 ]

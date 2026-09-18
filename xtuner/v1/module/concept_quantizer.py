@@ -13,6 +13,11 @@ ConceptLM recipe keeps the same concept quantisation contract:
 The codebooks are kept as a ``ParameterList`` of ``[codebook_size, head_dim]``
 matrices (instead of one stacked tensor) so Muon keeps treating each codebook as
 an independent matrix, which is what the reference implementation relies on.
+
+Layout note: like the reference implementation this module works on
+**sequence-major** tensors (``[S, B, hidden]`` / ``[S, B, num_codebooks, K]``).
+XTuner models carry batch-major tensors (``[B, S, hidden]``), so callers
+transpose around the quantizer calls.
 """
 
 from dataclasses import dataclass
@@ -47,9 +52,7 @@ class ConceptQuantizer(nn.Module):
         if hidden_size <= 0 or num_codebooks <= 0 or codebook_size <= 0:
             raise ValueError("hidden_size, num_codebooks and codebook_size must be positive")
         if hidden_size % num_codebooks:
-            raise ValueError(
-                f"hidden_size ({hidden_size}) must be divisible by num_codebooks ({num_codebooks})"
-            )
+            raise ValueError(f"hidden_size ({hidden_size}) must be divisible by num_codebooks ({num_codebooks})")
         self.hidden_size = int(hidden_size)
         self.num_codebooks = int(num_codebooks)
         self.codebook_size = int(codebook_size)
@@ -70,14 +73,26 @@ class ConceptQuantizer(nn.Module):
     def transformed_codebook(self) -> Tensor:
         return torch.stack(tuple(self.codebook), dim=0)
 
+    def init_extra_weights(self) -> set[str]:
+        """Register the split codebooks with XTuner's initializer contract.
+
+        The codebooks are bare parameters inside a ``ParameterList``, which the
+        generic initializer walk would not reach; XTuner requires every parameter
+        to be covered either by that walk or by an ``init_extra_weights`` hook.
+
+        Returns:
+            set[str]: Names of the codebook parameters this hook initializes.
+        """
+
+        self.reset_parameters()
+        return {f"codebook.{idx}" for idx in range(self.num_codebooks)}
+
     def decode_logits(self, logits: Tensor, mode: str = "raw_logits") -> Tensor:
-        """Convert per-codebook logits ``[S, B, H, K]`` into concept vectors."""
+        """Convert per-codebook logits ``[S, B, H, K]`` into concept
+        vectors."""
 
         if logits.dim() != 4:
-            raise ValueError(
-                "logits must have shape [S, B, num_codebooks, codebook_size], "
-                f"got {tuple(logits.shape)}"
-            )
+            raise ValueError(f"logits must have shape [S, B, num_codebooks, codebook_size], got {tuple(logits.shape)}")
         if logits.shape[2] != self.num_codebooks or logits.shape[3] != self.codebook_size:
             raise ValueError("logits codebook dimensions do not match the quantizer")
         codebook = self.transformed_codebook().to(device=logits.device, dtype=logits.dtype)
@@ -115,9 +130,7 @@ class ConceptQuantizer(nn.Module):
             for idx in range(self.num_codebooks)
         ]
         quantized = torch.stack(heads, dim=2).reshape_as(concept_hidden).to(concept_hidden.dtype)
-        per_tensor = F.mse_loss(
-            quantized.float(), concept_hidden.detach().float(), reduction="none"
-        ).mean(dim=-1)
+        per_tensor = F.mse_loss(quantized.float(), concept_hidden.detach().float(), reduction="none").mean(dim=-1)
         per_tensor = per_tensor + self.commitment_cost * F.mse_loss(
             quantized.detach().float(), concept_hidden.float(), reduction="none"
         ).mean(dim=-1)
