@@ -162,3 +162,51 @@ class Qwen3_5_VLTextDense9BConfig(Qwen3_5_VLTextDenseConfig):
             partial_rotary_factor=0.25,
         )
     )
+
+
+class Qwen3_5_VLTextDense2BConfig(Qwen3_5_VLTextDenseConfig):
+    """Qwen3.5-2B text-tower configuration.
+
+    Mirrors ``Qwen/Qwen3.5-2B-Base`` ``text_config``: 24 hybrid layers
+    (``linear_attention`` x3 + ``full_attention``, ``full_attention_interval=4``),
+    hidden size 2048, 8 query / 2 KV heads with head dim 256, tied embeddings and
+    16 GatedDeltaNet key/value heads.  The layer stack is the same shape the
+    reference ConceptLM recipe uses for its encoder / predictor / decoder stages.
+    """
+
+    vocab_size: int = 248320
+    max_position_embeddings: int = 262144
+    pad_token_id: int | None = None
+    eos_token_id: int = 248044
+    num_hidden_layers: int = 24
+    hidden_size: int = 2048
+    intermediate_size: int = 6144
+    rms_norm_eps: float = 1e-6
+    hidden_act: str = "silu"
+    tie_word_embeddings: bool = True
+    attention: MHAConfig = MHAConfig(
+        with_gate=True,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=256,
+        qk_norm=True,
+        rms_norm_eps=1e-6,
+        rms_norm_type="zero_centered",
+    )
+    linear_attention: GatedDeltaNetConfig = GatedDeltaNetConfig(
+        num_value_heads=16,
+        num_key_heads=16,
+        key_head_dim=128,
+        value_head_dim=128,
+        conv_kernel_dim=4,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+    )
+    rope_parameters_cfg: RopeParametersConfig = Field(
+        default_factory=lambda: RopeParametersConfig(
+            rope_theta=10000000.0,
+            rope_type="qwen3_vl",
+            mrope_section=[11, 11, 10],
+            partial_rotary_factor=0.25,
+        )
+    )
