@@ -23,6 +23,18 @@ def _triton_rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> t
     return rms_norm_fn(x, weight, bias=None, eps=epsilon)
 
 
+def _triton_zero_centered_rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
+    """Fused zero-centered RMSNorm (Qwen3.5) on the vendored Triton kernel.
+
+    The kernel applies ``w + 1.0`` in fp32 internally, matching
+    ``native_zero_centered_rms_norm``'s ``output * (1.0 + weight.float())``.
+    """
+
+    from .gpu import rms_norm_fn
+
+    return rms_norm_fn(x, weight, bias=None, eps=epsilon, zero_centered_weight=True)
+
+
 def native_zero_centered_rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
     def _norm(x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + epsilon)
@@ -59,7 +71,7 @@ def get_zero_centered_rms_norm_fn() -> RMSNormProtocol:
     if device in ["cpu", "cuda"]:
         # TODO: control triton rmsnorm by model config rather than env var
         if os.getenv("XTUNER_USE_NATIVE_RMSNORM", "1") == "0" and device == "cuda":
-            raise NotImplementedError("Zero-centered RMSNorm is not implemented in triton")
+            return _triton_zero_centered_rms_norm
         else:
             return native_zero_centered_rms_norm
     elif device == "npu":
