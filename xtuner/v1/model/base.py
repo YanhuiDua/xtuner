@@ -407,6 +407,8 @@ class ModelOutputs(PydanticBaseModel):
     hidden_states: list[torch.Tensor] | None = None
     logits: torch.Tensor | None = None
     loss: torch.Tensor | None = None  # TODO: `forward_only` mode for RL
+    ncp_loss: torch.Tensor | None = None
+    vq_loss: torch.Tensor | None = None
     extra_info: ModelForwardExtraLogInfo | dict | None = None  # TODO: `forward_only` mode for RL
 
     def free_nongrad_feature(self):

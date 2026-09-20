@@ -242,6 +242,62 @@ class ConceptLMV22VQ(BaseModel):
         )
 
     def to_hf_key_list(self, key: str) -> list[str]:
+        if self.config.model_type == "ncp_olmo3":
+            if key.endswith("._extra_state"):
+                return []
+            if key == "concept_quantizer.codebook":
+                return [
+                    f"concept_quantizer.codebook.{index}"
+                    for index in range(self.config.concept_v22_vq_num_codebooks)
+                ]
+            if key in {"prediction_heads.weight", "prediction_heads.bias"}:
+                suffix = key.rsplit(".", 1)[-1]
+                return [
+                    f"concept_predictor.prediction_heads.{index}.{suffix}"
+                    for index in range(self.config.concept_v22_vq_num_codebooks)
+                ]
+            mappings = (
+                (r"^embed_tokens\.", "embed_tokens."),
+                (r"^encoder_stages\.(\d+)\.transformer\.", r"encoder.layers.\1."),
+                (r"^concept_stages\.(\d+)\.transformer\.", r"concept_predictor.hlm_block.layers.\1."),
+                (r"^decoder_stages\.(\d+)\.transformer\.", r"decoder.layers.\1."),
+                (r"^encoder_stages\.(\d+)\.depth_dd\.", r"dd_encoder_self_dd.depth_dds.\1."),
+                (r"^concept_stages\.(\d+)\.depth_dd\.", r"concept_predictor.concept_self_dd.depth_dds.\1."),
+                (r"^concept_stages\.(\d+)\.read_encoder_route\.", r"concept_predictor.concept_read_encoder_routes.\1."),
+                (r"^decoder_stages\.(\d+)\.decoder_dd\.", r"dd_two_route_add.decoder_dds.\1."),
+                (r"^decoder_stages\.(\d+)\.concept_route\.", r"dd_two_route_add.concept_routes.\1."),
+                (r"^decoder_stages\.(\d+)\.read_encoder_route\.", r"decoder_read_encoder_routes.\1."),
+                (r"^decoder_stages\.(\d+)\.read_concept_route\.", r"decoder_read_concept_routes.\1."),
+                (r"^concept_final_norm\.", "concept_predictor.hlm_block.norm."),
+                (r"^concept_read_encoder_shared_source_norm\.", "concept_predictor.concept_read_encoder_shared_source_norm."),
+                (r"^final_norm\.", "decoder.norm."),
+                (r"^lm_head\.", "lm_head."),
+                (r"^decoder_read_encoder_shared_source_norm\.", "decoder_read_encoder_shared_source_norm."),
+                (r"^decoder_read_concept_shared_source_norm\.", "decoder_read_concept_shared_source_norm."),
+                (r"^fusion_tok_norm\.", "fusion_tok_norm."),
+                (r"^fusion_hl_norm\.", "fusion_hl_norm."),
+                (r"^fusion_norm_alpha$", "fusion_norm_alpha"),
+                (r"^final_read_concept_gate_logits$", "final_read_concept_gate_logits"),
+            )
+            for pattern, replacement in mappings:
+                if re.search(pattern, key):
+                    mapped = re.sub(pattern, replacement, key)
+                    mapped = mapped.replace("self_attention.", "self_attn.")
+                    mapped = mapped.replace("q_layernorm.", "q_norm.")
+                    mapped = mapped.replace("k_layernorm.", "k_norm.")
+                    mapped = mapped.replace("linear_proj.", "o_proj.")
+                    if mapped.endswith("linear_qkv.weight"):
+                        prefix = mapped.removesuffix("linear_qkv.weight")
+                        return [
+                            prefix + "q_proj.weight",
+                            prefix + "k_proj.weight",
+                            prefix + "v_proj.weight",
+                        ]
+                    if mapped.endswith("linear_fc1.weight"):
+                        prefix = mapped.removesuffix("linear_fc1.weight")
+                        return [prefix + "gate_proj.weight", prefix + "up_proj.weight"]
+                    return [mapped.replace("linear_fc2.", "down_proj.")]
+            return [key]
         if key == "concept_quantizer.codebook":
             return [f"concept_quantizer.codebook.{index}" for index in range(self.config.concept_v22_vq_num_codebooks)]
         if key in {"prediction_heads.weight", "prediction_heads.bias"}:
@@ -317,6 +373,15 @@ class ConceptLMV22VQ(BaseModel):
 
     @override
     def hf_tensor_to_canonical(self, name: str, loaded_tensor: torch.Tensor) -> torch.Tensor:
+        if self.config.model_type == "ncp_olmo3" and name.endswith("self_attention.linear_qkv.weight"):
+            hidden_size = self.config.hidden_size
+            query, key, value = loaded_tensor.split(hidden_size, dim=0)
+            num_heads = self.config.attention.num_attention_heads
+            head_dim = self.config.attention.head_dim
+            query = query.view(num_heads, head_dim, hidden_size)
+            key = key.view(num_heads, head_dim, hidden_size)
+            value = value.view(num_heads, head_dim, hidden_size)
+            return torch.stack((query, key, value), dim=2).reshape_as(loaded_tensor)
         if name == "fusion_norm_alpha":
             return loaded_tensor.reshape(1)
         return loaded_tensor
@@ -347,8 +412,37 @@ class ConceptLMV22VQ(BaseModel):
             # SequenceContext keeps max_length_q on CPU specifically so the
             # common single-sequence case does not need a CUDA-to-CPU copy.
             return [int(seq_ctx.max_length_q.item())]
-        lengths = seq_ctx.cu_seq_lens_q[1:] - seq_ctx.cu_seq_lens_q[:-1]
-        return [int(length) for length in lengths.detach().cpu().tolist()]
+        lengths = [
+            int(length)
+            for length in (seq_ctx.cu_seq_lens_q[1:] - seq_ctx.cu_seq_lens_q[:-1]).detach().cpu().tolist()
+        ]
+        if seq_ctx.num_padding <= 0:
+            return lengths
+
+        # SequenceContext keeps SP padding in the physical packed tensor and
+        # records it separately. Concept pooling must only see real tokens.
+        physical_tokens = sum(lengths)
+        valid_tokens = (
+            int(seq_ctx.valid_sequence_length)
+            if getattr(seq_ctx, "_valid_sequence_length_explicit", False)
+            else physical_tokens - int(seq_ctx.num_padding)
+        )
+        if valid_tokens > physical_tokens:
+            raise ValueError("SequenceContext.valid_sequence_length exceeds the physical sequence length")
+        if valid_tokens < 0:
+            raise ValueError("SequenceContext.num_padding exceeds the physical sequence length")
+        valid_lengths: list[int] = []
+        remaining = valid_tokens
+        for length in lengths:
+            valid_length = min(length, remaining)
+            if valid_length > 0:
+                valid_lengths.append(valid_length)
+            remaining -= valid_length
+            if remaining == 0:
+                break
+        if remaining != 0:
+            raise ValueError("SequenceContext cumulative lengths do not contain all valid tokens")
+        return valid_lengths
 
     @staticmethod
     def _gather_sequence(hidden_states: torch.Tensor, sp_mesh: DeviceMesh | None) -> torch.Tensor:
@@ -445,10 +539,13 @@ class ConceptLMV22VQ(BaseModel):
         for seq_len in token_lengths:
             state = hidden_states[:, start : start + seq_len]
             start += seq_len
-            if seq_len < chunk_size:
-                merged = state.mean(dim=1, keepdim=True)
+            usable = (seq_len // chunk_size) * chunk_size
+            if usable == 0:
+                # The HF reference emits no concept when a document does not
+                # contain a complete source chunk. Keep an empty segment so
+                # packed token/concept alignment remains document-local.
+                merged = state[:, :0]
             else:
-                usable = (seq_len // chunk_size) * chunk_size
                 reshaped = state[:, :usable].reshape(1, usable // chunk_size, chunk_size, *state.shape[2:])
                 if self.config.concept_chunk_merge_method == "first":
                     merged = reshaped[:, :, 0]
@@ -458,6 +555,8 @@ class ConceptLMV22VQ(BaseModel):
                     merged = reshaped.mean(dim=2)
             chunks.append(merged)
             concept_lengths.append(merged.shape[1])
+        if not chunks:
+            return hidden_states.new_empty(1, 0, *hidden_states.shape[2:]), []
         return self._cat_if_multiple(chunks, dim=1), concept_lengths
 
     def _repeat_shift(
@@ -486,6 +585,8 @@ class ConceptLMV22VQ(BaseModel):
                 padding = repeated.new_zeros(1, seq_len - repeated.shape[1], *repeated.shape[2:])
                 repeated = torch.cat((repeated, padding), dim=1)
             repeated_docs.append(repeated[:, :seq_len])
+        if not repeated_docs:
+            return concept_states.new_empty(1, 0, *concept_states.shape[2:])
         return self._cat_if_multiple(repeated_docs, dim=1)
 
     @staticmethod
@@ -499,9 +600,82 @@ class ConceptLMV22VQ(BaseModel):
         for concept_len in concept_lengths:
             state = concept_states[:, start : start + concept_len]
             start += concept_len
-            chunks.append(torch.cat((torch.zeros_like(state[:, :1]), state), dim=1))
+            if concept_len == 0:
+                chunks.append(concept_states.new_zeros(1, 1, *concept_states.shape[2:]))
+            else:
+                chunks.append(torch.cat((torch.zeros_like(state[:, :1]), state), dim=1))
             source_lengths.append(concept_len + 1)
+        if not chunks:
+            return concept_states.new_empty(1, 0, *concept_states.shape[2:]), []
         return ConceptLMV22VQ._cat_if_multiple(chunks, dim=1), source_lengths
+
+    @staticmethod
+    def _pad_sequence_tail(hidden_states: torch.Tensor, target_length: int) -> torch.Tensor:
+        if hidden_states.shape[1] >= target_length:
+            return hidden_states[:, :target_length]
+        padding = hidden_states.new_zeros(
+            hidden_states.shape[0],
+            target_length - hidden_states.shape[1],
+            *hidden_states.shape[2:],
+        )
+        return torch.cat((hidden_states, padding), dim=1)
+
+    def _concept_auxiliary_losses(
+        self,
+        continuous_concepts: torch.Tensor,
+        predicted_concepts: torch.Tensor,
+        concept_lengths: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute the paper's next-concept and product-VQ objectives.
+
+        ``continuous_concepts`` contains the encoder target at concept
+        resolution.  ``predicted_concepts[i]`` predicts the next concept, so
+        the last concept of every packed document has no NCP target.  Padding
+        and incomplete documents are absent from ``concept_lengths``/the
+        tensors passed here.
+        """
+        zero = continuous_concepts.new_zeros(())
+        ncp_parts: list[torch.Tensor] = []
+        target_parts: list[torch.Tensor] = []
+        start = 0
+        for length in concept_lengths:
+            if length > 1:
+                ncp_parts.append(predicted_concepts[:, start : start + length - 1])
+                target_parts.append(continuous_concepts[:, start + 1 : start + length])
+            start += length
+
+        if ncp_parts:
+            ncp_target = torch.cat(target_parts, dim=1)
+            if self.config.concept_vq_detach_hlm_target:
+                ncp_target = ncp_target.detach()
+            if self.config.concept_hlm_loss_type != "mse":
+                raise ValueError(f"Unsupported concept HLM loss type: {self.config.concept_hlm_loss_type}")
+            ncp_loss = F.mse_loss(torch.cat(ncp_parts, dim=1).float(), ncp_target.float())
+        else:
+            ncp_loss = zero
+
+        if continuous_concepts.shape[1] == 0:
+            return ncp_loss, zero
+
+        codebook = self.concept_quantizer.transformed_codebook().to(continuous_concepts.dtype)
+        target = continuous_concepts.view(
+            continuous_concepts.shape[0],
+            continuous_concepts.shape[1],
+            self.config.concept_v22_vq_num_codebooks,
+            self.concept_quantizer.code_dim,
+        )
+        distances = (target.unsqueeze(3) - codebook.unsqueeze(0).unsqueeze(0)).pow(2).sum(dim=-1)
+        indices = distances.argmin(dim=-1)
+        quantized = torch.gather(
+            codebook.unsqueeze(0).unsqueeze(0).expand(target.shape[0], target.shape[1], -1, -1, -1),
+            dim=3,
+            index=indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, self.concept_quantizer.code_dim),
+        ).squeeze(3)
+        quantized = quantized.reshape_as(continuous_concepts)
+        codebook_loss = F.mse_loss(quantized.float(), continuous_concepts.detach().float())
+        commitment_loss = F.mse_loss(continuous_concepts.float(), quantized.detach().float())
+        vq_loss = codebook_loss + self.config.concept_vq_commitment_cost * commitment_loss
+        return ncp_loss, vq_loss
 
     @staticmethod
     def _build_concept_context(
@@ -519,7 +693,12 @@ class ConceptLMV22VQ(BaseModel):
             pin_memory=use_pinned_metadata,
         )
         cu_seq_lens = cu_seq_lens_cpu.to(device, non_blocking=use_pinned_metadata)
-        position_id_chunks = [torch.arange(length, device=device) * chunk_size for length in concept_lengths]
+        # Concept positions index the pooled concept sequence, not the source
+        # token sequence.  The reference NCP implementation therefore uses
+        # 0, 1, 2, ... for each document even when each concept represents
+        # ``chunk_size`` source tokens.  Keep document-local resets for packed
+        # inputs; sequence-parallel sharding is applied below.
+        position_id_chunks = [torch.arange(length, device=device) for length in concept_lengths]
         position_ids = ConceptLMV22VQ._cat_if_multiple(position_id_chunks, dim=0).unsqueeze(0)
         shard_start = 0
         shard_size = concept_hidden.shape[1]
@@ -595,7 +774,9 @@ class ConceptLMV22VQ(BaseModel):
         full_encoder_hidden = self._gather_sequence(hidden_states, sp_mesh)
         full_encoder_raw_states = [self._gather_sequence(state, sp_mesh) for state in encoder_raw_states]
         concept_hidden, concept_lengths = self._merge_chunks(full_encoder_hidden, token_lengths)
+        continuous_concepts = concept_hidden
         valid_concept_length = concept_hidden.shape[1]
+        active_concept_lengths = [length for length in concept_lengths if length > 0]
         concept_hidden, concept_padding = self._pad_and_split_sequence(concept_hidden, sp_mesh)
         concept_hidden = self.concept_vq_input_norm(concept_hidden)
         merged_encoder_state_list = [
@@ -609,53 +790,76 @@ class ConceptLMV22VQ(BaseModel):
         if encoder_concept_padding != concept_padding:
             raise RuntimeError("Concept hidden states and encoder sources received different SP padding")
         encoder_concept_states = self.concept_read_encoder_shared_source_norm(merged_encoder_states)
-        padded_concept_lengths = [*concept_lengths, concept_padding] if concept_padding else concept_lengths
-        concept_ctx = self._build_concept_context(
-            concept_hidden,
-            padded_concept_lengths,
-            self.config.concept_chunk_size,
-            sp_mesh,
-            concept_padding,
-        )
-        assert concept_ctx.position_ids is not None
-        concept_position_embeddings = self.rotary_emb(concept_hidden, concept_ctx.position_ids)
-
-        concept_history: tuple[torch.Tensor, ...] = (concept_hidden,)
         concept_raw_states: list[torch.Tensor] = []
-        if self.config.stage_group_size == 1:
-            for stage_idx, stage in enumerate(self.concept_stages):
-                with self._activation_offload_context(concept_hidden, stage_idx, "concept"):
-                    concept_hidden, raw = stage(
-                        concept_hidden,
-                        concept_position_embeddings,
-                        concept_ctx,
-                        encoder_concept_states,
-                        *concept_history,
-                    )
-                concept_raw_states.append(raw)
-                concept_history = (*concept_history, raw)
+        if valid_concept_length > 0:
+            padded_concept_lengths = (
+                [*active_concept_lengths, concept_padding] if concept_padding else active_concept_lengths
+            )
+            concept_ctx = self._build_concept_context(
+                concept_hidden,
+                padded_concept_lengths,
+                self.config.concept_chunk_size,
+                sp_mesh,
+                concept_padding,
+            )
+            assert concept_ctx.position_ids is not None
+            concept_position_embeddings = self.rotary_emb(concept_hidden, concept_ctx.position_ids)
+
+            concept_history: tuple[torch.Tensor, ...] = (concept_hidden,)
+            if self.config.stage_group_size == 1:
+                for stage_idx, stage in enumerate(self.concept_stages):
+                    with self._activation_offload_context(concept_hidden, stage_idx, "concept"):
+                        concept_hidden, raw = stage(
+                            concept_hidden,
+                            concept_position_embeddings,
+                            concept_ctx,
+                            encoder_concept_states,
+                            *concept_history,
+                        )
+                    concept_raw_states.append(raw)
+                    concept_history = (*concept_history, raw)
+            else:
+                for group_idx, group in enumerate(self.concept_stage_groups):
+                    stage_idx = group_idx * self.config.stage_group_size
+                    with self._activation_offload_context(concept_hidden, stage_idx, "concept"):
+                        group_outputs = group(
+                            concept_hidden,
+                            concept_position_embeddings,
+                            concept_ctx,
+                            encoder_concept_states,
+                            *concept_history,
+                        )
+                    concept_hidden, *raw_states = group_outputs
+                    concept_raw_states.extend(raw_states)
+                    concept_history = (*concept_history, *raw_states)
+            concept_hidden = self.concept_final_norm(concept_hidden)
+            concept_logits = self._predict_concept_logits(concept_hidden)
+            codebook = self.concept_quantizer.transformed_codebook().to(concept_logits.dtype)
+            predicted_vectors = torch.einsum("bsck,ckd->bscd", concept_logits, codebook).reshape(
+                concept_logits.shape[0], concept_logits.shape[1], self.config.hidden_size
+            )
         else:
-            for group_idx, group in enumerate(self.concept_stage_groups):
-                stage_idx = group_idx * self.config.stage_group_size
-                with self._activation_offload_context(concept_hidden, stage_idx, "concept"):
-                    group_outputs = group(
-                        concept_hidden,
-                        concept_position_embeddings,
-                        concept_ctx,
-                        encoder_concept_states,
-                        *concept_history,
-                    )
-                concept_hidden, *raw_states = group_outputs
-                concept_raw_states.extend(raw_states)
-                concept_history = (*concept_history, *raw_states)
-        concept_hidden = self.concept_final_norm(concept_hidden)
-        concept_logits = self._predict_concept_logits(concept_hidden)
-        codebook = self.concept_quantizer.transformed_codebook().to(concept_logits.dtype)
-        predicted_vectors = torch.einsum("bsck,ckd->bscd", concept_logits, codebook).reshape(
-            concept_logits.shape[0], concept_logits.shape[1], self.config.hidden_size
-        )
+            # Match the HF path for sequences without a complete concept
+            # chunk: no Concept Module computation and an all-zero feedback
+            # path. Raw states are still materialized for decoder routing.
+            predicted_vectors = concept_hidden.new_empty(1, 0, self.config.hidden_size)
+            concept_raw_states = [
+                concept_hidden.new_empty(1, 0, self.config.hidden_size)
+                for _ in range(self.config.concept_special_layers)
+            ]
         predicted_vectors = self._gather_sequence(predicted_vectors, sp_mesh)[:, :valid_concept_length]
+        ncp_loss: torch.Tensor | None = None
+        vq_loss: torch.Tensor | None = None
+        if loss_ctx is not None and (
+            self.config.concept_hlm_loss_weight > 0 or self.config.concept_vq_loss_weight > 0
+        ):
+            ncp_loss, vq_loss = self._concept_auxiliary_losses(
+                continuous_concepts,
+                predicted_vectors,
+                active_concept_lengths,
+            )
         repeated_concepts = self._repeat_shift(predicted_vectors, concept_lengths, token_lengths)
+        repeated_concepts = self._pad_sequence_tail(repeated_concepts, full_encoder_hidden.shape[1])
         repeated_concepts = self._local_token_shard(repeated_concepts, seq_ctx, hidden_states.shape[1])
 
         hidden_states = self.fusion_tok_norm(hidden_states) + self.fusion_norm_alpha.to(
@@ -680,6 +884,7 @@ class ConceptLMV22VQ(BaseModel):
             token_lengths,
             prepend_zero=False,
         )
+        decoder_concept_states = self._pad_sequence_tail(decoder_concept_states, full_encoder_hidden.shape[1])
         decoder_concept_states = self._local_token_shard(decoder_concept_states, seq_ctx, hidden_states.shape[1])
 
         decoder_history: tuple[torch.Tensor, ...] = (hidden_states,)
@@ -724,8 +929,19 @@ class ConceptLMV22VQ(BaseModel):
             output["logits"] = logits
         else:
             loss, (logits, extra_info) = self.lm_head(hidden_states, loss_ctx["lm"])  # type: ignore[call-overload]
-            output["loss"] = loss
+            total_loss = loss
+            if ncp_loss is not None:
+                total_loss = total_loss + self.config.concept_hlm_loss_weight * ncp_loss
+            if vq_loss is not None:
+                total_loss = total_loss + self.config.concept_vq_loss_weight * vq_loss
+            output["loss"] = total_loss
+            output["ncp_loss"] = ncp_loss
+            output["vq_loss"] = vq_loss
             output["logits"] = logits
+            if ncp_loss is not None:
+                extra_info["ncp_loss"] = ncp_loss.detach()
+            if vq_loss is not None:
+                extra_info["vq_loss"] = vq_loss.detach()
             output["extra_info"] = extra_info
         return ModelOutputs(**output)
 
@@ -905,6 +1121,11 @@ class ConceptLMV22VQConfig(TransformerConfig):
     concept_chunk_merge_method: Literal["meanpooling", "first", "last"]
     concept_v22_vq_codebook_size: int
     concept_v22_vq_num_codebooks: int
+    concept_hlm_loss_weight: float = 0.0
+    concept_vq_loss_weight: float = 0.0
+    concept_vq_commitment_cost: float = 0.25
+    concept_vq_detach_hlm_target: bool = True
+    concept_hlm_loss_type: Literal["mse"] = "mse"
     concept_fusion_norm_alpha_init: float
     concept_dd_two_route_add_decoder_use_softmax: bool
     window_size: tuple[int, int]
@@ -926,6 +1147,10 @@ class ConceptLMV22VQConfig(TransformerConfig):
             raise ValueError("lm_head_vocab_padding_multiple must be positive")
         if self.stage_group_size <= 0:
             raise ValueError("stage_group_size must be positive")
+        if self.concept_hlm_loss_weight < 0 or self.concept_vq_loss_weight < 0:
+            raise ValueError("concept auxiliary loss weights must be non-negative")
+        if self.concept_vq_commitment_cost < 0:
+            raise ValueError("concept_vq_commitment_cost must be non-negative")
         return self
 
     def build(self) -> ConceptLMV22VQ:
@@ -936,22 +1161,24 @@ class ConceptLMV22VQConfig(TransformerConfig):
         from transformers import AutoConfig, AutoTokenizer
 
         hf_config = AutoConfig.from_pretrained(hf_path, trust_remote_code=True)
-        if hf_config.model_type != "conceptlm_v22_vq":
-            raise ValueError(f"Expected conceptlm_v22_vq, got {hf_config.model_type}")
+        if hf_config.model_type not in {"conceptlm_v22_vq", "ncp_olmo3"}:
+            raise ValueError(f"Expected conceptlm_v22_vq or ncp_olmo3, got {hf_config.model_type}")
+        def get_field(name: str, legacy: str, default: Any = None) -> Any:
+            return getattr(hf_config, name, getattr(hf_config, legacy, default))
         unsupported = {
-            "num_query_groups": hf_config.num_query_groups == hf_config.num_attention_heads,
-            "rotary_percent": hf_config.rotary_percent == 1.0,
-            "rotary_interleaved": not hf_config.rotary_interleaved,
-            "position_embedding_type": hf_config.position_embedding_type == "rope",
-            "gated_linear_unit": hf_config.gated_linear_unit,
-            "activation_function": hf_config.activation_function == "silu",
-            "concept_v22_vq_merge_mode": hf_config.concept_v22_vq_merge_mode == "raw_logits",
-            "concept_layer_norm_option": hf_config.concept_layer_norm_option == "normed_add",
-            "concept_dd_two_route_add": hf_config.concept_dd_two_route_add,
-            "concept_enable_concept_read_encoder": hf_config.concept_enable_concept_read_encoder,
-            "concept_enable_decoder_read_encoder": hf_config.concept_enable_decoder_read_encoder,
-            "concept_enable_decoder_read_concept": hf_config.concept_enable_decoder_read_concept,
-            "concept_final_read_concept_gate": hf_config.concept_final_read_concept_gate,
+            "num_query_groups": get_field("num_query_groups", "num_attention_heads") == hf_config.num_attention_heads,
+            "rotary_percent": getattr(hf_config, "rotary_percent", 1.0) == 1.0,
+            "rotary_interleaved": not getattr(hf_config, "rotary_interleaved", False),
+            "position_embedding_type": getattr(hf_config, "position_embedding_type", "rope") in {"rope", "yarn"},
+            "gated_linear_unit": getattr(hf_config, "gated_linear_unit", True),
+            "activation_function": getattr(hf_config, "activation_function", "silu") == "silu",
+            "concept_v22_vq_merge_mode": get_field("conceptlm_v22_vq_merge_mode", "concept_v22_vq_merge_mode") == "raw_logits",
+            "concept_layer_norm_option": get_field("conceptlm_layer_norm_option", "concept_layer_norm_option") == "normed_add",
+            "concept_dd_two_route_add": get_field("conceptlm_v21_dd_two_route_add", "concept_dd_two_route_add", True),
+            "concept_enable_concept_read_encoder": get_field("conceptlm_v21_enable_concept_read_encoder", "concept_enable_concept_read_encoder", True),
+            "concept_enable_decoder_read_encoder": get_field("conceptlm_v21_enable_decoder_read_encoder", "concept_enable_decoder_read_encoder", True),
+            "concept_enable_decoder_read_concept": get_field("conceptlm_v21_enable_decoder_read_concept", "concept_enable_decoder_read_concept", True),
+            "concept_final_read_concept_gate": get_field("conceptlm_v21_final_read_concept_gate", "concept_final_read_concept_gate", True),
         }
         disabled = [name for name, enabled in unsupported.items() if not enabled]
         if disabled:
@@ -959,6 +1186,7 @@ class ConceptLMV22VQConfig(TransformerConfig):
 
         tokenizer = AutoTokenizer.from_pretrained(hf_path, trust_remote_code=True)
         return cls(
+            model_type=hf_config.model_type,
             vocab_size=hf_config.vocab_size,
             max_position_embeddings=hf_config.max_position_embeddings,
             bos_token_id=getattr(hf_config, "bos_token_id", None) or tokenizer.bos_token_id,
@@ -968,10 +1196,10 @@ class ConceptLMV22VQConfig(TransformerConfig):
             hidden_size=hf_config.hidden_size,
             intermediate_size=hf_config.ffn_hidden_size,
             rms_norm_eps=hf_config.layernorm_epsilon,
-            hidden_act=hf_config.activation_function,
+            hidden_act=getattr(hf_config, "activation_function", "silu"),
             attention=MHAConfig(
                 num_attention_heads=hf_config.num_attention_heads,
-                num_key_value_heads=hf_config.num_query_groups,
+                num_key_value_heads=get_field("num_query_groups", "num_attention_heads"),
                 head_dim=hf_config.kv_channels,
                 dropout=hf_config.attention_dropout,
                 qk_norm=True,
@@ -981,16 +1209,28 @@ class ConceptLMV22VQConfig(TransformerConfig):
             rope_parameters_cfg=RopeParametersConfig.from_hf_config(hf_config),
             tie_word_embeddings=hf_config.tie_word_embeddings,
             use_sliding_window=True,
-            concept_encoder_layers=hf_config.concept_encoder_layers,
-            concept_decoder_layers=hf_config.concept_decoder_layers,
-            concept_special_layers=hf_config.concept_special_layers,
-            concept_chunk_size=hf_config.concept_chunk_size,
-            concept_shift_feature=hf_config.concept_shift_feature,
-            concept_chunk_merge_method=hf_config.concept_chunk_merge_method,
-            concept_v22_vq_codebook_size=hf_config.concept_v22_vq_codebook_size,
-            concept_v22_vq_num_codebooks=hf_config.concept_v22_vq_num_codebooks,
-            concept_fusion_norm_alpha_init=hf_config.concept_fusion_norm_alpha_init,
-            concept_dd_two_route_add_decoder_use_softmax=(hf_config.concept_dd_two_route_add_decoder_use_softmax),
+            concept_encoder_layers=get_field("conceptlm_encoder_layers", "concept_encoder_layers"),
+            concept_decoder_layers=get_field("conceptlm_decoder_layers", "concept_decoder_layers"),
+            concept_special_layers=get_field("conceptlm_special_layers", "concept_special_layers"),
+            concept_chunk_size=get_field("conceptlm_chunk_size", "concept_chunk_size"),
+            concept_shift_feature=get_field("conceptlm_shift_feature", "concept_shift_feature"),
+            concept_chunk_merge_method=get_field("conceptlm_chunk_merge_method", "concept_chunk_merge_method"),
+            concept_v22_vq_codebook_size=get_field("conceptlm_v22_vq_codebook_size", "concept_v22_vq_codebook_size"),
+            concept_v22_vq_num_codebooks=get_field("conceptlm_v22_vq_num_codebooks", "concept_v22_vq_num_codebooks"),
+            concept_hlm_loss_weight=get_field("conceptlm_hlm_loss_weight", "concept_hlm_loss_weight", 0.0),
+            concept_vq_loss_weight=get_field("conceptlm_vq_loss_weight", "concept_vq_loss_weight", 0.0),
+            concept_vq_commitment_cost=get_field(
+                "conceptlm_v22_vq_commitment_cost", "concept_v22_vq_commitment_cost", 0.25
+            ),
+            concept_vq_detach_hlm_target=get_field(
+                "conceptlm_v22_vq_detach_hlm_target", "concept_v22_vq_detach_hlm_target", True
+            ),
+            concept_hlm_loss_type=get_field("conceptlm_v22_vq_hlm_loss_type", "concept_hlm_loss_type", "mse"),
+            concept_fusion_norm_alpha_init=get_field("conceptlm_fusion_norm_alpha_init", "concept_fusion_norm_alpha_init"),
+            concept_dd_two_route_add_decoder_use_softmax=get_field(
+                "conceptlm_v21_dd_two_route_add_decoder_use_softmax",
+                "concept_dd_two_route_add_decoder_use_softmax",
+            ),
             window_size=tuple(hf_config.window_size),
             window_attn_skip_freq=hf_config.window_attn_skip_freq,
         )

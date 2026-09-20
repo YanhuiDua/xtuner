@@ -513,7 +513,85 @@ def test_lengths_padded_sequence_uses_cumulative_lengths():
     seq_ctx.num_padding = 2
     seq_ctx.max_length_q = torch.tensor(6)
 
-    assert ConceptLMV22VQ._lengths(seq_ctx) == [8]
+    assert ConceptLMV22VQ._lengths(seq_ctx) == [6]
+
+
+def test_merge_chunks_drops_incomplete_document_chunks():
+    config = _tiny_config()
+    model = config.build()
+    hidden_states = torch.arange(3 * config.hidden_size, dtype=torch.float32).reshape(
+        1, 3, config.hidden_size
+    )
+
+    merged, concept_lengths = model._merge_chunks(hidden_states, [3])
+
+    assert concept_lengths == [0]
+    assert merged.shape == (1, 0, config.hidden_size)
+
+
+def test_merge_chunks_ignores_trailing_padding_segment():
+    config = _tiny_config()
+    model = config.build()
+    hidden_states = torch.randn(1, 8, config.hidden_size, generator=torch.Generator().manual_seed(23))
+    seq_ctx = SequenceContext.from_input_ids((torch.arange(6).unsqueeze(0),), device="cpu")
+    seq_ctx.cu_seq_lens_q = torch.tensor([0, 6, 8], dtype=torch.int32)
+    seq_ctx.cu_seq_lens_k = seq_ctx.cu_seq_lens_q.clone()
+    seq_ctx.num_padding = 2
+
+    valid_lengths = model._lengths(seq_ctx)
+    merged, concept_lengths = model._merge_chunks(hidden_states, valid_lengths)
+
+    assert valid_lengths == [6]
+    assert concept_lengths == [1]
+    torch.testing.assert_close(merged, hidden_states[:, :4].mean(dim=1, keepdim=True))
+
+
+def test_concept_auxiliary_losses_use_next_concept_and_vq_mask():
+    config = _tiny_config().model_copy(
+        update={
+            "concept_hlm_loss_weight": 1.0,
+            "concept_vq_loss_weight": 1.0,
+            "concept_vq_commitment_cost": 0.25,
+        }
+    )
+    model = config.build()
+    generator = torch.Generator().manual_seed(31)
+    continuous = torch.randn(1, 5, config.hidden_size, generator=generator, requires_grad=True)
+    predicted = torch.randn(1, 5, config.hidden_size, generator=generator, requires_grad=True)
+
+    ncp_loss, vq_loss = model._concept_auxiliary_losses(continuous, predicted, [3, 0, 2])
+
+    expected_ncp = F.mse_loss(predicted[:, [0, 1, 3]], continuous[:, [1, 2, 4]])
+    torch.testing.assert_close(ncp_loss, expected_ncp)
+    assert ncp_loss.ndim == 0
+    assert vq_loss.ndim == 0
+    (ncp_loss + vq_loss).backward()
+    assert continuous.grad is not None
+    assert predicted.grad is not None
+    assert model.concept_quantizer.codebook.grad is not None
+
+
+def test_prepend_zero_chunks_preserves_empty_documents():
+    config = _tiny_config()
+    model = config.build()
+    source_states = torch.randn(
+        1,
+        2,
+        3,
+        config.hidden_size,
+        generator=torch.Generator().manual_seed(41),
+    )
+
+    actual, lengths = model._prepend_zero_chunks(source_states, [0, 2])
+
+    assert lengths == [1, 3]
+    assert actual.shape == (1, 4, 3, config.hidden_size)
+    torch.testing.assert_close(actual[:, :1], torch.zeros_like(actual[:, :1]))
+    torch.testing.assert_close(actual[:, 1], torch.zeros_like(actual[:, 1]))
+    torch.testing.assert_close(
+        actual[:, 2:],
+        torch.cat((torch.zeros_like(source_states[:, :1]), source_states), dim=1),
+    )
 
 
 @pytest.mark.parametrize("token_lengths", [[9], [7, 10]], ids=["single_document", "packed_documents"])
@@ -611,7 +689,7 @@ def test_concept_document_transforms_match_cat_reference(token_lengths, shift_fe
         config.concept_chunk_size,
     )
     expected_positions = torch.cat(
-        [torch.arange(length) * config.concept_chunk_size for length in expected_concept_lengths]
+        [torch.arange(length) for length in expected_concept_lengths]
     ).unsqueeze(0)
     torch.testing.assert_close(context.position_ids, expected_positions)
     torch.testing.assert_close(

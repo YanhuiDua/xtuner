@@ -84,6 +84,7 @@ class SequenceContext:
         raw_inputs_embeds: torch.FloatTensor | None = None,
         shard_start: int = 0,
         shard_size: int = 0,
+        valid_sequence_length: int | None = None,
     ):
         # Only to distinguish parameters accepted by the constructor from attributes. For example, for `max_length_q`,
         # the argument can be an int, but as an attribute it can only be a tensor
@@ -117,6 +118,12 @@ class SequenceContext:
         self._raw_inputs_embeds = raw_inputs_embeds
         self._shard_start = shard_start
         self._shard_size = shard_size
+        self._valid_sequence_length_explicit = valid_sequence_length is not None
+        self.valid_sequence_length = (
+            int(valid_sequence_length)
+            if valid_sequence_length is not None
+            else int(self.cu_seq_lens_q[-1].item()) - int(num_padding)
+        )
         self.seq_idx = None
 
         # `DeviceMesh.get_local_rank` is not compatible with `torch.compile`, we calculate `_sp_rank` in
@@ -256,6 +263,11 @@ class SequenceContext:
                 raw_input_ids=cast(torch.LongTensor, pad_input_ids),
                 shard_start=start,
                 shard_size=shard_size,
+                valid_sequence_length=(
+                    self.valid_sequence_length
+                    if self._valid_sequence_length_explicit
+                    else self.input_ids.shape[1] - self.num_padding
+                ),
             )
             return sp_seq_ctx
         else:
@@ -505,6 +517,10 @@ class SequenceContext:
             raw_inputs_embeds=overrides.get("raw_inputs_embeds", self._raw_inputs_embeds),
             shard_start=overrides.get("shard_start", self._shard_start),
             shard_size=overrides.get("shard_size", self._shard_size),
+            valid_sequence_length=overrides.get(
+                "valid_sequence_length",
+                self.valid_sequence_length if self._valid_sequence_length_explicit else None,
+            ),
         )
 
     def to(self, device: torch.device | str):
@@ -580,6 +596,7 @@ class SequenceContext:
             "max_length_q": self.max_length_q,
             "max_length_k": self.max_length_k,
             "num_padding": self.num_padding,
+            "valid_sequence_length": self.valid_sequence_length,
             "sequence_parallel_mesh": self.sequence_parallel_mesh,
             "block_table": self.block_table,
             "device": self.device,
