@@ -33,8 +33,7 @@ from xtuner.v1.utils.load_spec import ShardDescriptor
 MODEL_PATH = os.getenv("CONCEPT_OLMO_STAGE2_V1_PATH")
 ALIGNMENT_PROMPTS = (
     "Explain gravity in one concise sentence.",
-    "Write a Python function that adds two integers, and explain how it "
-    "handles negative inputs.",
+    "Write a Python function that adds two integers, and explain how it handles negative inputs.",
     "请用三句话介绍机器学习中的过拟合，并给出一种常见的缓解方法。",
 )
 
@@ -86,9 +85,7 @@ def _build_alignment_prompt_batch(
     )
     document_lengths = tuple(document.shape[1] for document in documents_cpu)
     assert all(document.shape[0] == 1 and document.shape[1] > 1 for document in documents_cpu)
-    assert len(set(document_lengths)) == len(documents_cpu), (
-        "The prompts must exercise genuinely varlen input"
-    )
+    assert len(set(document_lengths)) == len(documents_cpu), "The prompts must exercise genuinely varlen input"
     if tokenizer.pad_token_id is not None:
         assert all(not torch.eq(document, tokenizer.pad_token_id).any() for document in documents_cpu)
 
@@ -266,9 +263,9 @@ def test_config_alias_and_meta_layout():
     assert [len(group) for group in grouped_model.encoder_stage_groups] == [4, 4, 4, 4]
     assert [len(group) for group in grouped_model.concept_stage_groups] == [4, 4]
     assert [len(group) for group in grouped_model.decoder_stage_groups] == [4, 4, 4, 4]
-    assert grouped_model.to_hf_key_list(
-        "encoder_stage_groups.0.3.transformer.self_attention.linear_qkv.weight"
-    ) == ["encoder.layers.3.self_attention.linear_qkv.weight"]
+    assert grouped_model.to_hf_key_list("encoder_stage_groups.0.3.transformer.self_attention.linear_qkv.weight") == [
+        "encoder.layers.3.self_attention.linear_qkv.weight"
+    ]
     assert grouped_model.to_hf_key_list("decoder_stage_groups.0.2.read_concept_route.w2.weight") == [
         "decoder_read_concept_routes.2.w2.weight"
     ]
@@ -283,9 +280,7 @@ def test_lm_head_vocab_padding_checkpoint_conversion(
     monkeypatch: pytest.MonkeyPatch,
     load_spec_process_group: dist.ProcessGroup,
 ):
-    config = _tiny_config().model_copy(
-        update={"vocab_size": 126, "lm_head_vocab_padding_multiple": 8}
-    )
+    config = _tiny_config().model_copy(update={"vocab_size": 126, "lm_head_vocab_padding_multiple": 8})
     model = config.build()
     checkpoint_weight = torch.randn(config.vocab_size, config.hidden_size)
     local_weight = torch.empty(128, config.hidden_size)
@@ -458,9 +453,9 @@ def test_stage_group_eager_forward_backward_matches_individual_stages():
     assert [len(group) for group in grouped.encoder_stage_groups] == [4, 1]
     assert [len(group) for group in grouped.concept_stage_groups] == [4, 1]
     assert [len(group) for group in grouped.decoder_stage_groups] == [4, 1]
-    assert grouped.to_hf_key_list(
-        "encoder_stage_groups.1.4.transformer.self_attention.linear_qkv.weight"
-    ) == ["encoder.layers.4.self_attention.linear_qkv.weight"]
+    assert grouped.to_hf_key_list("encoder_stage_groups.1.4.transformer.self_attention.linear_qkv.weight") == [
+        "encoder.layers.4.self_attention.linear_qkv.weight"
+    ]
 
     baseline_parameters = list(baseline.named_parameters())
     grouped_parameters = list(grouped.named_parameters())
@@ -481,9 +476,7 @@ def test_stage_group_eager_forward_backward_matches_individual_stages():
     output_grad = torch.randn(grouped_logits.shape, generator=generator)
     baseline_logits.backward(output_grad)
     grouped_logits.backward(output_grad)
-    for (_, baseline_parameter), (_, grouped_parameter) in zip(
-        baseline_parameters, grouped_parameters, strict=True
-    ):
+    for (_, baseline_parameter), (_, grouped_parameter) in zip(baseline_parameters, grouped_parameters, strict=True):
         assert (grouped_parameter.grad is None) == (baseline_parameter.grad is None)
         if baseline_parameter.grad is not None:
             torch.testing.assert_close(grouped_parameter.grad, baseline_parameter.grad, rtol=1e-5, atol=1e-6)
@@ -519,9 +512,7 @@ def test_lengths_padded_sequence_uses_cumulative_lengths():
 def test_merge_chunks_drops_incomplete_document_chunks():
     config = _tiny_config()
     model = config.build()
-    hidden_states = torch.arange(3 * config.hidden_size, dtype=torch.float32).reshape(
-        1, 3, config.hidden_size
-    )
+    hidden_states = torch.arange(3 * config.hidden_size, dtype=torch.float32).reshape(1, 3, config.hidden_size)
 
     merged, concept_lengths = model._merge_chunks(hidden_states, [3])
 
@@ -588,10 +579,7 @@ def test_prepend_zero_chunks_preserves_empty_documents():
     assert actual.shape == (1, 4, 3, config.hidden_size)
     torch.testing.assert_close(actual[:, :1], torch.zeros_like(actual[:, :1]))
     torch.testing.assert_close(actual[:, 1], torch.zeros_like(actual[:, 1]))
-    torch.testing.assert_close(
-        actual[:, 2:],
-        torch.cat((torch.zeros_like(source_states[:, :1]), source_states), dim=1),
-    )
+    torch.testing.assert_close(actual[:, 2:], source_states)
 
 
 @pytest.mark.parametrize("token_lengths", [[9], [7, 10]], ids=["single_document", "packed_documents"])
@@ -611,12 +599,16 @@ def test_concept_document_transforms_match_cat_reference(token_lengths, shift_fe
             merged = state.mean(dim=1, keepdim=True)
         else:
             usable = (seq_len // config.concept_chunk_size) * config.concept_chunk_size
-            merged = state[:, :usable].reshape(
-                1,
-                usable // config.concept_chunk_size,
-                config.concept_chunk_size,
-                config.hidden_size,
-            ).mean(dim=2)
+            merged = (
+                state[:, :usable]
+                .reshape(
+                    1,
+                    usable // config.concept_chunk_size,
+                    config.concept_chunk_size,
+                    config.hidden_size,
+                )
+                .mean(dim=2)
+            )
         merged_chunks.append(merged)
     expected_merged = torch.cat(merged_chunks, dim=1)
     expected_concept_lengths = [chunk.shape[1] for chunk in merged_chunks]
@@ -688,9 +680,7 @@ def test_concept_document_transforms_match_cat_reference(token_lengths, shift_fe
         actual_concept_lengths,
         config.concept_chunk_size,
     )
-    expected_positions = torch.cat(
-        [torch.arange(length) for length in expected_concept_lengths]
-    ).unsqueeze(0)
+    expected_positions = torch.cat([torch.arange(length) for length in expected_concept_lengths]).unsqueeze(0)
     torch.testing.assert_close(context.position_ids, expected_positions)
     torch.testing.assert_close(
         context.cu_seq_lens_q,
@@ -886,7 +876,6 @@ class TestConceptOlmoOptimizations(DeterministicDDPTestCase):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA devices are required for SP")
 class TestConceptOlmoSequenceParallel(DeterministicDDPTestCase):
-
     @property
     def world_size(self) -> int:
         return 2
@@ -964,9 +953,7 @@ def test_full_checkpoint_padded_lm_head_forward_bitwise(monkeypatch):
     seq_ctx = SequenceContext.from_input_ids((input_ids,), device="cuda")
     with torch.no_grad():
         logits = model(seq_ctx).logits
-    expected = torch.tensor(
-        [4.90625, -6.21875, 2.796875, -1.8515625, -2.78125, 0.185546875, -3.796875, -6.03125]
-    )
+    expected = torch.tensor([4.90625, -6.21875, 2.796875, -1.8515625, -2.78125, 0.185546875, -3.796875, -6.03125])
     torch.testing.assert_close(logits[0, -1, :8].cpu(), expected, rtol=0, atol=0)
 
 
@@ -984,8 +971,8 @@ def test_full_checkpoint_hf_alignment(monkeypatch):
     monkeypatch.setenv("XTUNER_DETERMINISTIC", "true")
     monkeypatch.setenv("XTUNER_ACTIVATION_OFFLOAD", "0")
     device = torch.device("cuda")
-    documents_cpu, document_lengths, shifted_labels, loss_weight, expected_cu_seq_lens = (
-        _build_alignment_prompt_batch(MODEL_PATH, device)
+    documents_cpu, document_lengths, shifted_labels, loss_weight, expected_cu_seq_lens = _build_alignment_prompt_batch(
+        MODEL_PATH, device
     )
 
     shifted_label_documents = shifted_labels.split(document_lengths, dim=1)
@@ -1009,12 +996,15 @@ def test_full_checkpoint_hf_alignment(monkeypatch):
     hf_logits_tensor = torch.cat([output.logits for output in hf_document_outputs], dim=1)
     hf_logits = hf_logits_tensor.detach().float().cpu()
     total_valid_tokens = sum(document_length - 1 for document_length in document_lengths)
-    hf_native_loss_tensor = torch.stack(
-        [
-            output.loss * (document_length - 1)
-            for output, document_length in zip(hf_document_outputs, document_lengths, strict=True)
-        ]
-    ).sum() / total_valid_tokens
+    hf_native_loss_tensor = (
+        torch.stack(
+            [
+                output.loss * (document_length - 1)
+                for output, document_length in zip(hf_document_outputs, document_lengths, strict=True)
+            ]
+        ).sum()
+        / total_valid_tokens
+    )
     hf_native_loss = hf_native_loss_tensor.detach().float().item()
     hf_shared_loss_tensor = torch.stack(
         [
@@ -1070,8 +1060,7 @@ def test_full_checkpoint_hf_alignment(monkeypatch):
     # in test_full_checkpoint_hf_optimized_varlen_alignment, where differences
     # from fused/compiled kernels are measured with optimized-path tolerances.
     document_seq_contexts = tuple(
-        SequenceContext.from_input_ids((document,), device="cpu").to(device)
-        for document in documents_cpu
+        SequenceContext.from_input_ids((document,), device="cpu").to(device) for document in documents_cpu
     )
     for seq_ctx, document_length in zip(document_seq_contexts, document_lengths, strict=True):
         _assert_alignment_sequence_context(seq_ctx, (document_length,), [0, document_length])
@@ -1215,8 +1204,8 @@ def test_full_checkpoint_hf_optimized_varlen_alignment(monkeypatch):
         pytest.skip("flash-attn v2 is required for optimized HF parity")
     monkeypatch.setattr(attn_imp, "flash_attn_varlen_func", flash_attn_varlen_func_v2)
 
-    documents_cpu, document_lengths, shifted_labels, loss_weight, expected_cu_seq_lens = (
-        _build_alignment_prompt_batch(MODEL_PATH, device)
+    documents_cpu, document_lengths, shifted_labels, loss_weight, expected_cu_seq_lens = _build_alignment_prompt_batch(
+        MODEL_PATH, device
     )
 
     checkpoint_config = ConceptLMV22VQConfig.from_hf(MODEL_PATH)
@@ -1359,10 +1348,7 @@ def test_full_checkpoint_hf_optimized_varlen_alignment(monkeypatch):
             "xtuner": xtuner_peak_memory_gib,
         },
     }
-    print(
-        "CONCEPT_OLMO_HF_OPTIMIZED_VARLEN_ALIGNMENT="
-        f"{json.dumps(metrics, ensure_ascii=False, sort_keys=True)}"
-    )
+    print(f"CONCEPT_OLMO_HF_OPTIMIZED_VARLEN_ALIGNMENT={json.dumps(metrics, ensure_ascii=False, sort_keys=True)}")
 
     padded_lm_head_rows = model.lm_head.weight.shape[0] - config.vocab_size
     assert padded_lm_head_rows == 2

@@ -247,8 +247,7 @@ class ConceptLMV22VQ(BaseModel):
                 return []
             if key == "concept_quantizer.codebook":
                 return [
-                    f"concept_quantizer.codebook.{index}"
-                    for index in range(self.config.concept_v22_vq_num_codebooks)
+                    f"concept_quantizer.codebook.{index}" for index in range(self.config.concept_v22_vq_num_codebooks)
                 ]
             if key in {"prediction_heads.weight", "prediction_heads.bias"}:
                 suffix = key.rsplit(".", 1)[-1]
@@ -256,20 +255,26 @@ class ConceptLMV22VQ(BaseModel):
                     f"concept_predictor.prediction_heads.{index}.{suffix}"
                     for index in range(self.config.concept_v22_vq_num_codebooks)
                 ]
-            mappings = (
+            mappings: tuple[tuple[str, str], ...] = (
                 (r"^embed_tokens\.", "embed_tokens."),
                 (r"^encoder_stages\.(\d+)\.transformer\.", r"encoder.layers.\1."),
                 (r"^concept_stages\.(\d+)\.transformer\.", r"concept_predictor.hlm_block.layers.\1."),
                 (r"^decoder_stages\.(\d+)\.transformer\.", r"decoder.layers.\1."),
                 (r"^encoder_stages\.(\d+)\.depth_dd\.", r"dd_encoder_self_dd.depth_dds.\1."),
                 (r"^concept_stages\.(\d+)\.depth_dd\.", r"concept_predictor.concept_self_dd.depth_dds.\1."),
-                (r"^concept_stages\.(\d+)\.read_encoder_route\.", r"concept_predictor.concept_read_encoder_routes.\1."),
+                (
+                    r"^concept_stages\.(\d+)\.read_encoder_route\.",
+                    r"concept_predictor.concept_read_encoder_routes.\1.",
+                ),
                 (r"^decoder_stages\.(\d+)\.decoder_dd\.", r"dd_two_route_add.decoder_dds.\1."),
                 (r"^decoder_stages\.(\d+)\.concept_route\.", r"dd_two_route_add.concept_routes.\1."),
                 (r"^decoder_stages\.(\d+)\.read_encoder_route\.", r"decoder_read_encoder_routes.\1."),
                 (r"^decoder_stages\.(\d+)\.read_concept_route\.", r"decoder_read_concept_routes.\1."),
                 (r"^concept_final_norm\.", "concept_predictor.hlm_block.norm."),
-                (r"^concept_read_encoder_shared_source_norm\.", "concept_predictor.concept_read_encoder_shared_source_norm."),
+                (
+                    r"^concept_read_encoder_shared_source_norm\.",
+                    "concept_predictor.concept_read_encoder_shared_source_norm.",
+                ),
                 (r"^final_norm\.", "decoder.norm."),
                 (r"^lm_head\.", "lm_head."),
                 (r"^decoder_read_encoder_shared_source_norm\.", "decoder_read_encoder_shared_source_norm."),
@@ -413,8 +418,7 @@ class ConceptLMV22VQ(BaseModel):
             # common single-sequence case does not need a CUDA-to-CPU copy.
             return [int(seq_ctx.max_length_q.item())]
         lengths = [
-            int(length)
-            for length in (seq_ctx.cu_seq_lens_q[1:] - seq_ctx.cu_seq_lens_q[:-1]).detach().cpu().tolist()
+            int(length) for length in (seq_ctx.cu_seq_lens_q[1:] - seq_ctx.cu_seq_lens_q[:-1]).detach().cpu().tolist()
         ]
         if seq_ctx.num_padding <= 0:
             return lengths
@@ -1163,8 +1167,10 @@ class ConceptLMV22VQConfig(TransformerConfig):
         hf_config = AutoConfig.from_pretrained(hf_path, trust_remote_code=True)
         if hf_config.model_type not in {"conceptlm_v22_vq", "ncp_olmo3"}:
             raise ValueError(f"Expected conceptlm_v22_vq or ncp_olmo3, got {hf_config.model_type}")
+
         def get_field(name: str, legacy: str, default: Any = None) -> Any:
             return getattr(hf_config, name, getattr(hf_config, legacy, default))
+
         unsupported = {
             "num_query_groups": get_field("num_query_groups", "num_attention_heads") == hf_config.num_attention_heads,
             "rotary_percent": getattr(hf_config, "rotary_percent", 1.0) == 1.0,
@@ -1172,13 +1178,23 @@ class ConceptLMV22VQConfig(TransformerConfig):
             "position_embedding_type": getattr(hf_config, "position_embedding_type", "rope") in {"rope", "yarn"},
             "gated_linear_unit": getattr(hf_config, "gated_linear_unit", True),
             "activation_function": getattr(hf_config, "activation_function", "silu") == "silu",
-            "concept_v22_vq_merge_mode": get_field("conceptlm_v22_vq_merge_mode", "concept_v22_vq_merge_mode") == "raw_logits",
-            "concept_layer_norm_option": get_field("conceptlm_layer_norm_option", "concept_layer_norm_option") == "normed_add",
+            "concept_v22_vq_merge_mode": get_field("conceptlm_v22_vq_merge_mode", "concept_v22_vq_merge_mode")
+            == "raw_logits",
+            "concept_layer_norm_option": get_field("conceptlm_layer_norm_option", "concept_layer_norm_option")
+            == "normed_add",
             "concept_dd_two_route_add": get_field("conceptlm_v21_dd_two_route_add", "concept_dd_two_route_add", True),
-            "concept_enable_concept_read_encoder": get_field("conceptlm_v21_enable_concept_read_encoder", "concept_enable_concept_read_encoder", True),
-            "concept_enable_decoder_read_encoder": get_field("conceptlm_v21_enable_decoder_read_encoder", "concept_enable_decoder_read_encoder", True),
-            "concept_enable_decoder_read_concept": get_field("conceptlm_v21_enable_decoder_read_concept", "concept_enable_decoder_read_concept", True),
-            "concept_final_read_concept_gate": get_field("conceptlm_v21_final_read_concept_gate", "concept_final_read_concept_gate", True),
+            "concept_enable_concept_read_encoder": get_field(
+                "conceptlm_v21_enable_concept_read_encoder", "concept_enable_concept_read_encoder", True
+            ),
+            "concept_enable_decoder_read_encoder": get_field(
+                "conceptlm_v21_enable_decoder_read_encoder", "concept_enable_decoder_read_encoder", True
+            ),
+            "concept_enable_decoder_read_concept": get_field(
+                "conceptlm_v21_enable_decoder_read_concept", "concept_enable_decoder_read_concept", True
+            ),
+            "concept_final_read_concept_gate": get_field(
+                "conceptlm_v21_final_read_concept_gate", "concept_final_read_concept_gate", True
+            ),
         }
         disabled = [name for name, enabled in unsupported.items() if not enabled]
         if disabled:
@@ -1226,7 +1242,9 @@ class ConceptLMV22VQConfig(TransformerConfig):
                 "conceptlm_v22_vq_detach_hlm_target", "concept_v22_vq_detach_hlm_target", True
             ),
             concept_hlm_loss_type=get_field("conceptlm_v22_vq_hlm_loss_type", "concept_hlm_loss_type", "mse"),
-            concept_fusion_norm_alpha_init=get_field("conceptlm_fusion_norm_alpha_init", "concept_fusion_norm_alpha_init"),
+            concept_fusion_norm_alpha_init=get_field(
+                "conceptlm_fusion_norm_alpha_init", "concept_fusion_norm_alpha_init"
+            ),
             concept_dd_two_route_add_decoder_use_softmax=get_field(
                 "conceptlm_v21_dd_two_route_add_decoder_use_softmax",
                 "concept_dd_two_route_add_decoder_use_softmax",
