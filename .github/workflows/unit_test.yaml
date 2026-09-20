@@ -1,4 +1,5 @@
 name: unit_test
+run-name: unit_test-${{ github.event.inputs.ref || github.ref_name || github.ref }}
 on:
   pull_request:
     branches:
@@ -10,6 +11,24 @@ on:
       - ".github/workflows/ete_test_gpu.yaml"
       - ".github/workflows/ete_test_npu.yaml"
       - ".github/workflows/lint.yml"
+  # 23:00 Beijing (UTC+8) = 15:00 UTC
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        required: false
+        description: "Branch, tag, or commit SHA to checkout and test. Default is master."
+        type: string
+        default: "master"
+      changed_files:
+        required: false
+        description: >-
+          Simulated changed files for path-based pytest selection.
+          One path per line, or comma-separated.
+          Leave empty to run the full non-RL suite.
+        type: string
+        default: ""
 env:
   WORKSPACE_PREFIX: $(echo $GITHUB_WORKSPACE |cut -d '/' -f 1-5)
   WORKSPACE_PREFIX_SHORT: $(echo $GITHUB_WORKSPACE |cut -d '/' -f 1-3)
@@ -18,7 +37,9 @@ env:
   KUBEBRAIN_NAMESPACE: ailab-llmarchitecture
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # PRs cancel by number; nightly cancels overlap on the default branch;
+  # manual runs stay isolated via run_id.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'schedule' && github.ref) || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -26,42 +47,61 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       only_rl: ${{ steps.filter.outputs.only_rl }}
+      pytest_command: ${{ steps.filter.outputs.pytest_command }}
     steps:
       - uses: actions/checkout@v3
         with:
           fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.ref }}
       - id: filter
         name: Detect changed paths
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_CHANGED_FILES: ${{ github.event.inputs.changed_files }}
+          INPUT_REF: ${{ github.event.inputs.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
-          if ! changed_files="$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" 2>/dev/null)"; then
-            changed_files="$(git diff --name-only HEAD^1 HEAD)"
+          if [ "${EVENT_NAME}" = "schedule" ]; then
+            echo "Nightly full unit tests"
+            echo "only_rl=false" >> "$GITHUB_OUTPUT"
+            echo "pytest_command=pytest tests --ignore=tests/rl" >> "$GITHUB_OUTPUT"
+            echo "pytest_command=pytest tests --ignore=tests/rl"
+            exit 0
           fi
-          only_rl=true
 
-          if [ -z "$changed_files" ]; then
-            only_rl=false
-          else
-            while IFS= read -r file; do
-              case "$file" in
-                tests/rl/*|xtuner/v1/rl/*)
-                  ;;
-                *)
-                  only_rl=false
-                  break
-                  ;;
-              esac
-            done <<< "$changed_files"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            changed_files="$(printf '%s\n' "${INPUT_CHANGED_FILES}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d')"
+            echo "Manual UT ref=${INPUT_REF}"
+            if [ -z "$changed_files" ]; then
+              echo "No simulated changed_files; running full non-RL suite"
+              echo "only_rl=false" >> "$GITHUB_OUTPUT"
+              echo "pytest_command=pytest tests --ignore=tests/rl" >> "$GITHUB_OUTPUT"
+              echo "pytest_command=pytest tests --ignore=tests/rl"
+              exit 0
+            fi
+          elif ! changed_files="$(git diff --name-only "${PR_BASE}" "${PR_HEAD}" 2>/dev/null)"; then
+            changed_files="$(git diff --name-only HEAD^1 HEAD)"
           fi
 
           echo "$changed_files"
-          echo "only_rl=$only_rl"
-          echo "only_rl=$only_rl" >> "$GITHUB_OUTPUT"
+          pytest_command="$(printf '%s\n' "$changed_files" | python3 ci/scripts/select_unittest_targets.py --github-output "$GITHUB_OUTPUT")" \
+            || pytest_command=""
+          if [ -z "$pytest_command" ]; then
+            echo "Selector failed or empty; falling back to full non-RL suite"
+            echo "only_rl=false" >> "$GITHUB_OUTPUT"
+            echo "pytest_command=pytest tests --ignore=tests/rl" >> "$GITHUB_OUTPUT"
+            pytest_command="pytest tests --ignore=tests/rl"
+          fi
+          echo "pytest_command=$pytest_command"
 
   lint:
     runs-on: ubuntu-latest
     needs: detect_changes
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
       - name: Set up Python 3.12
         uses: actions/setup-python@v2
         with:
@@ -91,6 +131,8 @@ jobs:
         echo "::add-mask::${{env.WORKSPACE_PREFIX_SHORT}}"
         sudo git clean -ffdx
     - uses: actions/checkout@v3
+      with:
+        ref: ${{ github.event.inputs.ref || github.ref }}
 
     - id: unit-test
       name: unit-test
@@ -98,7 +140,10 @@ jobs:
         export KUBEBRAIN_CLUSTER_ENTRY=http://wangyixiuan-cpu.linzhouhan.ailab-llmarchitecture.svc.pjlab.local:11451
         export KUBEBRAIN_NAMESPACE=ailab-llmarchitecture 
         export PYTHONPYCACHEPREFIX=/tmp
-        pytest_command="pytest tests --ignore=tests/rl"
+        pytest_command="${{ needs.detect_changes.outputs.pytest_command }}"
+        if [ -z "$pytest_command" ]; then
+          pytest_command="pytest tests --ignore=tests/rl"
+        fi
         echo "pytest_command=$pytest_command"
         source /mnt/shared-storage-user/llmrazor-share/qa-llm-cicd/miniconda3/bin/activate
         conda activate clusterx-ncp
