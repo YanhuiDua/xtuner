@@ -36,9 +36,7 @@ def _tiny_flops_config() -> SimpleNamespace:
 
 
 def test_concept_olmo_flops_exact_tiny_model():
-    breakdown = ConceptOlmoFlopsEstimator(_tiny_flops_config()).estimate(
-        sequence_length=8
-    )
+    breakdown = ConceptOlmoFlopsEstimator(_tiny_flops_config()).estimate(sequence_length=8)
 
     assert breakdown.concept_sequence_length == 2
     assert breakdown.encoder_transformer_flops == 6176
@@ -76,9 +74,7 @@ def test_stage2_v1_mfu_uses_global_step_flops():
     assert calculator.model_flops_per_step == 6_441_807_498_706_944
 
     metrics = calculator.compute(step_time=4.0)
-    assert metrics.tflops_per_gpu == pytest.approx(
-        calculator.model_flops_per_step / 4.0 / 8 / 1e12
-    )
+    assert metrics.tflops_per_gpu == pytest.approx(calculator.model_flops_per_step / 4.0 / 8 / 1e12)
     assert calculator.peak_tflops_per_gpu == 989.0
     assert calculator.peak_tflops_source == "auto"
     assert metrics.mfu == pytest.approx(metrics.tflops_per_gpu / 989.0)
@@ -182,10 +178,12 @@ def test_trainer_step_log_and_tracker_include_mfu(monkeypatch):
         },
         training_metrics={
             "local_step_consumed_tokens": 8192,
+            "local_step_seqlen_tokens": 8192,
             "local_step_consumed_img_tokens": 0,
             "local_total_consumed_tokens": 24576,
             "approximate_total_consumed_tokens": 196608,
             "tgs": 2048.0,
+            "seqlen_tgs": 2048.0,
             "exp_tgs": 2048.0,
             "eta_seconds": 28.0,
             "eta_hms": "0:00:28",

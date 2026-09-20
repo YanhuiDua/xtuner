@@ -16,6 +16,30 @@ sys.path.insert(0, str(REPO_ROOT))
 from clusterx import CLUSTER, CLUSTER_MAPPING
 from clusterx.launcher.base import JobStatus
 
+JOB_INFO_RETRY_TIMES = 6
+JOB_INFO_RETRY_INTERVAL_S = 10
+
+
+def _is_too_many_requests(exc: BaseException) -> bool:
+    if getattr(exc, "status", None) == 429:
+        return True
+    text = f"{getattr(exc, 'body', '')} {exc}"
+    return "TooManyRequests" in text or "scheduler list capacity is full" in text
+
+
+def _retry_wait_s(exc: BaseException | None) -> int:
+    wait = JOB_INFO_RETRY_INTERVAL_S
+    headers = getattr(exc, "headers", None) if exc is not None else None
+    retry_after = None
+    if headers is not None:
+        retry_after = headers.get("Retry-After")
+    if retry_after:
+        try:
+            wait = max(wait, int(retry_after))
+        except (TypeError, ValueError):
+            pass
+    return wait
+
 
 def parse_args():
     """解析命令行参数，与run.py保持一致"""
@@ -44,6 +68,51 @@ def export_rjob_id(rjob_id: str) -> None:
         return
     with open(gh_out, "a", encoding="utf-8") as f:
         f.write(f"rjob_id={rjob_id}\n")
+
+
+def _is_valid_job_info(job_info) -> bool:
+    return job_info is not None and getattr(job_info, "status", None) is not None
+
+
+def get_job_info_with_retry(cluster, job_id: str):
+    """Retry get_job_info until a job with status is returned.
+
+    Transient 429 / scheduler-capacity errors keep the outer poll alive instead of
+    failing a still-queuing or running job.
+    """
+    last_error = None
+    rate_limited = False
+    for attempt in range(1, JOB_INFO_RETRY_TIMES + 1):
+        job_info = None
+        try:
+            job_info = cluster.get_job_info(job_id)
+        except Exception as e:
+            last_error = e
+            rate_limited = _is_too_many_requests(e)
+            print(
+                f"get_job_info({job_id}) failed on attempt "
+                f"{attempt}/{JOB_INFO_RETRY_TIMES}: {e}"
+            )
+        if _is_valid_job_info(job_info):
+            return job_info
+        if job_info is not None:
+            print(
+                f"get_job_info({job_id}) returned invalid job on attempt "
+                f"{attempt}/{JOB_INFO_RETRY_TIMES}: {job_info!r}"
+            )
+        if attempt < JOB_INFO_RETRY_TIMES:
+            wait_s = _retry_wait_s(last_error)
+            print(f"Retry get_job_info in {wait_s}s")
+            time.sleep(wait_s)
+
+    detail = f": {last_error}" if last_error else ""
+    message = (
+        f"Job {job_id} info unavailable after {JOB_INFO_RETRY_TIMES} retries{detail}"
+    )
+    if rate_limited:
+        print(message)
+        return None
+    raise RuntimeError(message)
 
 
 def main():
@@ -96,7 +165,10 @@ def main():
     while True:
         time.sleep(10)
 
-        job_info = cluster.get_job_info(job_schema.job_id)
+        job_info = get_job_info_with_retry(cluster, job_schema.job_id)
+        if job_info is None:
+            print(f"Job {job_schema.job_id} status temporarily unavailable, waiting...")
+            continue
         status = job_info.status
 
         if status == JobStatus.QUEUING:

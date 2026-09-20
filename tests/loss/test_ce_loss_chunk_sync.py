@@ -12,14 +12,15 @@ def test_chunk_loss_handles_an_all_ignored_chunk_without_host_branch() -> None:
     assert loss_context is not None
     loss_context = CELossContext.build_batches([loss_context], cu_seq_lens_list=[cu_seq_lens])[0]
 
-    hidden_states = torch.randn(1, 4, 3, requires_grad=True)
-    head_weight = torch.randn(5, 3, requires_grad=True)
+    device = loss_context.loss_kwargs.shifted_labels.device
+    hidden_states = torch.randn(1, 4, 3, device=device, requires_grad=True)
+    head_weight = torch.randn(5, 3, device=hidden_states.device, requires_grad=True)
     reference_hidden_states = hidden_states.detach().clone().requires_grad_()
     reference_head_weight = head_weight.detach().clone().requires_grad_()
     loss, _ = loss_context(hidden_states, head_weight)
 
     logits = F.linear(reference_hidden_states, reference_head_weight).float().flatten(0, 1)
-    reference = F.cross_entropy(logits, labels.flatten(), reduction="none", ignore_index=-100).sum() / 2
+    reference = F.cross_entropy(logits, labels.to(device).flatten(), reduction="none", ignore_index=-100).sum() / 2
     torch.testing.assert_close(loss, reference)
 
     loss.backward()
