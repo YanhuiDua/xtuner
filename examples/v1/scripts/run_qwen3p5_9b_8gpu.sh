@@ -24,7 +24,12 @@ export OPTIMIZER="${OPTIMIZER:-muon}"
 export MODEL_COMPILE="${MODEL_COMPILE:-1}"
 export LOSS_MODE="${LOSS_MODE:-chunk}"
 export LOSS_REDUCTION="${LOSS_REDUCTION:-square}"
-export LOSS_CHUNK_SIZE="${LOSS_CHUNK_SIZE:-4096}"
+# 4096 pushes the MUDD+MTP leg to ~127 GB, where the caching allocator starts
+# returning blocks to the driver inside the chunked-loss backward: 43 synchronous
+# cudaFree calls (~245 ms) per step. 2048 removes that storm entirely -- the leg
+# drops from 3.094 s to 2.776 s (-10.3%) and every configuration saves ~5.7 GB --
+# while the non-MUDD legs stay within 1.2%.
+export LOSS_CHUNK_SIZE="${LOSS_CHUNK_SIZE:-2048}"
 export MUON_ENABLE_ALL2ALL="${MUON_ENABLE_ALL2ALL:-1}"
 export MUON_ADAMW_FOREACH="${MUON_ADAMW_FOREACH:-1}"
 export XTUNER_MUON_USE_TRITON="${XTUNER_MUON_USE_TRITON:-1}"
