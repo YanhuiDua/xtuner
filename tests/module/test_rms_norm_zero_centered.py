@@ -42,6 +42,7 @@ class TestZeroCenteredRMSNormParity:
             (torch.float32, (1, 64, 128), 2.0e-5),
             (torch.bfloat16, (1, 64, 128), 2.0e-2),
             (torch.bfloat16, (1, 8192, 2048), 2.0e-2),
+            (torch.bfloat16, (1, 8192, 4096), 2.0e-2),
             (torch.float32, (4, 333, 257), 2.0e-5),
         ],
     )
@@ -66,6 +67,7 @@ class TestZeroCenteredRMSNormParity:
             (torch.float32, (1, 64, 128)),
             (torch.bfloat16, (1, 64, 128)),
             (torch.bfloat16, (1, 8192, 2048)),
+            (torch.bfloat16, (1, 8192, 4096)),
         ],
     )
     def test_backward_not_worse_than_native(self, dtype, shape):
