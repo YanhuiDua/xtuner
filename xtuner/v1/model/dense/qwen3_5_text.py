@@ -75,8 +75,10 @@ class Qwen3_5_VLTextDenseConfig(TransformerConfig):
     mudd_router_norm_affine: bool = False
     # Read the route endpoints through a device pointer table instead of copying them
     # into a contiguous stack first. Removes the forward scratch fill and the backward
-    # stack rebuild (~195 ms/step on the 9B doc configuration) without touching the math.
-    mudd_route_scatter: bool = False
+    # stack rebuild (0.14-0.18 s/step and ~2 GB/GPU on the 9B doc configuration) without
+    # touching the math: the kernel body is unchanged, only the addressing is. Non-contiguous
+    # endpoints transparently fall back to the stacked path, so this is safe as a default.
+    mudd_route_scatter: bool = True
 
     @computed_field
     def layers_type(self) -> list[Literal["full_attention", "linear_attention"]]:

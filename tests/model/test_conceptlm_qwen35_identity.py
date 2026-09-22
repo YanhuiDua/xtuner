@@ -10,6 +10,8 @@ TestConceptLMQwen35Identity
         会经深 decoder 放大，因此只做量级断言）。
     test_packed_unaligned_documents_run: packed 文档不按 chunk 对齐（``[7, 1]``）时前向仍可跑通
         且输出有限。
+    test_route_scatter_reaches_every_stack: ``mudd_route_scatter`` 从 config 一路传到三段 MUDD 的
+        每条路由（2B recipe 曾经设了开关但没人读）。
 """
 
 import pytest
@@ -149,3 +151,24 @@ class TestConceptLMQwen35Identity:
             logits = model(seq_ctx)["logits"]
         assert logits.shape == (1, 8, 64)
         assert torch.isfinite(logits.float()).all()
+
+    @pytest.mark.parametrize("route_scatter", [False, True])
+    def test_route_scatter_reaches_every_stack(self, route_scatter: bool):
+        """The config switch has to reach the per-stack routes, not just the dense builder."""
+        config = _TinyConceptLMConfig(
+            concept_encoder_mudd=True,
+            concept_predictor_mudd=True,
+            concept_decoder_mudd=True,
+            compile_cfg=False,
+            mudd_route_scatter=route_scatter,
+        )
+        torch.manual_seed(0)
+        model = config.build()
+        stacks = [model.encoder_mudd, model.predictor_mudd, model.decoder_mudd]
+        assert all(stack is not None for stack in stacks)
+        routes = [route for stack in stacks for route in stack.routes]
+        assert (
+            len(routes)
+            == config.concept_encoder_layers + config.concept_predictor_layers + config.concept_decoder_layers
+        )
+        assert all(route.route_scatter is route_scatter for route in routes)

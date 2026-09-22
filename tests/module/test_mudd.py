@@ -18,6 +18,10 @@ TestQwen35MUDDRouteFusedParity
 TestQwen35MUDDStackScratch
     test_stack_endpoints_reuse_one_buffer: 融合路径的端点栈复用同一个 scratch，宽度变化只换窗口不换缓冲。
     test_scratch_never_enters_the_state_dict: scratch 不落在模块属性/state_dict 上。
+TestQwen35MUDDScatterSources
+    test_pointer_table_matches_data_ptrs: 散列指针表的 dtype/device/取值与各 source 的 data_ptr 一致，且按宽度复用缓存缓冲。
+    test_scatter_route_never_materialises_a_stack: scatter 路由与栈路由输出逐位相等，且全程不物化端点栈。
+    test_scatter_route_falls_back_to_the_stack_for_views: 端点是非连续视图时自动回退到栈路径，数值仍与栈路由逐位一致。
 TestQwen35MUDDRouteCompile
     test_compile_matches_eager_fused: compile 路径与融合 eager 路径输出一致。
     test_compile_zero_init_is_identity: compile 路径零初始化时四路输出严格等于 raw 当前层输出。
@@ -282,7 +286,6 @@ class TestQwen35MUDDScatterSources:
     def test_scatter_route_never_materialises_a_stack(self):
         if not torch.cuda.is_available():
             pytest.skip("scatter route requires CUDA")
-        import xtuner.v1.module.mudd as mudd_mod
 
         reference = _build_route(num_sources=4).cuda()
         scatter = Qwen35MUDDRoute(
@@ -312,6 +315,63 @@ class TestQwen35MUDDScatterSources:
             torch.cat = real_cat
             torch.stack = real_stack
 
+        expected = reference(current.detach(), [source.detach() for source in sources])
+        for got, want in zip(outputs, expected, strict=True):
+            assert torch.equal(got.detach(), want)
+        assert current.grad is not None and torch.isfinite(current.grad).all()
+        for source in sources:
+            assert source.grad is not None and torch.isfinite(source.grad).all()
+
+    def test_scatter_route_falls_back_to_the_stack_for_views(self):
+        """A non-contiguous endpoint cannot be dereferenced in place; the route stacks instead."""
+        if not torch.cuda.is_available():
+            pytest.skip("the fused routes require CUDA")
+        import xtuner.v1.module.mudd as mudd_mod
+
+        reference = _build_route(num_sources=4).cuda()
+        scatter = Qwen35MUDDRoute(
+            HIDDEN_SIZE,
+            4,
+            EPS,
+            route_kernel=True,
+            route_scatter=True,
+        ).to(device="cuda")
+        scatter.load_state_dict(reference.state_dict())
+        current, _ = _build_inputs(num_sources=4)
+        current = current.to("cuda").requires_grad_(True)
+        # Every source is a slice of a wider block, so none of them is contiguous.
+        padded = [
+            torch.randn(2, 3, HIDDEN_SIZE + 8, generator=torch.Generator().manual_seed(step)).to("cuda")
+            for step in range(4)
+        ]
+        sources = [pad[..., :HIDDEN_SIZE].detach().requires_grad_(True) for pad in padded]
+        assert not any(source.is_contiguous() for source in sources)
+
+        real_pointers = mudd_mod._source_pointers
+        stacks = 0
+        real_stack = torch.stack
+
+        def _forbid_pointers(*args, **kwargs):
+            raise AssertionError("a view endpoint must take the stacked path")
+
+        def _count_stack(*args, **kwargs):
+            nonlocal stacks
+            stacks += 1
+            return real_stack(*args, **kwargs)
+
+        mudd_mod._source_pointers = _forbid_pointers
+        torch.stack = _count_stack
+        try:
+            outputs = scatter(current, sources)
+            loss = sum(output.float().square().mean() for output in outputs)
+            loss.backward()
+        finally:
+            mudd_mod._source_pointers = real_pointers
+            torch.stack = real_stack
+
+        # Forward falls back (and the backward stack rebuild counts once more), yet the
+        # numbers stay identical to the plain stacked route.
+        assert stacks >= 1
         expected = reference(current.detach(), [source.detach() for source in sources])
         for got, want in zip(outputs, expected, strict=True):
             assert torch.equal(got.detach(), want)

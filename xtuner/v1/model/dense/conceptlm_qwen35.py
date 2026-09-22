@@ -186,6 +186,7 @@ class ConceptLMQwen35(BaseModel):
             compile_route=config.mudd_compile,
             route_kernel=config.mudd_route_kernel,
             router_norm_affine=config.mudd_router_norm_affine,
+            route_scatter=config.mudd_route_scatter,
         )
 
     # --------------------------------------------------------------- forward

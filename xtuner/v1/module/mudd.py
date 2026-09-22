@@ -399,8 +399,11 @@ class _MUDDCombineTriton(torch.autograd.Function):
         hidden_size = sources[0].shape[-1]
         rows = sources[0].numel() // hidden_size
         num_sources = len(sources)
+        # The scatter path dereferences each endpoint in place, so every source has to be a
+        # contiguous ``[rows, hidden]`` block. Fall back to the stack whenever a caller hands
+        # us a non-contiguous view: the stacked path is always correct, just slower.
+        scatter = scatter and all(source.is_contiguous() for source in sources)
         if scatter:
-            assert all(source.is_contiguous() for source in sources), "scatter sources must be contiguous"
             src_ptrs = _source_pointers(list(sources))
             # Never read when SCATTER is set; only the pointer table is dereferenced.
             stacked = sources[0].reshape(rows, hidden_size)
