@@ -21,7 +21,7 @@ export CONCEPTLM_DECODER_MUDD="${CONCEPTLM_DECODER_MUDD:-0}"
 export MUDD_ROUTE_KERNEL="${MUDD_ROUTE_KERNEL:-1}"
 export MUDD_COMPILE="${MUDD_COMPILE:-0}"
 export MUDD_ROUTER_NORM_AFFINE="${MUDD_ROUTER_NORM_AFFINE:-0}"
-export MUDD_ROUTE_SCATTER="${MUDD_ROUTE_SCATTER:-1}"
+export MUDD_ROUTE_SCATTER="${MUDD_ROUTE_SCATTER:-0}"
 # The reference recipe keeps MTP disabled (its composed forward rejects it).
 export MTP_ENABLED=0
 export OPTIMIZER="${OPTIMIZER:-muon}"

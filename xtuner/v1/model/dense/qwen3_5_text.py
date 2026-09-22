@@ -73,12 +73,18 @@ class Qwen3_5_VLTextDenseConfig(TransformerConfig):
     # the router's own input norm carries a learnable scale. The reference
     # implementation's best-validated configuration runs it affine-free.
     mudd_router_norm_affine: bool = False
-    # Read the route endpoints through a device pointer table instead of copying them
-    # into a contiguous stack first. Removes the forward scratch fill and the backward
-    # stack rebuild (0.14-0.18 s/step and ~2 GB/GPU on the 9B doc configuration) without
-    # touching the math: the kernel body is unchanged, only the addressing is. Non-contiguous
-    # endpoints transparently fall back to the stacked path, so this is safe as a default.
-    mudd_route_scatter: bool = True
+    # Read the route endpoints through a device pointer table instead of copying them into a
+    # contiguous stack first: the kernel body is unchanged, only the addressing is, and
+    # non-contiguous endpoints fall back to the stacked path on their own. Measured on the 9B
+    # doc configuration at -2.4%/-3.7% step time and -2.08 GB/GPU (MUDD with and without MTP),
+    # with the 50-step loss curve inside 0.012%.
+    #
+    # Off by default: on the 2B ConceptLM the same change measured +19%/+22% step time, and
+    # that configuration also reproduces an intermittent ``misaligned address`` device fault
+    # (it disappears under ``CUDA_LAUNCH_BLOCKING=1``) which is not yet understood. Enable it
+    # only for 9B-shaped workloads until the 2B path is fixed -- see
+    # ``dev_notes/features/MUDD/mudd_scatter_acceptance_2026-09-23.md``.
+    mudd_route_scatter: bool = False
 
     @computed_field
     def layers_type(self) -> list[Literal["full_attention", "linear_attention"]]:

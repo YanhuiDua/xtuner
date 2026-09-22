@@ -62,7 +62,7 @@ model_cfg.mudd_enabled = _bool_env("MUDD_ENABLED", False)
 model_cfg.mudd_route_kernel = _bool_env("MUDD_ROUTE_KERNEL", True)
 model_cfg.mudd_compile = _bool_env("MUDD_COMPILE", False)
 model_cfg.mudd_router_norm_affine = _bool_env("MUDD_ROUTER_NORM_AFFINE", False)
-model_cfg.mudd_route_scatter = _bool_env("MUDD_ROUTE_SCATTER", True)
+model_cfg.mudd_route_scatter = _bool_env("MUDD_ROUTE_SCATTER", False)
 if _bool_env("MTP_ENABLED", True):
     model_cfg.mtp_config = MTPConfig(num_layers=1, loss_scaling_factor=0.1)
 
