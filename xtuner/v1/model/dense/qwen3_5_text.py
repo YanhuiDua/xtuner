@@ -75,15 +75,16 @@ class Qwen3_5_VLTextDenseConfig(TransformerConfig):
     mudd_router_norm_affine: bool = False
     # Read the route endpoints through a device pointer table instead of copying them into a
     # contiguous stack first: the kernel body is unchanged, only the addressing is, and
-    # non-contiguous endpoints fall back to the stacked path on their own. Measured on the 9B
-    # doc configuration at -2.4%/-3.7% step time and -2.08 GB/GPU (MUDD with and without MTP),
-    # with the 50-step loss curve inside 0.012%.
+    # non-contiguous endpoints fall back to the stacked path on their own. The table is staged
+    # per call and copied synchronously, so no buffer is ever rewritten while a copy is in
+    # flight.
     #
-    # Off by default: on the 2B ConceptLM the same change measured +19%/+22% step time, and
-    # that configuration also reproduces an intermittent ``misaligned address`` device fault
-    # (it disappears under ``CUDA_LAUNCH_BLOCKING=1``) which is not yet understood. Enable it
-    # only for 9B-shaped workloads until the 2B path is fixed -- see
-    # ``dev_notes/features/MUDD/mudd_scatter_acceptance_2026-09-23.md``.
+    # On the 9B doc configuration it is worth -2.4%/-3.7% step time and -2.08 GB/GPU (MUDD with
+    # and without MTP), with the 50-step loss curve inside 0.012% -- which is why the 9B recipe
+    # turns it on. On the 2B ConceptLM the same route measures +19%..+22% instead (a step there
+    # is only 0.82 s, so per-call staging costs more than the stack fill it removes), so the
+    # ConceptLM recipe leaves it off; the library default stays off for the same reason.
+    # See ``dev_notes/features/MUDD/mudd_scatter_acceptance_2026-09-23.md``.
     mudd_route_scatter: bool = False
 
     @computed_field
