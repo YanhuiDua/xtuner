@@ -68,32 +68,20 @@ def _stack_endpoints(sources: list[Tensor]) -> tuple[Tensor, int]:
     return torch.cat(flat, dim=-2, out=buffer[:rows, : len(sources), :]), buffer.shape[1]
 
 
-_PTR_TABLE_CPU: dict[int, Tensor] = {}
-_PTR_TABLE_DEV: dict[int, Tensor] = {}
-
-
 def _source_pointers(sources: list[Tensor]) -> Tensor:
     """Return a device ``int64`` tensor holding each source's data pointer.
 
-    The pinned staging buffer is cached per device so building the table costs one
-    tiny async H2D copy rather than an allocation, and the kernel can then read the
-    endpoints in place instead of copying them into a contiguous stack first.
+    The table is staged per call instead of through a shared pinned buffer: an async H2D
+    copy out of a *shared* pinned staging area can still be pending when the next route
+    call writes its own pointers into that area, which hands one layer another layer's
+    addresses -- an illegal memory access on the 2B ConceptLM, whose three stacks have
+    different row counts, so a borrowed pointer is also read past its end. A pageable
+    staging tensor copies synchronously (``non_blocking=False``), so no transfer is ever
+    in flight while the staging memory is reused. The table is a few hundred bytes, so the
+    extra allocation is negligible next to the route it feeds.
     """
     device = sources[0].device
-    key = device.index if device.index is not None else -1
-    count = len(sources)
-    cpu = _PTR_TABLE_CPU.get(key)
-    dev = _PTR_TABLE_DEV.get(key)
-    if cpu is None or cpu.numel() < count:
-        cpu = torch.empty(max(count, 64), dtype=torch.int64, pin_memory=True)
-        _PTR_TABLE_CPU[key] = cpu
-    if dev is None or dev.numel() < count or dev.device != device:
-        dev = torch.empty(max(count, 64), dtype=torch.int64, device=device)
-        _PTR_TABLE_DEV[key] = dev
-    for index, source in enumerate(sources):
-        cpu[index] = source.data_ptr()
-    dev[:count].copy_(cpu[:count], non_blocking=True)
-    return dev[:count]
+    return torch.tensor([source.data_ptr() for source in sources], dtype=torch.int64).to(device=device)
 
 
 def _raise_dynamo_limits() -> None:

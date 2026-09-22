@@ -267,8 +267,6 @@ class TestQwen35MUDDScatterSources:
     def test_pointer_table_matches_data_ptrs(self):
         import xtuner.v1.module.mudd as mudd_mod
 
-        mudd_mod._PTR_TABLE_CPU.clear()
-        mudd_mod._PTR_TABLE_DEV.clear()
         generator = torch.Generator().manual_seed(0)
         sources = [torch.randn(2, 3, HIDDEN_SIZE, generator=generator) for _ in range(5)]
         table = mudd_mod._source_pointers(sources)
@@ -276,11 +274,13 @@ class TestQwen35MUDDScatterSources:
         assert table.device == sources[0].device
         assert [int(entry) for entry in table.tolist()] == [source.data_ptr() for source in sources]
 
-        # A wider route reuses the same cached staging buffers.
+        # Every call owns its table: a shared staging buffer let the next call's host-side
+        # write race the previous call's async H2D copy, i.e. one route could read another
+        # route's pointers.
         more = [*sources, torch.randn(2, 3, HIDDEN_SIZE, generator=generator)]
         wide = mudd_mod._source_pointers(more)
-        assert len(mudd_mod._PTR_TABLE_CPU) == 1
-        assert len(mudd_mod._PTR_TABLE_DEV) == 1
+        assert wide.data_ptr() != table.data_ptr()
+        assert [int(entry) for entry in table.tolist()] == [source.data_ptr() for source in sources]
         assert [int(entry) for entry in wide.tolist()] == [source.data_ptr() for source in more]
 
     def test_scatter_route_never_materialises_a_stack(self):
