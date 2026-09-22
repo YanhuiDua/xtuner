@@ -78,6 +78,7 @@ model_cfg.concept_detach_hlm_target = _bool_env("CONCEPTLM_DETACH_HLM_TARGET", T
 model_cfg.mudd_route_kernel = _bool_env("MUDD_ROUTE_KERNEL", True)
 model_cfg.mudd_compile = _bool_env("MUDD_COMPILE", False)
 model_cfg.mudd_router_norm_affine = _bool_env("MUDD_ROUTER_NORM_AFFINE", False)
+model_cfg.mudd_route_scatter = _bool_env("MUDD_ROUTE_SCATTER", False)
 model_cfg.concept_encoder_mudd = _bool_env("CONCEPTLM_ENCODER_MUDD", False)
 model_cfg.concept_predictor_mudd = _bool_env("CONCEPTLM_PREDICTOR_MUDD", False)
 model_cfg.concept_decoder_mudd = _bool_env("CONCEPTLM_DECODER_MUDD", False)

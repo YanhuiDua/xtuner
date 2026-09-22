@@ -68,6 +68,34 @@ def _stack_endpoints(sources: list[Tensor]) -> tuple[Tensor, int]:
     return torch.cat(flat, dim=-2, out=buffer[:rows, : len(sources), :]), buffer.shape[1]
 
 
+_PTR_TABLE_CPU: dict[int, Tensor] = {}
+_PTR_TABLE_DEV: dict[int, Tensor] = {}
+
+
+def _source_pointers(sources: list[Tensor]) -> Tensor:
+    """Return a device ``int64`` tensor holding each source's data pointer.
+
+    The pinned staging buffer is cached per device so building the table costs one
+    tiny async H2D copy rather than an allocation, and the kernel can then read the
+    endpoints in place instead of copying them into a contiguous stack first.
+    """
+    device = sources[0].device
+    key = device.index if device.index is not None else -1
+    count = len(sources)
+    cpu = _PTR_TABLE_CPU.get(key)
+    dev = _PTR_TABLE_DEV.get(key)
+    if cpu is None or cpu.numel() < count:
+        cpu = torch.empty(max(count, 64), dtype=torch.int64, pin_memory=True)
+        _PTR_TABLE_CPU[key] = cpu
+    if dev is None or dev.numel() < count or dev.device != device:
+        dev = torch.empty(max(count, 64), dtype=torch.int64, device=device)
+        _PTR_TABLE_DEV[key] = dev
+    for index, source in enumerate(sources):
+        cpu[index] = source.data_ptr()
+    dev[:count].copy_(cpu[:count], non_blocking=True)
+    return dev[:count]
+
+
 def _raise_dynamo_limits() -> None:
     """Give Dynamo room for one graph per layer width without tripping its
     guard."""
@@ -163,6 +191,7 @@ if _HAS_TRITON:
     def _mudd_combine_fwd_kernel(
         current_ptr,
         stacked_ptr,
+        src_ptrs,
         weights_ptr,
         source_norm_ptr,
         post_norm_ptr,
@@ -174,6 +203,7 @@ if _HAS_TRITON:
         H: tl.constexpr,
         BLOCK_H: tl.constexpr,
         PREPOST: tl.constexpr,
+        SCATTER: tl.constexpr,
     ):
         row = tl.program_id(0)
         offs_h = tl.arange(0, BLOCK_H)
@@ -183,7 +213,11 @@ if _HAS_TRITON:
             source_norm = tl.load(source_norm_ptr + offs_h, mask=h_mask, other=0.0).to(tl.float32)
         acc = tl.zeros((4, BLOCK_H), dtype=tl.float32)
         for n in tl.static_range(N):
-            x = tl.load(stacked_ptr + row * NST * H + n * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+            if SCATTER:
+                src_ptr = tl.load(src_ptrs + n).to(tl.pointer_type(current_ptr.dtype.element_ty))
+                x = tl.load(src_ptr + row * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+            else:
+                x = tl.load(stacked_ptr + row * NST * H + n * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
             if PREPOST:
                 inv_rms = tl.rsqrt(tl.sum(x * x, axis=0) / H + eps)
                 # Hand the per-source normalization to the backward pass, which
@@ -212,6 +246,7 @@ if _HAS_TRITON:
     def _mudd_combine_bwd_kernel(
         grad_out_ptr,
         stacked_ptr,
+        src_ptrs,
         weights_ptr,
         source_norm_ptr,
         post_norm_ptr,
@@ -228,6 +263,7 @@ if _HAS_TRITON:
         BLOCK_H: tl.constexpr,
         ROWS_PER_PROG: tl.constexpr,
         PREPOST: tl.constexpr,
+        SCATTER: tl.constexpr,
     ):
         pid = tl.program_id(0)
         offs_h = tl.arange(0, BLOCK_H)
@@ -256,7 +292,11 @@ if _HAS_TRITON:
             # loop carries no cross-lane reduction and streams at full bandwidth.
             acc = tl.zeros((4, BLOCK_H), dtype=tl.float32)
             for n in tl.static_range(N):
-                x = tl.load(stacked_ptr + safe_row * N * H + n * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+                if SCATTER:
+                    src_ptr = tl.load(src_ptrs + n).to(tl.pointer_type(grad_out_ptr.dtype.element_ty))
+                    x = tl.load(src_ptr + safe_row * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+                else:
+                    x = tl.load(stacked_ptr + safe_row * N * H + n * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
                 if PREPOST:
                     x = x * tl.load(inv_rms_ptr + safe_row * N + n) * source_norm
                 w = tl.load(weights_ptr + safe_row * 4 * N + offs4 * N + n).to(tl.float32)
@@ -275,7 +315,11 @@ if _HAS_TRITON:
             else:
                 du = gout
             for n in tl.static_range(N):
-                x = tl.load(stacked_ptr + safe_row * N * H + n * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+                if SCATTER:
+                    src_ptr = tl.load(src_ptrs + n).to(tl.pointer_type(grad_out_ptr.dtype.element_ty))
+                    x = tl.load(src_ptr + safe_row * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+                else:
+                    x = tl.load(stacked_ptr + safe_row * N * H + n * H + offs_h, mask=h_mask, other=0.0).to(tl.float32)
                 if PREPOST:
                     inv_rms = tl.load(inv_rms_ptr + safe_row * N + n)
                     y = x * inv_rms * source_norm
@@ -349,10 +393,21 @@ class _MUDDCombineTriton(torch.autograd.Function):
         post_norm: Tensor,
         eps: float,
         prepost: bool,
+        scatter: bool,
         *sources: Tensor,
     ) -> Tensor:
-        stacked, row_stride = _stack_endpoints(list(sources))
-        rows, num_sources, hidden_size = stacked.shape
+        hidden_size = sources[0].shape[-1]
+        rows = sources[0].numel() // hidden_size
+        num_sources = len(sources)
+        if scatter:
+            assert all(source.is_contiguous() for source in sources), "scatter sources must be contiguous"
+            src_ptrs = _source_pointers(list(sources))
+            # Never read when SCATTER is set; only the pointer table is dereferenced.
+            stacked = sources[0].reshape(rows, hidden_size)
+            row_stride = num_sources
+        else:
+            stacked, row_stride = _stack_endpoints(list(sources))
+            src_ptrs = stacked
         out = torch.empty(rows, 4, hidden_size, device=stacked.device, dtype=stacked.dtype)
         # Per-source inverse RMS from the forward, reused by the backward so its
         # loops stay free of cross-lane reductions. 4 bytes per source per row.
@@ -361,6 +416,7 @@ class _MUDDCombineTriton(torch.autograd.Function):
         _mudd_combine_fwd_kernel[(rows,)](
             current_raw.reshape(rows, hidden_size),
             stacked,
+            src_ptrs,
             weights.reshape(rows, 4, num_sources),
             source_norm,
             post_norm,
@@ -372,11 +428,13 @@ class _MUDDCombineTriton(torch.autograd.Function):
             H=hidden_size,
             BLOCK_H=block_h,
             PREPOST=prepost,
+            SCATTER=scatter,
             num_warps=_kernel_num_warps(block_h),
         )
         ctx.save_for_backward(current_raw, weights, source_norm, post_norm, inv_rms, *sources)
         ctx.eps = eps
         ctx.prepost = prepost
+        ctx.scatter = scatter
         return out.reshape(*sources[0].shape[:-1], 4, hidden_size)
 
     @staticmethod
@@ -384,12 +442,20 @@ class _MUDDCombineTriton(torch.autograd.Function):
         saved = ctx.saved_tensors
         current_raw, weights, source_norm, post_norm, inv_rms = saved[:5]
         sources = saved[5:]
-        # Rebuilt on demand; the endpoints themselves are alive regardless.
-        stacked = torch.stack(sources, dim=-2)
-        num_sources, hidden_size = stacked.shape[-2], stacked.shape[-1]
-        rows = stacked.numel() // (num_sources * hidden_size)
+        hidden_size = sources[0].shape[-1]
+        rows = sources[0].numel() // hidden_size
+        num_sources = len(sources)
+        if ctx.scatter:
+            src_ptrs = _source_pointers(list(sources))
+            # Never read when SCATTER is set; only the pointer table is dereferenced.
+            stacked = sources[0].reshape(rows, hidden_size)
+        else:
+            # Rebuilt on demand; the endpoints themselves are alive regardless.
+            stacked = torch.stack(sources, dim=-2)
+            src_ptrs = stacked
+            stacked = stacked.reshape(rows, num_sources, hidden_size)
         grad_out = grad_out.reshape(rows, 4, hidden_size).contiguous()
-        grad_stacked = torch.empty_like(stacked)
+        grad_stacked = torch.empty(rows, num_sources, hidden_size, device=stacked.device, dtype=stacked.dtype)
         grad_weights = torch.empty_like(weights)
         block_h = triton.next_power_of_2(hidden_size)
         if ctx.prepost:
@@ -402,7 +468,8 @@ class _MUDDCombineTriton(torch.autograd.Function):
         rows_per_prog = 8
         _mudd_combine_bwd_kernel[(triton.cdiv(rows, rows_per_prog),)](
             grad_out,
-            stacked.reshape(rows, num_sources, hidden_size),
+            stacked,
+            src_ptrs,
             weights.reshape(rows, 4, num_sources),
             source_norm,
             post_norm,
@@ -419,6 +486,7 @@ class _MUDDCombineTriton(torch.autograd.Function):
             BLOCK_H=block_h,
             ROWS_PER_PROG=rows_per_prog,
             PREPOST=ctx.prepost,
+            SCATTER=ctx.scatter,
             num_warps=_kernel_num_warps(block_h),
         )
         if ctx.prepost:
@@ -428,7 +496,16 @@ class _MUDDCombineTriton(torch.autograd.Function):
             # Unused pointers; the kernel never touches them when PREPOST=False.
             grad_current = grad_source_norm = grad_post_norm = None  # type: ignore[assignment]
         # One gradient per endpoint; the stack has no node of its own to feed now.
-        return grad_current, grad_weights, grad_source_norm, grad_post_norm, None, None, *grad_stacked.unbind(dim=-2)
+        return (
+            grad_current,
+            grad_weights,
+            grad_source_norm,
+            grad_post_norm,
+            None,
+            None,
+            None,
+            *grad_stacked.reshape(*sources[0].shape[:-1], num_sources, hidden_size).unbind(dim=-2),
+        )
 
 
 @dataclass
@@ -471,6 +548,7 @@ class Qwen35MUDDRoute(nn.Module):
         compile_route: bool = False,
         route_kernel: bool = False,
         router_norm_affine: bool = False,
+        route_scatter: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = int(hidden_size)
@@ -479,6 +557,7 @@ class Qwen35MUDDRoute(nn.Module):
         self.compile_route = bool(compile_route)
         self.route_kernel = bool(route_kernel)
         self.router_norm_affine = bool(router_norm_affine)
+        self.route_scatter = bool(route_scatter)
         route_width = self.num_streams * self.num_sources
         # Plain parameters rather than ``nn.Linear``: the generic initializer rewrites the
         # ``weight`` of every submodule whose name does not contain "norm", which would
@@ -565,6 +644,7 @@ class Qwen35MUDDRoute(nn.Module):
                 self.post_norm,
                 self.eps,
                 True,
+                self.route_scatter,
                 *sources,
             )
             return tuple(fused.unbind(dim=-2))
@@ -618,6 +698,7 @@ class Qwen35MUDD(nn.Module):
         compile_route: bool = False,
         route_kernel: bool = False,
         router_norm_affine: bool = False,
+        route_scatter: bool = False,
     ) -> None:
         super().__init__()
         self.routes = nn.ModuleList(
@@ -629,6 +710,7 @@ class Qwen35MUDD(nn.Module):
                     compile_route=compile_route,
                     route_kernel=route_kernel,
                     router_norm_affine=router_norm_affine,
+                    route_scatter=route_scatter,
                 )
                 for layer_idx in range(int(num_layers))
             ]

@@ -83,6 +83,7 @@ class Dense(BaseModel):
                 compile_route=bool(getattr(config, "mudd_compile", False)),
                 route_kernel=bool(getattr(config, "mudd_route_kernel", True)),
                 router_norm_affine=bool(getattr(config, "mudd_router_norm_affine", False)),
+                route_scatter=bool(getattr(config, "mudd_route_scatter", False)),
             )
             if bool(getattr(config, "mudd_enabled", False))
             else None

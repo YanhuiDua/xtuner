@@ -73,6 +73,10 @@ class Qwen3_5_VLTextDenseConfig(TransformerConfig):
     # the router's own input norm carries a learnable scale. The reference
     # implementation's best-validated configuration runs it affine-free.
     mudd_router_norm_affine: bool = False
+    # Read the route endpoints through a device pointer table instead of copying them
+    # into a contiguous stack first. Removes the forward scratch fill and the backward
+    # stack rebuild (~195 ms/step on the 9B doc configuration) without touching the math.
+    mudd_route_scatter: bool = False
 
     @computed_field
     def layers_type(self) -> list[Literal["full_attention", "linear_attention"]]:

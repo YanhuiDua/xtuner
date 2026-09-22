@@ -257,6 +257,69 @@ class TestQwen35MUDDStackScratch:
         assert not hasattr(route, "_STACK_SCRATCH")
 
 
+class TestQwen35MUDDScatterSources:
+    """The scatter route reads endpoints through a pointer table instead of materialising a stack."""
+
+    def test_pointer_table_matches_data_ptrs(self):
+        import xtuner.v1.module.mudd as mudd_mod
+
+        mudd_mod._PTR_TABLE_CPU.clear()
+        mudd_mod._PTR_TABLE_DEV.clear()
+        generator = torch.Generator().manual_seed(0)
+        sources = [torch.randn(2, 3, HIDDEN_SIZE, generator=generator) for _ in range(5)]
+        table = mudd_mod._source_pointers(sources)
+        assert table.dtype == torch.int64
+        assert table.device == sources[0].device
+        assert [int(entry) for entry in table.tolist()] == [source.data_ptr() for source in sources]
+
+        # A wider route reuses the same cached staging buffers.
+        more = [*sources, torch.randn(2, 3, HIDDEN_SIZE, generator=generator)]
+        wide = mudd_mod._source_pointers(more)
+        assert len(mudd_mod._PTR_TABLE_CPU) == 1
+        assert len(mudd_mod._PTR_TABLE_DEV) == 1
+        assert [int(entry) for entry in wide.tolist()] == [source.data_ptr() for source in more]
+
+    def test_scatter_route_never_materialises_a_stack(self):
+        if not torch.cuda.is_available():
+            pytest.skip("scatter route requires CUDA")
+        import xtuner.v1.module.mudd as mudd_mod
+
+        reference = _build_route(num_sources=4).cuda()
+        scatter = Qwen35MUDDRoute(
+            HIDDEN_SIZE,
+            4,
+            EPS,
+            route_kernel=True,
+            route_scatter=True,
+        ).to(device="cuda")
+        scatter.load_state_dict(reference.state_dict())
+        current, sources = _build_inputs(num_sources=4)
+        current = current.to("cuda").requires_grad_(True)
+        sources = [source.to("cuda").requires_grad_(True) for source in sources]
+
+        real_cat, real_stack = torch.cat, torch.stack
+
+        def _forbid(*args, **kwargs):
+            raise AssertionError("the scatter route must not materialise a stack")
+
+        torch.cat = _forbid
+        torch.stack = _forbid
+        try:
+            outputs = scatter(current, sources)
+            loss = sum(output.float().square().mean() for output in outputs)
+            loss.backward()
+        finally:
+            torch.cat = real_cat
+            torch.stack = real_stack
+
+        expected = reference(current.detach(), [source.detach() for source in sources])
+        for got, want in zip(outputs, expected, strict=True):
+            assert torch.equal(got.detach(), want)
+        assert current.grad is not None and torch.isfinite(current.grad).all()
+        for source in sources:
+            assert source.grad is not None and torch.isfinite(source.grad).all()
+
+
 def _compile_available() -> bool:
     try:
         probe = torch.compile(lambda x: x * 2, fullgraph=True)
