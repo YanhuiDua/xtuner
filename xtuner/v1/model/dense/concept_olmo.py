@@ -70,6 +70,46 @@ CONCEPT_OLMO_GROUPED_COMPILE_CFG: dict[str, TorchCompileOption] = {
 }
 
 
+class ConceptPredictionHeads(nn.Linear):
+    """Packed VQ heads whose 32-way GEMM runs inside this module's forward.
+
+    FSDP mixed precision unshards and casts weights only for the wrapped
+    module's ``forward``. Reading ``weight`` from the parent sees fp32 master
+    shards and skips the all-gather.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        num_codebooks: int,
+        codebook_size: int,
+        bias: bool = True,
+    ) -> None:
+        super().__init__(in_features, num_codebooks * codebook_size, bias=bias)
+        self.num_codebooks = num_codebooks
+        self.codebook_size = codebook_size
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if isinstance(self.weight, DTensor):
+            weight = self.weight.to_local()
+            bias = self.bias.to_local() if self.bias is not None else None
+        else:
+            weight = self.weight
+            bias = self.bias
+        assert bias is not None
+        return torch.stack(
+            [
+                F.linear(input, head_weight, head_bias)
+                for head_weight, head_bias in zip(
+                    weight.chunk(self.num_codebooks),
+                    bias.chunk(self.num_codebooks),
+                    strict=True,
+                )
+            ],
+            dim=2,
+        )
+
+
 class ConceptLMV22VQ(BaseModel):
     """XTuner implementation of the ConceptLM V2.2 residual-VQ model."""
 
@@ -121,6 +161,9 @@ class ConceptLMV22VQ(BaseModel):
             )
             for layer_idx in range(config.concept_decoder_layers)
         ]
+        from xtuner.v1.model.dense.concept_layer_dump import tag_stages
+
+        tag_stages(encoder_stages, concept_stages, decoder_stages)
         if config.stage_group_size == 1:
             self.encoder_stages = nn.ModuleList(encoder_stages)
             self.concept_stages = nn.ModuleList(concept_stages)
@@ -153,12 +196,20 @@ class ConceptLMV22VQ(BaseModel):
             config.concept_v22_vq_codebook_size,
         )
         self.concept_final_norm = CheckpointRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.prediction_heads = build_linear(
-            config.hidden_size,
-            config.concept_v22_vq_num_codebooks * config.concept_v22_vq_codebook_size,
-            bias=True,
-            float8_cfg=config.float8_cfg,
-        )
+        if config.float8_cfg is None:
+            self.prediction_heads = ConceptPredictionHeads(
+                config.hidden_size,
+                config.concept_v22_vq_num_codebooks,
+                config.concept_v22_vq_codebook_size,
+                bias=True,
+            )
+        else:
+            self.prediction_heads = build_linear(
+                config.hidden_size,
+                config.concept_v22_vq_num_codebooks * config.concept_v22_vq_codebook_size,
+                bias=True,
+                float8_cfg=config.float8_cfg,
+            )
         self.concept_read_encoder_shared_source_norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.fusion_tok_norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -210,41 +261,20 @@ class ConceptLMV22VQ(BaseModel):
         codebook_size = self.config.concept_v22_vq_codebook_size
 
         # A single physical parameter keeps prediction-head FSDP communication
-        # in one collective. Use its single large GEMM in the optimized/FP8
-        # path; for eager BF16 inference, retain the 32 independent HF GEMMs so
-        # checkpoint parity keeps the original accumulation order.
-        if self._compile_cfg or self.config.float8_cfg is not None:
-            return self.prediction_heads(concept_hidden).reshape(
-                *concept_hidden.shape[:-1],
-                num_codebooks,
-                codebook_size,
-            )
-
-        projection = cast(nn.Linear, self.prediction_heads)
-        weight = projection.weight
-        bias = projection.bias
-        if isinstance(weight, DTensor):
-            weight = weight.to_local()
-            if bias is not None:
-                assert isinstance(bias, DTensor)
-                bias = bias.to_local()
-        assert bias is not None
-        return torch.stack(
-            [
-                F.linear(concept_hidden, head_weight, head_bias)
-                for head_weight, head_bias in zip(
-                    weight.chunk(num_codebooks),
-                    bias.chunk(num_codebooks),
-                    strict=True,
-                )
-            ],
-            dim=2,
-        )
+        # in one collective. Eager BF16 runs 32 independent GEMMs inside the
+        # wrapped module so FSDP unshards and casts to param_dtype first.
+        logits = self.prediction_heads(concept_hidden)
+        if logits.ndim == concept_hidden.ndim + 1:
+            return logits
+        return logits.reshape(*concept_hidden.shape[:-1], num_codebooks, codebook_size)
 
     def to_hf_key_list(self, key: str) -> list[str]:
+        # DUMP_INIT_HF writes parameters only. CheckpointRMSNorm still keeps an
+        # empty ``_extra_state`` in ``state_dict`` via get_extra_state, but it
+        # is not a required checkpoint tensor.
+        if key.endswith("_extra_state"):
+            return []
         if self.config.model_type == "ncp_olmo3":
-            if key.endswith("._extra_state"):
-                return []
             if key == "concept_quantizer.codebook":
                 return [
                     f"concept_quantizer.codebook.{index}" for index in range(self.config.concept_v22_vq_num_codebooks)
@@ -387,7 +417,7 @@ class ConceptLMV22VQ(BaseModel):
             key = key.view(num_heads, head_dim, hidden_size)
             value = value.view(num_heads, head_dim, hidden_size)
             return torch.stack((query, key, value), dim=2).reshape_as(loaded_tensor)
-        if name == "fusion_norm_alpha":
+        if name == "fusion_norm_alpha" or name.endswith((".alpha", ".beta", ".final_beta")):
             return loaded_tensor.reshape(1)
         return loaded_tensor
 
@@ -405,8 +435,10 @@ class ConceptLMV22VQ(BaseModel):
 
     @override
     def param_to_safetensor(self, safetensor: torch.Tensor, hf_param_name: str) -> torch.Tensor:
-        if hf_param_name == "fusion_norm_alpha":
-            return safetensor.squeeze(0)
+        if hf_param_name == "fusion_norm_alpha" or hf_param_name.endswith(
+            (".alpha", ".beta", ".final_beta")
+        ):
+            return safetensor.reshape(())
         if hf_param_name == "output_layer.weight" and safetensor.shape[0] > self.config.vocab_size:
             return safetensor[: self.config.vocab_size]
         return safetensor
@@ -744,6 +776,19 @@ class ConceptLMV22VQ(BaseModel):
         )
 
     def forward(
+        self,
+        seq_ctx: SequenceContext,
+        loss_ctx: dict[str, BaseLossContext | list[BaseLossContext]] | None = None,
+    ) -> ModelOutputs:
+        from xtuner.v1.model.dense.concept_layer_dump import begin_forward, end_forward
+
+        begin_forward()
+        try:
+            return self._forward_impl(seq_ctx, loss_ctx)
+        finally:
+            end_forward()
+
+    def _forward_impl(
         self,
         seq_ctx: SequenceContext,
         loss_ctx: dict[str, BaseLossContext | list[BaseLossContext]] | None = None,

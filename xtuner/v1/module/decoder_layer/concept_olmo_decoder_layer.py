@@ -87,6 +87,12 @@ class ConceptOlmoDecoderLayer(nn.Module):
         seq_ctx: SequenceContext,
     ) -> torch.Tensor:
         attention_output = self.self_attention(hidden_states, position_embeddings, seq_ctx)["projected_output"]
+        from xtuner.v1.model.dense.concept_layer_dump import record
+
+        dump_name = getattr(self, "concept_dump_name", None)
+        record(dump_name, "attn", attention_output)
         hidden_states = hidden_states + self.post_attention_layernorm(attention_output)
+        record(dump_name, "attn_res", hidden_states)
         mlp_output = self.mlp(hidden_states)
+        record(dump_name, "mlp", mlp_output)
         return hidden_states + self.post_feedforward_layernorm(mlp_output)

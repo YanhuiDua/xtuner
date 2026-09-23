@@ -333,6 +333,7 @@ class DataloaderConfig(BaseDataloaderConfig):
         Parameter(help="path to sampler order .npy (mmap read); required when pack_level='preset'"),
     ] = None
     round_up: Annotated[bool, Parameter(help="enable or disable round up mode")] = True
+    shuffle: Annotated[bool, Parameter(help="shuffle dataset indices in ParallelSampler")] = True
 
     @staticmethod
     def _force_preset_pack_settings(dataset_config_list: "DatasetConfigList") -> "DatasetConfigList":
@@ -535,7 +536,7 @@ class DataloaderConfig(BaseDataloaderConfig):
                 dataset=dataset,  # type: ignore[arg-type]
                 dp_mesh=dp_mesh,
                 global_batch_size=global_batch_size,
-                shuffle=shuffle,
+                shuffle=self.shuffle if shuffle is True else shuffle,
                 seed=seed,
                 round_up=self.round_up,
             )

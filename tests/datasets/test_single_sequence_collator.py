@@ -43,6 +43,27 @@ def test_single_sequence_collator_requires_exact_hard_pack():
         )
 
 
+def test_single_sequence_collator_accepts_unpacked_dict():
+    source_tokens = list(range(9))
+    batch = single_sequence_sft_llm_collator(
+        [
+            {
+                "input_ids": source_tokens,
+                "labels": source_tokens,
+                "num_tokens": len(source_tokens),
+            }
+        ],  # type: ignore[arg-type]
+        pack_max_length=9,
+        padding_token_idx=0,
+    )
+
+    seq_ctx = batch[0]["seq_ctx"]
+    assert seq_ctx.input_ids is not None
+    assert seq_ctx.input_ids.shape == (1, 8)
+    assert seq_ctx.cu_seq_lens_q.tolist() == [0, 8]
+    assert seq_ctx.num_padding == 0
+
+
 def test_single_sequence_collator_produces_exact_8192_sequence():
     source_tokens = list(range(8193))
     instances = [

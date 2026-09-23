@@ -154,6 +154,8 @@ def single_sequence_sft_llm_collator(
 
     ret: list[ColateItem] = []
     for instance in instances:
+        if isinstance(instance, dict):
+            instance = [instance]
         source_length = sum(item["num_tokens"] for item in instance)
         if source_length != pack_max_length:
             raise ValueError(
