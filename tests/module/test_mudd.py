@@ -20,6 +20,7 @@ TestQwen35MUDDStackScratch
     test_scratch_never_enters_the_state_dict: scratch 不落在模块属性/state_dict 上。
 TestQwen35MUDDScatterSources
     test_pointer_table_matches_data_ptrs: 散列指针表的 dtype/device/取值与各 source 的 data_ptr 一致，且按宽度复用缓存缓冲。
+    test_staging_stream_is_per_device: 暂存用的 side stream 每设备只建一次，且不是当前主流。
     test_scatter_route_never_materialises_a_stack: scatter 路由与栈路由输出逐位相等，且全程不物化端点栈。
     test_scatter_route_falls_back_to_the_stack_for_views: 端点是非连续视图时自动回退到栈路径，数值仍与栈路由逐位一致。
 TestQwen35MUDDRouteCompile
@@ -282,6 +283,16 @@ class TestQwen35MUDDScatterSources:
         assert wide.data_ptr() != table.data_ptr()
         assert [int(entry) for entry in table.tolist()] == [source.data_ptr() for source in sources]
         assert [int(entry) for entry in wide.tolist()] == [source.data_ptr() for source in more]
+
+    def test_staging_stream_is_per_device(self):
+        """The table is staged on one reusable per-device stream, never on the main one."""
+        if not torch.cuda.is_available():
+            pytest.skip("staging stream requires CUDA")
+        import xtuner.v1.module.mudd as mudd_mod
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        assert mudd_mod._side_stream(device) is mudd_mod._side_stream(device)
+        assert mudd_mod._side_stream(device) is not torch.cuda.current_stream(device)
 
     def test_scatter_route_never_materialises_a_stack(self):
         if not torch.cuda.is_available():

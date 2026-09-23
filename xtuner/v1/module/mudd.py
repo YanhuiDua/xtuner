@@ -68,6 +68,23 @@ def _stack_endpoints(sources: list[Tensor]) -> tuple[Tensor, int]:
     return torch.cat(flat, dim=-2, out=buffer[:rows, : len(sources), :]), buffer.shape[1]
 
 
+_SIDE_STREAMS: dict[int, "torch.cuda.Stream"] = {}
+
+
+def _side_stream(device: torch.device) -> "torch.cuda.Stream":
+    """Return the per-device stream the pointer table is staged on.
+
+    Created on first use and kept, so the table's H2D copy never has to wait behind the model's queued work on the main
+    stream.
+    """
+    key = device.index if device.index is not None else -1
+    stream = _SIDE_STREAMS.get(key)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device)
+        _SIDE_STREAMS[key] = stream
+    return stream
+
+
 def _source_pointers(sources: list[Tensor]) -> Tensor:
     """Return a device ``int64`` tensor holding each source's data pointer.
 
@@ -75,13 +92,36 @@ def _source_pointers(sources: list[Tensor]) -> Tensor:
     copy out of a *shared* pinned staging area can still be pending when the next route
     call writes its own pointers into that area, which hands one layer another layer's
     addresses -- an illegal memory access on the 2B ConceptLM, whose three stacks have
-    different row counts, so a borrowed pointer is also read past its end. A pageable
-    staging tensor copies synchronously (``non_blocking=False``), so no transfer is ever
-    in flight while the staging memory is reused. The table is a few hundred bytes, so the
-    extra allocation is negligible next to the route it feeds.
+    different row counts, so a borrowed pointer is also read past its end.
+
+    Landing that copy on a per-device *side* stream keeps the safety without paying for it.
+    The copy is host-blocking, so the staging tensor is free to be dropped as soon as this
+    returns; but the side stream carries nothing else, so the wait is the transfer itself
+    rather than the model's queued work on the main stream (a plain ``.to(device)`` on the
+    main stream measured ~2.5 ms per call at the 9B shape, 32 calls per step). Both ends of
+    the hand-off are explicit: the table is allocated *on* the side stream, so the
+    allocator's own stream ordering covers reuse of that block by the next call's copy; the
+    *consumer* stream is recorded on it, so the block is not handed back to the allocator
+    while the combine kernel that dereferences it may still be running; and the main stream
+    waits on the side stream before that kernel is launched.
+
+    The table is a few hundred bytes, so the extra allocation is negligible next to the
+    route it feeds. CPU callers (the unit tests) get the plain staging tensor.
     """
     device = sources[0].device
-    return torch.tensor([source.data_ptr() for source in sources], dtype=torch.int64).to(device=device)
+    staged = torch.empty(len(sources), dtype=torch.int64, pin_memory=device.type == "cuda")
+    for index, source in enumerate(sources):
+        staged[index] = source.data_ptr()
+    if device.type != "cuda":  # unit tests build the table on the host
+        return staged
+    current = torch.cuda.current_stream(device)
+    side = _side_stream(device)
+    with torch.cuda.stream(side):
+        table = torch.empty(staged.shape, dtype=torch.int64, device=device)
+        table.copy_(staged, non_blocking=False)
+        table.record_stream(current)
+    current.wait_stream(side)
+    return table
 
 
 def _raise_dynamo_limits() -> None:
