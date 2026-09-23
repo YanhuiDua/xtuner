@@ -94,11 +94,14 @@ class TestNewtonSchulz(DeterministicDDPTestCase):
         torch.testing.assert_close(result, expected)
 
 
-def test_spectral_scale_matches_megatron():
-    assert _get_muon_lr_ratio(4096, 4096, "spectral_norm") == 64
-    assert _get_muon_lr_ratio(22016, 4096, "spectral_norm") == math.sqrt(22016)
-    assert _get_muon_lr_ratio(4096, 11008, "spectral_norm") == math.sqrt(11008)
-    assert _get_muon_lr_ratio(2, 4096, "spectral_norm") == 64
+def test_lr_ratio_modes():
+    assert _get_muon_lr_ratio(4096, 4096, "spectral_norm") == 1
+    assert _get_muon_lr_ratio(22016, 4096, "spectral_norm") == math.sqrt(22016 / 4096)
+    assert _get_muon_lr_ratio(4096, 11008, "spectral_norm") == math.sqrt(4096 / 11008)
+    assert _get_muon_lr_ratio(4096, 4096, "rms_norm") == 0.2 * 64
+    assert _get_muon_lr_ratio(4096, 4096, "rms_norm", extra_scale_factor=1) == 64
+    assert _get_muon_lr_ratio(22016, 4096, "rms_norm", extra_scale_factor=1) == math.sqrt(22016)
+    assert _get_muon_lr_ratio(4096, 11008, "rms_norm", extra_scale_factor=1) == math.sqrt(11008)
 
 
 def test_qkv_split_gathers_before_orthogonalize():
@@ -119,7 +122,8 @@ def test_qkv_split_gathers_before_orthogonalize():
         num_experts=1,
         newton_schulz_func=identity,
         qkv_split_shapes=(head_dim, head_dim, head_dim),
-        adjust_lr="spectral_norm",
+        adjust_lr="rms_norm",
+        extra_scale_factor=1,
     )
 
     gathered_rows = groups * head_dim

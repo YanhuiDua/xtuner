@@ -626,26 +626,25 @@ class ConceptLMV22VQ(BaseModel):
 
     def _concept_auxiliary_losses(
         self,
-        continuous_concepts: torch.Tensor,
+        concept_vq_hidden: torch.Tensor,
         predicted_concepts: torch.Tensor,
         concept_lengths: list[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute the paper's next-concept and product-VQ objectives.
+        """Compute next-concept MSE and product-VQ loss on normed concepts.
 
-        ``continuous_concepts`` contains the encoder target at concept
-        resolution.  ``predicted_concepts[i]`` predicts the next concept, so
-        the last concept of every packed document has no NCP target.  Padding
-        and incomplete documents are absent from ``concept_lengths``/the
-        tensors passed here.
+        ``concept_vq_hidden`` is the full ``concept_vq_input_norm`` output.
+        ``predicted_concepts[i]`` predicts the next concept, so the last
+        concept of every packed document has no HLM target. Megatron detaches
+        the quantizer input, so commitment does not train the encoder.
         """
-        zero = continuous_concepts.new_zeros(())
+        zero = concept_vq_hidden.new_zeros(())
         ncp_parts: list[torch.Tensor] = []
         target_parts: list[torch.Tensor] = []
         start = 0
         for length in concept_lengths:
             if length > 1:
                 ncp_parts.append(predicted_concepts[:, start : start + length - 1])
-                target_parts.append(continuous_concepts[:, start + 1 : start + length])
+                target_parts.append(concept_vq_hidden[:, start + 1 : start + length])
             start += length
 
         if ncp_parts:
@@ -658,13 +657,14 @@ class ConceptLMV22VQ(BaseModel):
         else:
             ncp_loss = zero
 
-        if continuous_concepts.shape[1] == 0:
+        if concept_vq_hidden.shape[1] == 0:
             return ncp_loss, zero
 
-        codebook = self.concept_quantizer.transformed_codebook().to(continuous_concepts.dtype)
-        target = continuous_concepts.view(
-            continuous_concepts.shape[0],
-            continuous_concepts.shape[1],
+        vq_input = concept_vq_hidden.detach()
+        codebook = self.concept_quantizer.transformed_codebook().to(vq_input.dtype)
+        target = vq_input.view(
+            vq_input.shape[0],
+            vq_input.shape[1],
             self.config.concept_v22_vq_num_codebooks,
             self.concept_quantizer.code_dim,
         )
@@ -675,11 +675,27 @@ class ConceptLMV22VQ(BaseModel):
             dim=3,
             index=indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, 1, self.concept_quantizer.code_dim),
         ).squeeze(3)
-        quantized = quantized.reshape_as(continuous_concepts)
-        codebook_loss = F.mse_loss(quantized.float(), continuous_concepts.detach().float())
-        commitment_loss = F.mse_loss(continuous_concepts.float(), quantized.detach().float())
+        quantized = quantized.reshape_as(vq_input)
+        codebook_loss = F.mse_loss(quantized.float(), vq_input.float())
+        commitment_loss = F.mse_loss(vq_input.float(), quantized.detach().float())
         vq_loss = codebook_loss + self.config.concept_vq_commitment_cost * commitment_loss
         return ncp_loss, vq_loss
+
+    @staticmethod
+    def _ce_token_scale(
+        lm_loss_ctx: BaseLossContext | list[BaseLossContext],
+        ref_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(lm_loss_ctx, list):
+            lm_loss_ctx = lm_loss_ctx[0]
+        loss_weight = getattr(getattr(lm_loss_ctx, "loss_kwargs", None), "loss_weight", None)
+        if loss_weight is None:
+            return ref_tensor.new_ones(())
+        mask = loss_weight != 0
+        scale = loss_weight.sum() / mask.sum().clamp_min(1)
+        if dist.is_initialized():
+            scale = scale * dist.get_world_size()
+        return scale
 
     @staticmethod
     def _build_concept_context(
@@ -778,11 +794,14 @@ class ConceptLMV22VQ(BaseModel):
         full_encoder_hidden = self._gather_sequence(hidden_states, sp_mesh)
         full_encoder_raw_states = [self._gather_sequence(state, sp_mesh) for state in encoder_raw_states]
         concept_hidden, concept_lengths = self._merge_chunks(full_encoder_hidden, token_lengths)
-        continuous_concepts = concept_hidden
         valid_concept_length = concept_hidden.shape[1]
         active_concept_lengths = [length for length in concept_lengths if length > 0]
-        concept_hidden, concept_padding = self._pad_and_split_sequence(concept_hidden, sp_mesh)
+        # Megatron norms the merged concepts before VQ and the HLM target.
+        # LayerNorm is per token, so doing it before the SP split matches the
+        # full-sequence norm used by those losses.
         concept_hidden = self.concept_vq_input_norm(concept_hidden)
+        concept_vq_hidden = concept_hidden[:, :valid_concept_length]
+        concept_hidden, concept_padding = self._pad_and_split_sequence(concept_hidden, sp_mesh)
         merged_encoder_state_list = [
             self._merge_chunks(state, token_lengths)[0] for state in full_encoder_raw_states[:-1]
         ]
@@ -852,16 +871,6 @@ class ConceptLMV22VQ(BaseModel):
                 for _ in range(self.config.concept_special_layers)
             ]
         predicted_vectors = self._gather_sequence(predicted_vectors, sp_mesh)[:, :valid_concept_length]
-        ncp_loss: torch.Tensor | None = None
-        vq_loss: torch.Tensor | None = None
-        if loss_ctx is not None and (
-            self.config.concept_hlm_loss_weight > 0 or self.config.concept_vq_loss_weight > 0
-        ):
-            ncp_loss, vq_loss = self._concept_auxiliary_losses(
-                continuous_concepts,
-                predicted_vectors,
-                active_concept_lengths,
-            )
         repeated_concepts = self._repeat_shift(predicted_vectors, concept_lengths, token_lengths)
         repeated_concepts = self._pad_sequence_tail(repeated_concepts, full_encoder_hidden.shape[1])
         repeated_concepts = self._local_token_shard(repeated_concepts, seq_ctx, hidden_states.shape[1])
@@ -933,19 +942,28 @@ class ConceptLMV22VQ(BaseModel):
             output["logits"] = logits
         else:
             loss, (logits, extra_info) = self.lm_head(hidden_states, loss_ctx["lm"])  # type: ignore[call-overload]
-            total_loss = loss
-            if ncp_loss is not None:
-                total_loss = total_loss + self.config.concept_hlm_loss_weight * ncp_loss
-            if vq_loss is not None:
-                total_loss = total_loss + self.config.concept_vq_loss_weight * vq_loss
-            output["loss"] = total_loss
+            if extra_info is None:
+                extra_info = {}
+            ncp_loss: torch.Tensor | None = None
+            vq_loss: torch.Tensor | None = None
+            if valid_concept_length > 0 and (
+                self.config.concept_hlm_loss_weight > 0 or self.config.concept_vq_loss_weight > 0
+            ):
+                ncp_loss, vq_loss = self._concept_auxiliary_losses(
+                    concept_vq_hidden,
+                    predicted_vectors,
+                    active_concept_lengths,
+                )
+                token_scale = self._ce_token_scale(loss_ctx["lm"], predicted_vectors)
+                extra_info["ncp_loss"] = ncp_loss.detach()
+                extra_info["hlm_loss"] = ncp_loss.detach()
+                extra_info["vq_loss"] = vq_loss.detach()
+                ncp_loss = ncp_loss.float() * self.config.concept_hlm_loss_weight * token_scale
+                vq_loss = vq_loss.float() * self.config.concept_vq_loss_weight * token_scale
+            output["loss"] = loss
             output["ncp_loss"] = ncp_loss
             output["vq_loss"] = vq_loss
             output["logits"] = logits
-            if ncp_loss is not None:
-                extra_info["ncp_loss"] = ncp_loss.detach()
-            if vq_loss is not None:
-                extra_info["vq_loss"] = vq_loss.detach()
             output["extra_info"] = extra_info
         return ModelOutputs(**output)
 

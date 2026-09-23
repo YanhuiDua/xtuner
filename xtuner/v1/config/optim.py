@@ -99,6 +99,10 @@ class MuonConfig(OptimConfig):
     adjust_lr: Annotated[
         Literal["rms_norm", "spectral_norm", "none"], Parameter(help="Method for adjusting lr in Muon")
     ] = "rms_norm"
+    extra_scale_factor: Annotated[
+        float,
+        Parameter(help="Multiplier for rms_norm. 0.2 is the historical rms ratio; 1 matches Megatron spectral."),
+    ] = 0.2
     enable_all2all: Annotated[
         bool, Parameter(help="Allow all-to-all comm strategy; set False on topologies where all-to-all is unreliable")
     ] = True
@@ -115,10 +119,14 @@ class MuonConfig(OptimConfig):
         trainable_names = {name for name, _ in trainable_parameters_names}
 
         muon_split_sizes = {}
+        muon_qkv_split_shapes = {}
         for module in model.modules():
             get_muon_split_sizes = getattr(module, "get_muon_split_sizes", None)
             if callable(get_muon_split_sizes):
                 muon_split_sizes.update(get_muon_split_sizes())
+            get_muon_qkv_split_shapes = getattr(module, "get_muon_qkv_split_shapes", None)
+            if callable(get_muon_qkv_split_shapes):
+                muon_qkv_split_shapes.update(get_muon_qkv_split_shapes())
 
         untrainable_names = []
         num_total = 0
@@ -244,10 +252,12 @@ class MuonConfig(OptimConfig):
             nesterov=True,
             flatten=True,
             adjust_lr=self.adjust_lr,
+            extra_scale_factor=self.extra_scale_factor,
             use_triton=os.getenv("XTUNER_MUON_USE_TRITON", "0").lower() in ("1", "true", "yes", "on"),
             epsilon=self.eps,
             enable_all2all=self.enable_all2all,
             muon_split_sizes=muon_split_sizes,
+            muon_qkv_split_shapes=muon_qkv_split_shapes,
         )
 
         return optimizer
