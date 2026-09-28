@@ -155,5 +155,9 @@ jobs:
           source /mnt/shared-storage-user/llmrazor-share/qa-llm-cicd/miniconda3/bin/activate
           conda activate clusterx
           unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
-          rjob stop ${RJOB_ID}
+          # clusterx's rjob still requires the runner kubebrain env; do not hardcode it.
+          if [ -f /etc/profile.d/ssh-init.sh ]; then
+            source /etc/profile.d/ssh-init.sh
+          fi
+          rjob stop ${RJOB_ID} --namespace ailab-llmarchitecture
         fi
