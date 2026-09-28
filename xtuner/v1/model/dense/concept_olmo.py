@@ -916,6 +916,20 @@ class ConceptLMV22VQ(BaseModel):
                 for _ in range(self.config.concept_special_layers)
             ]
         predicted_vectors = self._gather_sequence(predicted_vectors, sp_mesh)[:, :valid_concept_length]
+        # VQ distances are forward-only and several GiB. Compute them before the
+        # decoder saves its activations so the temporary does not overlap that peak.
+        ncp_loss: torch.Tensor | None = None
+        vq_loss: torch.Tensor | None = None
+        if (
+            loss_ctx is not None
+            and valid_concept_length > 0
+            and (self.config.concept_hlm_loss_weight > 0 or self.config.concept_vq_loss_weight > 0)
+        ):
+            ncp_loss, vq_loss = self._concept_auxiliary_losses(
+                concept_vq_hidden,
+                predicted_vectors,
+                active_concept_lengths,
+            )
         repeated_concepts = self._repeat_shift(predicted_vectors, concept_lengths, token_lengths)
         repeated_concepts = self._pad_sequence_tail(repeated_concepts, full_encoder_hidden.shape[1])
         repeated_concepts = self._local_token_shard(repeated_concepts, seq_ctx, hidden_states.shape[1])
@@ -989,16 +1003,7 @@ class ConceptLMV22VQ(BaseModel):
             loss, (logits, extra_info) = self.lm_head(hidden_states, loss_ctx["lm"])  # type: ignore[call-overload]
             if extra_info is None:
                 extra_info = {}
-            ncp_loss: torch.Tensor | None = None
-            vq_loss: torch.Tensor | None = None
-            if valid_concept_length > 0 and (
-                self.config.concept_hlm_loss_weight > 0 or self.config.concept_vq_loss_weight > 0
-            ):
-                ncp_loss, vq_loss = self._concept_auxiliary_losses(
-                    concept_vq_hidden,
-                    predicted_vectors,
-                    active_concept_lengths,
-                )
+            if ncp_loss is not None and vq_loss is not None:
                 token_scale = self._ce_token_scale(loss_ctx["lm"], predicted_vectors)
                 extra_info["ncp_loss"] = ncp_loss.detach()
                 extra_info["hlm_loss"] = ncp_loss.detach()

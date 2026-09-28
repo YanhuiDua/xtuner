@@ -96,7 +96,7 @@ _peak_tflops_override = os.getenv("PEAK_TFLOPS_PER_GPU")
 PEAK_TFLOPS_PER_GPU = float(_peak_tflops_override) if _peak_tflops_override else None
 
 model_cfg = ConceptOlmoStage2V1Config(
-    compile_cfg=False,
+    compile_cfg=TORCH_COMPILE,
     concept_hlm_loss_weight=float(os.getenv("HLM_LOSS_WEIGHT", "1.0")),
     concept_vq_loss_weight=float(os.getenv("VQ_LOSS_WEIGHT", "1.0")),
 )
