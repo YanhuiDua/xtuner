@@ -152,5 +152,8 @@ jobs:
       run: |
         echo "rjob_id=${RJOB_ID}"
         if [ -n "${RJOB_ID}" ]; then
+          source /mnt/shared-storage-user/llmrazor-share/qa-llm-cicd/miniconda3/bin/activate
+          conda activate clusterx
+          unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
           rjob stop ${RJOB_ID}
         fi
