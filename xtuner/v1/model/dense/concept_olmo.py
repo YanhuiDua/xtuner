@@ -435,9 +435,7 @@ class ConceptLMV22VQ(BaseModel):
 
     @override
     def param_to_safetensor(self, safetensor: torch.Tensor, hf_param_name: str) -> torch.Tensor:
-        if hf_param_name == "fusion_norm_alpha" or hf_param_name.endswith(
-            (".alpha", ".beta", ".final_beta")
-        ):
+        if hf_param_name == "fusion_norm_alpha" or hf_param_name.endswith((".alpha", ".beta", ".final_beta")):
             return safetensor.reshape(())
         if hf_param_name == "output_layer.weight" and safetensor.shape[0] > self.config.vocab_size:
             return safetensor[: self.config.vocab_size]

@@ -1610,7 +1610,9 @@ def _muon_qkv_newton_schulz(
     are handled the same way. The spectral scale uses the gathered matrix shape.
     """
     if X.ndim != 2 or num_experts != 1:
-        raise ValueError(f"QKV Muon split expects one 2D matrix, got shape={tuple(X.shape)}, num_experts={num_experts}")
+        raise ValueError(
+            f"QKV Muon split expects one 2D matrix, got shape={tuple(X.shape)}, num_experts={num_experts}"
+        )
     if len(qkv_split_shapes) != 3 or any(size <= 0 for size in qkv_split_shapes):
         raise ValueError(f"Invalid QKV split shapes: {qkv_split_shapes}")
 
