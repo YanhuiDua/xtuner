@@ -92,7 +92,12 @@ class ConceptPredictionHeads(nn.Linear):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if isinstance(self.weight, DTensor):
             weight = self.weight.to_local()
-            bias = self.bias.to_local() if self.bias is not None else None
+            if self.bias is None:
+                bias = None
+            elif isinstance(self.bias, DTensor):
+                bias = self.bias.to_local()
+            else:
+                bias = self.bias
         else:
             weight = self.weight
             bias = self.bias
@@ -196,6 +201,7 @@ class ConceptLMV22VQ(BaseModel):
             config.concept_v22_vq_codebook_size,
         )
         self.concept_final_norm = CheckpointRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.prediction_heads: nn.Module
         if config.float8_cfg is None:
             self.prediction_heads = ConceptPredictionHeads(
                 config.hidden_size,

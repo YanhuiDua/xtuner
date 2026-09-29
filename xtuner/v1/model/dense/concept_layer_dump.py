@@ -1,7 +1,7 @@
 """Dump per-layer hidden states and attention outputs for Megatron alignment.
 
-Enabled only when CONCEPT_LAYER_DUMP=1. Rank 0 saves the first microbatch of
-each of the first CONCEPT_LAYER_DUMP_STEPS optimizer steps (default 5).
+Enabled only when CONCEPT_LAYER_DUMP=1. Rank 0 saves the first microbatch of each of the first CONCEPT_LAYER_DUMP_STEPS
+optimizer steps (default 5).
 """
 
 from __future__ import annotations

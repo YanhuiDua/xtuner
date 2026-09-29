@@ -13,8 +13,7 @@ from xtuner.v1.module.linear import build_linear
 
 
 class CheckpointRMSNorm(ConceptOlmoRMSNorm):
-    """RMSNorm carrying the empty extra-state tensor found in some
-    checkpoints.
+    """RMSNorm carrying the empty extra-state tensor found in some checkpoints.
 
     Megatron ``DUMP_INIT_HF`` exports parameters only, so this buffer is not
     persistent and is not required by ``from_hf``.
