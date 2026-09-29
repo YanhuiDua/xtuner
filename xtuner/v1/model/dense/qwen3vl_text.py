@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.loss import BaseLossContext
 from xtuner.v1.model.base import ModelOutputs
+from xtuner.v1.module.mudd import Qwen35MUDDState
 
 from .dense import DenseModelOutputs
 from .qwen3 import Qwen3Dense, Qwen3Dense4BConfig, Qwen3Dense8BConfig
@@ -63,13 +64,24 @@ class Qwen3VLTextDense(Qwen3Dense):
         deepstack_visual_embeds = seq_ctx.deepstack_visual_embeds
         visual_pos_masks = seq_ctx.visual_pos_masks
         # =====================================================
+        mudd_state: Qwen35MUDDState | None = None
+        if self.mudd is not None:
+            mudd_state = self.mudd.initial_state(hidden_states)
+
         for idx, decoder_layer in self.layers.items():
             current_raw = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
                 seq_ctx=seq_ctx,
+                mudd_streams=mudd_state.streams if mudd_state is not None else None,
             )
-            hidden_states = current_raw
+
+            if self.mudd is not None:
+                assert mudd_state is not None
+                mudd_state = self.mudd.finish_layer(int(idx), current_raw, mudd_state)
+                hidden_states = self.mudd.final_read(mudd_state)
+            else:
+                hidden_states = current_raw
 
             if deepstack_visual_embeds is not None and ((idx := int(idx)) in range(len(deepstack_visual_embeds))):
                 assert visual_pos_masks is not None

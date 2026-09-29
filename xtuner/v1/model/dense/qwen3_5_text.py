@@ -62,6 +62,30 @@ class Qwen3_5_VLTextDenseConfig(TransformerConfig):
         ],
     )
     mudd_enabled: bool = False
+    # The fused Triton route kernel is the supported path: measured against the compiled
+    # route it is faster per step (2.540s vs 4.655s at the doc configuration) and peaks
+    # lower (119.56 GB vs 123.75 GB), with no one-off compilation cost. It falls back to
+    # the eager route wherever Triton or CUDA is unavailable, so it is safe as a default.
+    mudd_route_kernel: bool = True
+    # Kept for reproducing the reference implementation's route formulation; opt-in only.
+    mudd_compile: bool = False
+    # The route always follows the PrePostDANorm contract; this only selects whether
+    # the router's own input norm carries a learnable scale. The reference
+    # implementation's best-validated configuration runs it affine-free.
+    mudd_router_norm_affine: bool = False
+    # Read the route endpoints through a device pointer table instead of copying them into a
+    # contiguous stack first: the kernel body is unchanged, only the addressing is, and
+    # non-contiguous endpoints fall back to the stacked path on their own. The table is staged
+    # per call and copied synchronously, so no buffer is ever rewritten while a copy is in
+    # flight.
+    #
+    # On the 9B doc configuration it is worth -2.4%/-3.7% step time and -2.08 GB/GPU (MUDD with
+    # and without MTP), with the 50-step loss curve inside 0.012% -- which is why the 9B recipe
+    # turns it on. On the 2B ConceptLM the same route measures +19%..+22% instead (a step there
+    # is only 0.82 s, so per-call staging costs more than the stack fill it removes), so the
+    # ConceptLM recipe leaves it off; the library default stays off for the same reason.
+    # See ``dev_notes/features/MUDD/mudd_scatter_acceptance_2026-09-23.md``.
+    mudd_route_scatter: bool = False
 
     @computed_field
     def layers_type(self) -> list[Literal["full_attention", "linear_attention"]]:
@@ -136,6 +160,54 @@ class Qwen3_5_VLTextDense9BConfig(Qwen3_5_VLTextDenseConfig):
     )
     linear_attention: GatedDeltaNetConfig = GatedDeltaNetConfig(
         num_value_heads=32,
+        num_key_heads=16,
+        key_head_dim=128,
+        value_head_dim=128,
+        conv_kernel_dim=4,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+    )
+    rope_parameters_cfg: RopeParametersConfig = Field(
+        default_factory=lambda: RopeParametersConfig(
+            rope_theta=10000000.0,
+            rope_type="qwen3_vl",
+            mrope_section=[11, 11, 10],
+            partial_rotary_factor=0.25,
+        )
+    )
+
+
+class Qwen3_5_VLTextDense2BConfig(Qwen3_5_VLTextDenseConfig):
+    """Qwen3.5-2B text-tower configuration.
+
+    Mirrors ``Qwen/Qwen3.5-2B-Base`` ``text_config``: 24 hybrid layers
+    (``linear_attention`` x3 + ``full_attention``, ``full_attention_interval=4``),
+    hidden size 2048, 8 query / 2 KV heads with head dim 256, tied embeddings and
+    16 GatedDeltaNet key/value heads.  The layer stack is the same shape the
+    reference ConceptLM recipe uses for its encoder / predictor / decoder stages.
+    """
+
+    vocab_size: int = 248320
+    max_position_embeddings: int = 262144
+    pad_token_id: int | None = None
+    eos_token_id: int = 248044
+    num_hidden_layers: int = 24
+    hidden_size: int = 2048
+    intermediate_size: int = 6144
+    rms_norm_eps: float = 1e-6
+    hidden_act: str = "silu"
+    tie_word_embeddings: bool = True
+    attention: MHAConfig = MHAConfig(
+        with_gate=True,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=256,
+        qk_norm=True,
+        rms_norm_eps=1e-6,
+        rms_norm_type="zero_centered",
+    )
+    linear_attention: GatedDeltaNetConfig = GatedDeltaNetConfig(
+        num_value_heads=16,
         num_key_heads=16,
         key_head_dim=128,
         value_head_dim=128,

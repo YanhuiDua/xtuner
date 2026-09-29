@@ -398,6 +398,32 @@ class TestMuonSingleGPU(DeterministicDDPTestCase):
                 msg=f"mismatch on '{name}': max_abs={abs_diff.max().item():.2e}, max_rel={rel_diff.max().item():.2e}",
             )
 
+    def test_muon_step_runs_with_epsilon_as_a_plain_scalar(self):
+        """One production Muon step must not depend on epsilon's device.
+
+        Regression: the batched update path builds epsilon as a zero-dim CPU tensor, and
+        Newton-Schulz compares it with ``clamp_min``, which requires both operands on the
+        same device. Every Muon run died here on its first optimizer step. This test does
+        not compare against ``ReferenceMuon`` -- that reference still normalizes in the
+        pre-384d4d1f order, which is a separate disagreement -- it only pins that the step
+        completes and really updates the parameters.
+        """
+        self.create_pg("cuda")
+
+        config = ToyMoEModelConfig(compile_cfg=False)
+        model = config.build().to("cuda")
+        model.fully_shard(FSDPConfig(param_dtype=torch.float32, reduce_dtype=torch.float32, torch_compile=False))
+
+        optimizer = MuonConfig(lr=0.01, momentum=0.95, weight_decay=0.01, eps=1e-8, betas=(0.9, 0.95)).build(model)
+        before = {name: p.detach().clone() for name, p in model.named_parameters()}
+
+        loss = model(torch.randint(0, config.vocab_size, (2, 8), device="cuda"))
+        loss.backward()
+        optimizer.step()
+
+        moved = [name for name, p in model.named_parameters() if not torch.equal(p.detach(), before[name])]
+        assert moved, "the Muon step left every parameter unchanged"
+
     @parametrize.parametrize("clip_grad_mode", ["all", "adamw_only"])
     def test_clip_grad_norm_respects_config(self, clip_grad_mode: Literal["all", "adamw_only"]):
         self.create_pg("cuda")

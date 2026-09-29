@@ -16,16 +16,37 @@ export RECOMPUTE_RATIO="${RECOMPUTE_RATIO:-0}"
 export RESHARD_AFTER_FORWARD="${RESHARD_AFTER_FORWARD:-0}"
 export FSDP_GRAD_ACCUMULATION_NO_SYNC="${FSDP_GRAD_ACCUMULATION_NO_SYNC:-1}"
 export MUDD_ENABLED="${MUDD_ENABLED:-0}"
+export MUDD_ROUTE_KERNEL="${MUDD_ROUTE_KERNEL:-1}"
+export MUDD_COMPILE="${MUDD_COMPILE:-0}"
+export MUDD_ROUTER_NORM_AFFINE="${MUDD_ROUTER_NORM_AFFINE:-0}"
+export MUDD_ROUTE_SCATTER="${MUDD_ROUTE_SCATTER:-1}"
 export MTP_ENABLED="${MTP_ENABLED:-1}"
 export OPTIMIZER="${OPTIMIZER:-muon}"
 export MODEL_COMPILE="${MODEL_COMPILE:-1}"
 export LOSS_MODE="${LOSS_MODE:-chunk}"
 export LOSS_REDUCTION="${LOSS_REDUCTION:-square}"
-export LOSS_CHUNK_SIZE="${LOSS_CHUNK_SIZE:-4096}"
+# 4096 pushes the MUDD+MTP leg to ~127 GB, where the caching allocator starts
+# returning blocks to the driver inside the chunked-loss backward: 43 synchronous
+# cudaFree calls (~245 ms) per step. 2048 removes that storm entirely -- the leg
+# drops from 3.094 s to 2.776 s (-10.3%) and every configuration saves ~5.7 GB --
+# while the non-MUDD legs stay within 1.2%.
+export LOSS_CHUNK_SIZE="${LOSS_CHUNK_SIZE:-2048}"
 export MUON_ENABLE_ALL2ALL="${MUON_ENABLE_ALL2ALL:-1}"
 export MUON_ADAMW_FOREACH="${MUON_ADAMW_FOREACH:-1}"
 export XTUNER_MUON_USE_TRITON="${XTUNER_MUON_USE_TRITON:-1}"
+# The vendored Triton kernel fuses the fp32 mean, scale and cast that the native
+# zero-centered RMSNorm materializes as separate tensors; MUDD amplifies the win
+# because it normalizes the routed Q/K/V streams once per layer. The selector still
+# honours XTUNER_HF_IMPL=true, and setting this variable to 1 restores native.
+export XTUNER_USE_NATIVE_RMSNORM="${XTUNER_USE_NATIVE_RMSNORM:-0}"
 export XTUNER_USE_FA3=1
+
+# Reuse the compile caches across runs. Measured on the 2B ConceptLM recipe this
+# cuts the first step by ~81% without changing steady-state step time.
+export QWEN35_CACHE_ROOT="${QWEN35_CACHE_ROOT:-/tmp/qwen3p5_9b_compile_cache}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$QWEN35_CACHE_ROOT/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$QWEN35_CACHE_ROOT/triton}"
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 
 if [[ "$DATA_FORMAT" == "jsonl" ]]; then
     export DATA_PATH="${DATA_PATH:-$WORK_DIR/data/synthetic.jsonl}"
@@ -48,7 +69,11 @@ else
 fi
 
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# expandable_segments returns the route's multi-GiB combine buffers to the driver
+# between steps and re-maps them on the next use; that mapping stalls the caller long
+# enough to miss the next layer's FSDP all-gather and costs ~2.8x step time on the
+# MUDD+MTP configuration (measured on 8xH200). See dev_notes/features/MUDD.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
