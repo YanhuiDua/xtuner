@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import torch
 
+
 _fused_rms_norm_gated_import_error: BaseException | None = None
 FusedRMSNormGated = None  # type: ignore[assignment,misc]
 has_fused_rms_norm_gated = False

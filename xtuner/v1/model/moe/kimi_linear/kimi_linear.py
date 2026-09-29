@@ -58,9 +58,7 @@ class KimiLinear(MoE):
             self.output_attn_res_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
             self.output_attn_res_proj = build_linear(self.config.hidden_size, 1, bias=False)
 
-    def _apply_output_attn_res(
-        self, hidden_states: torch.Tensor, block_residual: torch.Tensor | None
-    ) -> torch.Tensor:
+    def _apply_output_attn_res(self, hidden_states: torch.Tensor, block_residual: torch.Tensor | None) -> torch.Tensor:
         if block_residual is None or self.config.attn_res_block_size is None:
             return hidden_states
         batch_size, seq_len, hidden_size = hidden_states.shape
@@ -110,10 +108,7 @@ class KimiLinear(MoE):
             block_residual = None
 
         offload_tensors: list[torch.Tensor] = []
-        if (
-            int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1
-            and layer_idx >= self.config.first_k_dense_replace
-        ):
+        if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1 and layer_idx >= self.config.first_k_dense_replace:
             offload_tensors = list(hidden_states) if isinstance(hidden_states, list) else [hidden_states]
 
         offload_block_idx = sum(
@@ -151,9 +146,7 @@ class KimiLinear(MoE):
                 br_list = list(block_residual)
             else:
                 br_list = [block_residual] * len(hidden_states)
-            return [
-                self._apply_output_attn_res(hs, br) for hs, br in zip(hidden_states, br_list)
-            ]
+            return [self._apply_output_attn_res(hs, br) for hs, br in zip(hidden_states, br_list)]
 
         assert block_residual is None or isinstance(block_residual, torch.Tensor)
         return self._apply_output_attn_res(hidden_states, block_residual)
@@ -277,9 +270,7 @@ class KimiLinearConfig(MoEConfig):
     routed_expert_hidden_size: int | None = None
     latent_moe_use_norm: bool = False
     attn_res_block_size: int | None = None
-    moe_act_fn_cfg: MoEActFnConfig = MoEActFnConfig(
-        act_type="situ", situ_beta=4.0, situ_linear_beta=25.0
-    )
+    moe_act_fn_cfg: MoEActFnConfig = MoEActFnConfig(act_type="situ", situ_beta=4.0, situ_linear_beta=25.0)
 
     def build(self) -> KimiLinear:
         return KimiLinear(self)
@@ -288,11 +279,7 @@ class KimiLinearConfig(MoEConfig):
     def layers_type(self) -> list[Literal["full_attention", "linear_attention"]]:
         # Hub Kimi-K3: full attn when 1-based index % 4 == 0, or the final layer.
         return [
-            (
-                "full_attention"
-                if (i + 1) % 4 == 0 or (i + 1) == self.num_hidden_layers
-                else "linear_attention"
-            )
+            ("full_attention" if (i + 1) % 4 == 0 or (i + 1) == self.num_hidden_layers else "linear_attention")
             for i in range(self.num_hidden_layers)
         ]
 
@@ -380,14 +367,10 @@ class KimiLinearConfig(MoEConfig):
         """Build a serializable HF config for ``save_hf`` (trust_remote_code model)."""
         from transformers import PretrainedConfig
 
-        assert isinstance(self.router, NoAuxRouterConfig), (
-            "Only support saving NoAuxRouter to HF KimiLinear format."
-        )
+        assert isinstance(self.router, NoAuxRouterConfig), "Only support saving NoAuxRouter to HF KimiLinear format."
         linear_attn = self.linear_attention
         kda_layers, full_attn_layers = _kimi_hybrid_layer_ids(self.num_hidden_layers)
-        rope_theta = (
-            self.rope_parameters_cfg.rope_theta if self.rope_parameters_cfg is not None else 10000.0
-        )
+        rope_theta = self.rope_parameters_cfg.rope_theta if self.rope_parameters_cfg is not None else 10000.0
         return PretrainedConfig(
             model_type="kimi_linear",
             architectures=["KimiLinearForCausalLM"],
@@ -495,9 +478,7 @@ class KimiLinearTinyConfig(KimiLinearConfig):
         topk_group=1,
     )
     moe_act_fn_cfg: MoEActFnConfig = MoEActFnConfig(act_type="situ", situ_beta=4.0, situ_linear_beta=25.0)
-    rope_parameters_cfg: RopeParametersConfig = Field(
-        default_factory=lambda: RopeParametersConfig(rope_theta=10000.0)
-    )
+    rope_parameters_cfg: RopeParametersConfig = Field(default_factory=lambda: RopeParametersConfig(rope_theta=10000.0))
     balancing_loss_cfg: BalancingLossConfig | None = None
     tie_word_embeddings: bool = False
 
@@ -549,6 +530,4 @@ class KimiLinearK3TextConfig(KimiLinearConfig):
         topk_group=1,
     )
     moe_act_fn_cfg: MoEActFnConfig = MoEActFnConfig(act_type="situ", situ_beta=4.0, situ_linear_beta=25.0)
-    rope_parameters_cfg: RopeParametersConfig = Field(
-        default_factory=lambda: RopeParametersConfig(rope_theta=10000.0)
-    )
+    rope_parameters_cfg: RopeParametersConfig = Field(default_factory=lambda: RopeParametersConfig(rope_theta=10000.0))
