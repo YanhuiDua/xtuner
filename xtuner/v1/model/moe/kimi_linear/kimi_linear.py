@@ -48,7 +48,7 @@ class KimiLinear(MoE):
     dense_decoder_layer_cls = KimiDenseDecoderLayer
     moe_decoder_layer_cls = KimiMoEDecoderLayer
 
-    def __init__(self, config: "KimiLinearConfig"):
+    def __init__(self, config: KimiLinearConfig):
         super().__init__(config)
         self.config: KimiLinearConfig
 
@@ -92,6 +92,8 @@ class KimiLinear(MoE):
             | DenseDecoderLayerMicroBatchOutput
             | MoEDecoderLayerOutput
             | MoEDecoderLayerMicroBatchOutput
+            | torch.Tensor
+            | tuple[torch.Tensor, ...]
             | None
         ),
     ) -> (
@@ -100,7 +102,11 @@ class KimiLinear(MoE):
         | MoEDecoderLayerOutput
         | MoEDecoderLayerMicroBatchOutput
     ):
-        if previous_layer_results is not None and "block_residual" in previous_layer_results:
+        if (
+            previous_layer_results is not None
+            and not isinstance(previous_layer_results, (torch.Tensor, tuple))
+            and "block_residual" in previous_layer_results
+        ):
             block_residual = previous_layer_results["block_residual"]  # type: ignore[typeddict-item]
         elif self.config.attn_res_block_size is not None:
             block_residual = self._seed_block_residual(hidden_states)

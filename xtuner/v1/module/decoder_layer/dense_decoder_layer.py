@@ -1,4 +1,3 @@
-from functools import partial
 from typing import Literal, TypedDict, cast
 
 import torch

@@ -159,7 +159,7 @@ class KDAConfig(BaseModel):
         float8_cfg: Float8Config | None = None,
         layer_idx: int = 0,
         **kwargs: Any,
-    ) -> "KimiDeltaAttention":
+    ) -> KimiDeltaAttention:
         return KimiDeltaAttention(
             **self.model_dump(),
             hidden_size=hidden_size,
