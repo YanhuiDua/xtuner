@@ -52,9 +52,45 @@ def _all_to_all_out(x, scatter_dim, gather_dim, mesh):
 
 
 _fla_kda_import_error: BaseException | None = None
-chunk_kda = None  # type: ignore[assignment]
-KDAShortConvolution = None  # type: ignore[assignment,misc]
 _fla_causal_conv1d = None  # type: ignore[assignment]
+
+
+def _unavailable_chunk_kda(*args: Any, **kwargs: Any) -> tuple[Any, Any]:
+    del args, kwargs
+    raise RuntimeError("Please run `pip install -U fla-core`")
+
+
+chunk_kda = _unavailable_chunk_kda
+
+
+class KDAShortConvolution(nn.Module):
+    """Typed stand-in; the ``try`` block replaces it with the FLA subclass."""
+
+    weight: nn.Parameter
+    bias: nn.Parameter | None
+    activation: str
+
+    def __init__(self, hidden_size: int, kernel_size: int, activation: str = "silu", **kwargs: Any) -> None:
+        super().__init__()
+        del hidden_size, kernel_size, kwargs
+        self.activation = activation
+
+    def materialize_weight_bias(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        raise RuntimeError("Please run `pip install -U fla-core`")
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        weight: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        del x, cache, output_final_state, cu_seqlens, weight, bias, kwargs
+        raise RuntimeError("Please run `pip install -U fla-core`")
+
 
 try:
     from fla.modules import ShortConvolution as FLAShortConvolution

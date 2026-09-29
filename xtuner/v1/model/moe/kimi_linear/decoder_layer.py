@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Protocol
+from typing import Callable, Protocol, cast
 
 import torch
 import torch.nn as nn
@@ -59,7 +59,9 @@ class _AttnResLayer(Protocol):
     mlp_res_norm: RMSNorm
     input_layernorm: RMSNorm
     post_attention_layernorm: RMSNorm
-    self_attn: nn.Module
+
+    @property
+    def self_attn(self) -> nn.Module: ...
 
 
 def run_attn_res_forward(
@@ -156,8 +158,8 @@ class KimiDenseDecoderLayer(DenseDecoderLayer):
             hs = self.hidden_size
             self.self_attention_res_norm = RMSNorm(hs, eps=eps)
             self.mlp_res_norm = RMSNorm(hs, eps=eps)
-            self.self_attention_res_proj = build_linear(hs, 1, bias=False)
-            self.mlp_res_proj = build_linear(hs, 1, bias=False)
+            self.self_attention_res_proj = cast(nn.Linear, build_linear(hs, 1, bias=False))
+            self.mlp_res_proj = cast(nn.Linear, build_linear(hs, 1, bias=False))
 
     @override
     def forward(  # type: ignore[override]
@@ -236,8 +238,8 @@ class KimiMoEDecoderLayer(MoEDecoderLayer):
             hs = self.hidden_size
             self.self_attention_res_norm = RMSNorm(hs, eps=eps)
             self.mlp_res_norm = RMSNorm(hs, eps=eps)
-            self.self_attention_res_proj = build_linear(hs, 1, bias=False)
-            self.mlp_res_proj = build_linear(hs, 1, bias=False)
+            self.self_attention_res_proj = cast(nn.Linear, build_linear(hs, 1, bias=False))
+            self.mlp_res_proj = cast(nn.Linear, build_linear(hs, 1, bias=False))
 
     @override
     def forward(  # type: ignore[override]
@@ -311,11 +313,14 @@ class KimiMoEDecoderLayer(MoEDecoderLayer):
             block_residual=block_residual,
             ffn_fn=_moe_ffn,
         )
-        return {
-            "hidden_states": prefix_sum,
-            "block_residual": block_residual,
-            **extras,
-        }
+        return cast(
+            KimiMoEDecoderLayerOutput,
+            {
+                "hidden_states": prefix_sum,
+                "block_residual": block_residual,
+                **extras,
+            },
+        )
 
     def _forward_moe_body(
         self,

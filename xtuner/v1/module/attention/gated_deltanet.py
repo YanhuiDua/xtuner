@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from cyclopts import Parameter
 from pydantic import BaseModel, ConfigDict
 from torch import nn
+from torch.distributed.tensor import DTensor
 from typing_extensions import overload
 
 from xtuner.v1.data_proto import SequenceContext

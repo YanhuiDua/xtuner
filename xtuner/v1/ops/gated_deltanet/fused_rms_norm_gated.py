@@ -4,11 +4,43 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 
 
 _fused_rms_norm_gated_import_error: BaseException | None = None
-FusedRMSNormGated = None  # type: ignore[assignment,misc]
 has_fused_rms_norm_gated = False
+
+
+class FusedRMSNormGated(nn.Module):
+    """Typed stand-in used when ``fla`` is not installed.
+
+    The ``try`` block below replaces this class with the FLA subclass. Keeping a
+    real class here lets mypy treat the name as callable and as an ``isinstance``
+    target; assigning ``None`` made every later attribute in ``__init__`` untyped.
+    """
+
+    weight: nn.Parameter
+    bias: nn.Parameter | None
+    eps: float
+    activation: str
+
+    def __init__(self, hidden_size: int, eps: float = 1e-5, activation: str = "silu") -> None:
+        super().__init__()
+        del hidden_size
+        self.eps = eps
+        self.activation = activation
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        g: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        prenorm: bool = False,
+        residual_in_fp32: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        del x, g, residual, prenorm, residual_in_fp32
+        raise RuntimeError("Please install fla (`pip install -U fla-core`)")
+
 
 try:
     from fla.modules import FusedRMSNormGated as FLA_FusedRMSNormGated

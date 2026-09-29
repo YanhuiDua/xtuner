@@ -56,7 +56,7 @@ class KimiLinear(MoE):
     def _configure_model_specific_layers(self) -> None:
         if self.config.attn_res_block_size is not None:
             self.output_attn_res_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-            self.output_attn_res_proj = build_linear(self.config.hidden_size, 1, bias=False)
+            self.output_attn_res_proj = cast(nn.Linear, build_linear(self.config.hidden_size, 1, bias=False))
 
     def _apply_output_attn_res(self, hidden_states: torch.Tensor, block_residual: torch.Tensor | None) -> torch.Tensor:
         if block_residual is None or self.config.attn_res_block_size is None:
@@ -101,7 +101,7 @@ class KimiLinear(MoE):
         | MoEDecoderLayerMicroBatchOutput
     ):
         if previous_layer_results is not None and "block_residual" in previous_layer_results:
-            block_residual = previous_layer_results["block_residual"]  # type: ignore[index]
+            block_residual = previous_layer_results["block_residual"]  # type: ignore[typeddict-item]
         elif self.config.attn_res_block_size is not None:
             block_residual = self._seed_block_residual(hidden_states)
         else:
@@ -136,7 +136,7 @@ class KimiLinear(MoE):
     ) -> torch.Tensor | list[torch.Tensor]:
         block_residual = None
         if previous_layer_results is not None and "block_residual" in previous_layer_results:
-            block_residual = previous_layer_results["block_residual"]  # type: ignore[index]
+            block_residual = previous_layer_results["block_residual"]  # type: ignore[typeddict-item]
 
         if isinstance(hidden_states, list):
             br_list: list[torch.Tensor | None]
@@ -164,11 +164,9 @@ class KimiLinear(MoE):
             else:
                 raise ValueError(f"Unsupported layer type {config.layers_type[layer_idx]}")
 
-            common_kimi = dict(
-                situ_beta=config.activation_situ_beta or 1.0,
-                situ_linear_beta=config.activation_situ_linear_beta,
-                attn_res_block_size=config.attn_res_block_size,
-            )
+            situ_beta = config.activation_situ_beta or 1.0
+            situ_linear_beta = config.activation_situ_linear_beta
+            attn_res_block_size = config.attn_res_block_size
             if layer_idx < config.first_k_dense_replace:
                 layers[str(layer_idx)] = self.dense_decoder_layer_cls(
                     hidden_size=config.hidden_size,
@@ -183,7 +181,9 @@ class KimiLinear(MoE):
                     generate_config=config.generate_config,
                     float8_cfg=config.float8_cfg,
                     layer_idx=layer_idx,
-                    **common_kimi,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                    attn_res_block_size=attn_res_block_size,
                 )
             else:
                 layers[str(layer_idx)] = self.moe_decoder_layer_cls(
@@ -218,7 +218,9 @@ class KimiLinear(MoE):
                     ep_tp_mesh=self.ep_tp_mesh,
                     routed_expert_hidden_size=config.routed_expert_hidden_size,
                     latent_moe_use_norm=config.latent_moe_use_norm,
-                    **common_kimi,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                    attn_res_block_size=attn_res_block_size,
                 )
         from xtuner.v1.model.utils import module_dict_repr
 
