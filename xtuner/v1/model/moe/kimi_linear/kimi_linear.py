@@ -38,7 +38,8 @@ from .decoder_layer import (
 
 
 def _kimi_hybrid_layer_ids(num_hidden_layers: int) -> tuple[list[int], list[int]]:
-    """Hub schedule (1-based): 3×KDA + 1×MLA repeating; last layer always MLA."""
+    """Hub schedule (1-based): 3×KDA + 1×MLA repeating; last layer always
+    MLA."""
     kda = [i for i in range(1, num_hidden_layers + 1) if i % 4 != 0 and i != num_hidden_layers]
     full = [i for i in range(1, num_hidden_layers + 1) if i not in set(kda)]
     return kda, full
@@ -372,7 +373,8 @@ class KimiLinearConfig(MoEConfig):
 
     @property
     def hf_config(self):
-        """Build a serializable HF config for ``save_hf`` (trust_remote_code model)."""
+        """Build a serializable HF config for ``save_hf`` (trust_remote_code
+        model)."""
         from transformers import PretrainedConfig
 
         assert isinstance(self.router, NoAuxRouterConfig), "Only support saving NoAuxRouter to HF KimiLinear format."
@@ -493,7 +495,8 @@ class KimiLinearTinyConfig(KimiLinearConfig):
 
 # text tower的配置（完整模型2.8T）
 class KimiLinearK3TextConfig(KimiLinearConfig):
-    """Published Kimi-K3 text-tower dimensions (structure only; weights separate)."""
+    """Published Kimi-K3 text-tower dimensions (structure only; weights
+    separate)."""
 
     vocab_size: int = 163840
     max_position_embeddings: int = 1048576

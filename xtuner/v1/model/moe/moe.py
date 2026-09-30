@@ -1102,7 +1102,8 @@ class MoE(BaseModel):
             | None
         ),
     ) -> torch.Tensor | list[torch.Tensor]:
-        """Null hook after the decoder loop (subclasses may mix cross-layer state)."""
+        """Null hook after the decoder loop (subclasses may mix cross-layer
+        state)."""
         del previous_layer_results
         return hidden_states
 

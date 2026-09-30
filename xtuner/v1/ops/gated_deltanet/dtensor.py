@@ -20,7 +20,8 @@ def materialize_depthwise_conv1d_weight_bias(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Gather FSDP weights and rearrange Conv1d ``(D, 1, W)`` → ``(D, W)`` for FLA kernels."""
+    """Gather FSDP weights and rearrange Conv1d ``(D, 1, W)`` → ``(D, W)`` for
+    FLA kernels."""
     w = dtensor_full_tensor(weight)
     b = None if bias is None else dtensor_full_tensor(bias)
     return rearrange(w, "d 1 w -> d w"), b

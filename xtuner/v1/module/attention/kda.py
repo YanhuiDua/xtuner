@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-"""Kimi Delta Attention (KDA) — distinct from Qwen3.5 GatedDeltaNet weight layout."""
+"""Kimi Delta Attention (KDA) — distinct from Qwen3.5 GatedDeltaNet weight
+layout."""
 
 from __future__ import annotations
 
@@ -103,7 +104,8 @@ try:
     _fla_causal_conv1d = _fla_causal_conv1d_impl
 
     class KDAShortConvolution(FLAShortConvolution):  # type: ignore[no-redef]
-        """HF ``ShortConvolution``; always routes through FLA ``causal_conv1d``."""
+        """HF ``ShortConvolution``; always routes through FLA
+        ``causal_conv1d``."""
 
         def materialize_weight_bias(self) -> tuple[torch.Tensor, torch.Tensor | None]:
             return materialize_depthwise_conv1d_weight_bias(self.weight, self.bias)
@@ -169,7 +171,8 @@ class KDAConfig(BaseModel):
 
 
 class KimiDeltaAttention(nn.Module):
-    """Kimi Delta Attention matching HF `KimiDeltaAttention` parameter names."""
+    """Kimi Delta Attention matching HF `KimiDeltaAttention` parameter
+    names."""
 
     def __init__(
         self,
@@ -265,7 +268,8 @@ class KimiDeltaAttention(nn.Module):
         sp_size: int,
         cu_seqlens: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Gather full sequence / shard channels, run the same short-conv entry as non-SP."""
+        """Gather full sequence / shard channels, run the same short-conv entry
+        as non-SP."""
         # (B, L/sp, C) -> (B, C, L/sp) -> all_to_all -> (B, C/sp, L) -> (B, L, C/sp)
         x = x_local.transpose(1, 2)
         x = all_to_all_fn(x, scatter_dim=1, gather_dim=2, mesh=sp_mesh)
@@ -291,7 +295,8 @@ class KimiDeltaAttention(nn.Module):
         hidden_states: torch.Tensor,
         seq_ctx: SequenceContext,
     ) -> AttnOutputs:
-        """Sequence-parallel KDA aligned with GatedDeltaNet ``forward_for_sp``."""
+        """Sequence-parallel KDA aligned with GatedDeltaNet
+        ``forward_for_sp``."""
         batch_size, seq_len, _ = hidden_states.shape
         assert batch_size == 1, "KDA currently supports packed batch size 1"
         assert seq_ctx.sequence_parallel_mesh is not None, "sequence_parallel_mesh is required for forward_for_sp"
