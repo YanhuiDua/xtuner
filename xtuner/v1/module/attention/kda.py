@@ -250,7 +250,7 @@ class KimiDeltaAttention(nn.Module):
             # inverse_softplus(LogUniform[0.001, 0.1])
             log_low = torch.log(torch.tensor(0.001, device=param.device, dtype=param.dtype))
             log_high = torch.log(torch.tensor(0.1, device=param.device, dtype=param.dtype))
-            dt = torch.empty_like(param).uniform_(log_low, log_high).exp()
+            dt = torch.empty_like(param).uniform_(log_low.item(), log_high.item()).exp()
             param.copy_(dt + torch.log(-torch.expm1(-dt)))
 
         init_params(self.A_log, init_a_log)
