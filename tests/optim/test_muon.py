@@ -26,7 +26,13 @@ from xtuner.v1.config.optim import MuonConfig
 from xtuner.v1.engine.train_engine import TrainEngine
 from xtuner.v1.model.base import BaseModel, XTunerBaseModelConfig
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseMLP
-from xtuner.v1.optim.muon import Muon, _muonsplit_newton_schulz, zeropower_via_newtonschulz5
+from xtuner.v1.optim.muon import (
+    Muon,
+    _get_muon_lr_ratio,
+    _muon_qkv_newton_schulz,
+    _muonsplit_newton_schulz,
+    zeropower_via_newtonschulz5,
+)
 
 
 # ─── Test: Newton-Schulz functions ───────────────────────────────────────────
@@ -86,6 +92,47 @@ class TestNewtonSchulz(DeterministicDDPTestCase):
         expected = torch.cat(expected_chunks)
 
         torch.testing.assert_close(result, expected)
+
+
+def test_lr_ratio_modes():
+    assert _get_muon_lr_ratio(4096, 4096, "spectral_norm") == 1
+    assert _get_muon_lr_ratio(22016, 4096, "spectral_norm") == math.sqrt(22016 / 4096)
+    assert _get_muon_lr_ratio(4096, 11008, "spectral_norm") == math.sqrt(4096 / 11008)
+    assert _get_muon_lr_ratio(4096, 4096, "rms_norm") == 0.2 * 64
+    assert _get_muon_lr_ratio(4096, 4096, "rms_norm", extra_scale_factor=1) == 64
+    assert _get_muon_lr_ratio(22016, 4096, "rms_norm", extra_scale_factor=1) == math.sqrt(22016)
+    assert _get_muon_lr_ratio(4096, 11008, "rms_norm", extra_scale_factor=1) == math.sqrt(11008)
+
+
+def test_qkv_split_gathers_before_orthogonalize():
+    """Head-interleaved Q/K/V are gathered, then scaled on the gathered shape."""
+    seen: list[tuple[int, int]] = []
+
+    def identity(matrix, epsilon, num_experts):
+        assert num_experts == 1
+        seen.append(tuple(matrix.shape))
+        return matrix.clone()
+
+    groups, head_dim, hidden = 2, 2, 4
+    rows = groups * 3 * head_dim
+    source = torch.arange(rows * hidden, dtype=torch.float32).reshape(rows, hidden)
+    result = _muon_qkv_newton_schulz(
+        source,
+        epsilon=1e-7,
+        num_experts=1,
+        newton_schulz_func=identity,
+        qkv_split_shapes=(head_dim, head_dim, head_dim),
+        adjust_lr="rms_norm",
+        extra_scale_factor=1,
+    )
+
+    gathered_rows = groups * head_dim
+    assert seen == [(gathered_rows, hidden)] * 3
+    scale = math.sqrt(max(gathered_rows, hidden))
+    grouped = source.view(groups, 3 * head_dim, hidden)
+    parts = [part.reshape(gathered_rows, hidden) * scale for part in grouped.split((head_dim, head_dim, head_dim), dim=1)]
+    expected = torch.cat([part.view(groups, head_dim, hidden) for part in parts], dim=1).reshape(rows, hidden)
+    torch.testing.assert_close(result, expected)
 
 
 # ─── Model for end-to-end tests ──────────────────────────────────────────────

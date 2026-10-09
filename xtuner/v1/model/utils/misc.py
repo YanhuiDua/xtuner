@@ -111,10 +111,14 @@ class ModelForwardExtraLogInfo(dict):
         )
         max_keys = ("max_ratio", "reduced_train_policy_ratio_max")
         min_keys = ("reduced_train_policy_ratio_min",)
+        mean_keys = ("vq_loss", "hlm_loss", "ncp_loss")
         for keys, op in ((sum_keys, "sum"), (max_keys, "max"), (min_keys, "min")):
             for key in keys:
                 if key in self:
                     return_dict[key] = self._reduce_tensor(self[key], op).item()
+        for key in mean_keys:
+            if key in self:
+                return_dict[key] = self[key].float().mean().item()
         return return_dict
 
 

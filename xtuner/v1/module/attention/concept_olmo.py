@@ -89,6 +89,16 @@ class ConceptOlmoAttention(nn.Module):
         self.reference_sdpa = os.getenv("XTUNER_HF_IMPL") == "true"
         self.attn_impl_func: Callable[..., AttnOpOutputs] = get_attn_impl_fn(attn_impl)  # type: ignore[assignment]
 
+    def get_muon_qkv_split_shapes(self) -> dict[nn.Parameter, tuple[int, int, int]]:
+        """Per-head Q, K, V row sizes for Megatron Muon.
+
+        Rows repeat ``(head_dim, head_dim, head_dim)`` once per head. The optimizer
+        gathers every head's Q into one matrix before Newton-Schulz, and does the
+        same for K and V.
+        """
+        head_dim = self.head_dim
+        return {self.linear_qkv.weight: (head_dim, head_dim, head_dim)}  # type: ignore[dict-item]
+
     def _reference_attention(
         self,
         query_states: torch.Tensor,

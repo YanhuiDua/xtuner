@@ -36,6 +36,14 @@ class AdamWConfig(OptimConfig):
     weight_decay: Annotated[float, Parameter(help="Weight decay coefficient for L2 regularization")] = 0.01
     betas: Annotated[Tuple[float, float], Parameter(help="Beta coefficients for Adam optimizer")] = (0.9, 0.95)
     eps: Annotated[float, Parameter(help="Epsilon value for numerical stability in Adam optimizer")] = 1e-8
+    embedding_weight_decay: Annotated[
+        Optional[float],
+        Parameter(help="Weight decay for embedding parameters. None uses weight_decay."),
+    ] = None
+    one_d_weight_decay: Annotated[
+        Optional[float],
+        Parameter(help="Weight decay for 1D / bias parameters. None uses weight_decay."),
+    ] = None
     foreach: Annotated[Optional[bool], Parameter(help="Use foreach implementation for AdamW")] = None
     fused: Annotated[Optional[bool], Parameter(help="Use fused implementation for AdamW")] = None
     local_dtensor_step: Annotated[
@@ -66,6 +74,47 @@ class AdamWConfig(OptimConfig):
                 f"Total trainable parameters: {num_total_requires_grad / 1e6:.2f}M, total parameters: {num_total / 1e6:.2f}M"
             )
             logger.info(f"Untrainable parameters names: {untrainable_names}")
+        if self.embedding_weight_decay is not None or self.one_d_weight_decay is not None:
+            if self.swap_optimizer or self.local_dtensor_step:
+                raise ValueError(
+                    "embedding/1D weight decay split is not supported with swap_optimizer or local_dtensor_step"
+                )
+            embed_wd = self.weight_decay if self.embedding_weight_decay is None else self.embedding_weight_decay
+            one_d_wd = self.weight_decay if self.one_d_weight_decay is None else self.one_d_weight_decay
+            decay_params, embed_params, one_d_params = [], [], []
+            for name, param in model.named_parameters():
+                if name not in trainable_names:
+                    continue
+                is_embed = "embed_tokens" in name or name.endswith("embeddings.weight")
+                is_1d = param.ndim < 2 or param.numel() in param.shape
+                if is_embed:
+                    embed_params.append(param)
+                elif is_1d:
+                    one_d_params.append(param)
+                else:
+                    decay_params.append(param)
+            if dist.get_rank() == 0:
+                logger.info(
+                    "AdamW groups: "
+                    f"decay={sum(param.numel() for param in decay_params)} wd={self.weight_decay}, "
+                    f"embed={sum(param.numel() for param in embed_params)} wd={embed_wd}, "
+                    f"one_d={sum(param.numel() for param in one_d_params)} wd={one_d_wd}"
+                )
+            param_groups = []
+            if decay_params:
+                param_groups.append({"params": decay_params, "weight_decay": self.weight_decay})
+            if embed_params:
+                param_groups.append({"params": embed_params, "weight_decay": embed_wd})
+            if one_d_params:
+                param_groups.append({"params": one_d_params, "weight_decay": one_d_wd})
+            return torch.optim.AdamW(
+                param_groups,
+                lr=self.lr,
+                betas=self.betas,
+                eps=self.eps,
+                foreach=self.foreach,
+                fused=self.fused,
+            )
         if self.swap_optimizer:
             if self.fused:
                 raise ValueError("fused AdamW is not supported together with optimizer-state swapping")
@@ -99,6 +148,10 @@ class MuonConfig(OptimConfig):
     adjust_lr: Annotated[
         Literal["rms_norm", "spectral_norm", "none"], Parameter(help="Method for adjusting lr in Muon")
     ] = "rms_norm"
+    extra_scale_factor: Annotated[
+        float,
+        Parameter(help="Multiplier for rms_norm. 0.2 is the historical rms ratio; 1 matches Megatron spectral."),
+    ] = 0.2
     enable_all2all: Annotated[
         bool, Parameter(help="Allow all-to-all comm strategy; set False on topologies where all-to-all is unreliable")
     ] = True
@@ -109,16 +162,29 @@ class MuonConfig(OptimConfig):
     adamw_foreach: Annotated[
         bool, Parameter(help="Use foreach updates for parameters handled by Muon's AdamW fallback")
     ] = True
+    nesterov: Annotated[bool, Parameter(help="Use Nesterov momentum in Muon updates")] = True
+    embedding_weight_decay: Annotated[
+        float | None,
+        Parameter(help="Weight decay for embedding parameters. None uses weight_decay."),
+    ] = None
+    one_d_weight_decay: Annotated[
+        float | None,
+        Parameter(help="Weight decay for 1D / bias parameters in the AdamW group. None uses weight_decay."),
+    ] = None
 
     def build(self, model):
         trainable_parameters_names = model.trainable_parameters()
         trainable_names = {name for name, _ in trainable_parameters_names}
 
         muon_split_sizes = {}
+        muon_qkv_split_shapes = {}
         for module in model.modules():
             get_muon_split_sizes = getattr(module, "get_muon_split_sizes", None)
             if callable(get_muon_split_sizes):
                 muon_split_sizes.update(get_muon_split_sizes())
+            get_muon_qkv_split_shapes = getattr(module, "get_muon_qkv_split_shapes", None)
+            if callable(get_muon_qkv_split_shapes):
+                muon_qkv_split_shapes.update(get_muon_qkv_split_shapes())
 
         untrainable_names = []
         num_total = 0
@@ -147,6 +213,8 @@ class MuonConfig(OptimConfig):
         muon_params_moe_fused_w1w3 = []  # num_experts = 2 * n_routed_experts
         muon_params_moe_other = []  # num_experts = n_routed_experts
         adamw_params = []
+        adamw_embed_params = []
+        adamw_1d_params = []
 
         for name, p in model.named_parameters():
             n = p.numel()
@@ -176,7 +244,14 @@ class MuonConfig(OptimConfig):
                         if dist.get_rank() == 0:
                             logger.info(f"Muon regular param: [{name}]: shape = {p.shape}")
                 else:
-                    adamw_params.append(p)
+                    is_embed = "embed_tokens" in name or name.endswith("embeddings.weight")
+                    is_1d = p.ndim < 2 or p.numel() in p.shape
+                    if self.embedding_weight_decay is not None and is_embed:
+                        adamw_embed_params.append(p)
+                    elif self.one_d_weight_decay is not None and is_1d:
+                        adamw_1d_params.append(p)
+                    else:
+                        adamw_params.append(p)
                     num_adamw += n
                     if dist.get_rank() == 0:
                         logger.info(f"AdamW param: [{name}]: shape = {p.shape}")
@@ -200,13 +275,39 @@ class MuonConfig(OptimConfig):
         # Other expert params: num_experts = n_routed_experts
         if muon_params_moe_other:
             param_groups.append(dict(params=muon_params_moe_other, num_experts=num_experts, clip_grad=clip_muon_grad))
-        param_groups.append(
-            dict(params=adamw_params, algorithm="adamw", clip_grad=True, adamw_foreach=self.adamw_foreach)
-        )
+        if adamw_embed_params:
+            param_groups.append(
+                dict(
+                    params=adamw_embed_params,
+                    algorithm="adamw",
+                    clip_grad=True,
+                    adamw_foreach=self.adamw_foreach,
+                    weight_decay=self.embedding_weight_decay,
+                )
+            )
+        if adamw_1d_params:
+            param_groups.append(
+                dict(
+                    params=adamw_1d_params,
+                    algorithm="adamw",
+                    clip_grad=True,
+                    adamw_foreach=self.adamw_foreach,
+                    weight_decay=self.one_d_weight_decay,
+                )
+            )
+        if adamw_params:
+            param_groups.append(
+                dict(params=adamw_params, algorithm="adamw", clip_grad=True, adamw_foreach=self.adamw_foreach)
+            )
 
         # Sanity check: ensure all trainable parameters are assigned to optimizer
         total_assigned = (
-            len(muon_params_regular) + len(muon_params_moe_fused_w1w3) + len(muon_params_moe_other) + len(adamw_params)
+            len(muon_params_regular)
+            + len(muon_params_moe_fused_w1w3)
+            + len(muon_params_moe_other)
+            + len(adamw_params)
+            + len(adamw_embed_params)
+            + len(adamw_1d_params)
         )
         total_trainable = len(trainable_names)
         assert total_assigned == total_trainable, (
@@ -241,13 +342,15 @@ class MuonConfig(OptimConfig):
             mu=self.momentum,
             betas=self.betas,
             weight_decay=self.weight_decay,
-            nesterov=True,
+            nesterov=self.nesterov,
             flatten=True,
             adjust_lr=self.adjust_lr,
+            extra_scale_factor=self.extra_scale_factor,
             use_triton=os.getenv("XTUNER_MUON_USE_TRITON", "0").lower() in ("1", "true", "yes", "on"),
             epsilon=self.eps,
             enable_all2all=self.enable_all2all,
             muon_split_sizes=muon_split_sizes,
+            muon_qkv_split_shapes=muon_qkv_split_shapes,
         )
 
         return optimizer

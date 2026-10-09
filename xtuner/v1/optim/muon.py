@@ -71,12 +71,13 @@ def _get_muon_lr_ratio(
     fan_out: int,
     fan_in: int,
     adjust_lr: Literal["rms_norm", "spectral_norm", "none"],
+    extra_scale_factor: float = 0.2,
 ) -> float:
     if adjust_lr == "none":
         return 1.0
     if adjust_lr == "spectral_norm":
         return math.sqrt(fan_out / fan_in)
-    return 0.2 * math.sqrt(max(fan_out, fan_in))
+    return extra_scale_factor * math.sqrt(max(fan_out, fan_in))
 
 
 def pad_batch(batch: list[Tensor], batch_size: int) -> list[Tensor]:
@@ -278,9 +279,10 @@ class Muon(Optimizer):
         epsilon (float): Small value to avoid division by zero.
         nesterov (bool): Whether to use Nesterov momentum.
         adjust_lr (str): How to adjust the learning rate for Muon updates ("spectral_norm", "rms_norm", or "none").
-            "spectral_norm": Adjust based on spectral norm, for learning rate transfer across model scale.
-            "rms_norm": Adjust based on RMS norm, for learning rate compatibility with Adam/AdamW.
+            "spectral_norm": sqrt(fan_out / fan_in). A square matrix keeps ratio 1.
+            "rms_norm": extra_scale_factor * sqrt(max(fan_out, fan_in)).
             "none": Do not adjust the learning rate.
+        extra_scale_factor (float): Multiplier for rms_norm only. Default 0.2 keeps the historical RMS ratio.
         flatten (bool): Whether to flatten 3D+ tensors to 2D for Muon updates.
             True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
@@ -295,6 +297,9 @@ class Muon(Optimizer):
             the original FSDP2 Muon behavior by zero-padding the batch to world size and using all-to-all.
         muon_split_sizes (dict[Tensor, tuple[int, ...]] | None): Logical row blocks that Muon should
             orthogonalize and scale independently. Used by GLM MuonSplit attention projections.
+        muon_qkv_split_shapes (dict[Tensor, tuple[int, int, int]] | None): Per query-group
+            ``(q_rows, k_rows, v_rows)`` for head-interleaved fused QKV. Megatron gathers every
+            group's Q into one matrix (and likewise K and V) before Newton-Schulz.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -310,12 +315,14 @@ class Muon(Optimizer):
         epsilon: float = 1e-8,
         nesterov: bool = False,
         adjust_lr: Literal["rms_norm", "spectral_norm", "none"] = "rms_norm",
+        extra_scale_factor: float = 0.2,
         flatten: bool = False,
         use_triton: bool = False,
         newton_schulz_func: Callable | None = None,
         enable_all2all: bool = True,
         remainder_strategy: Literal["agrs", "pad_all2all"] = "agrs",
         muon_split_sizes: dict[Tensor, tuple[int, ...]] | None = None,
+        muon_qkv_split_shapes: dict[Tensor, tuple[int, int, int]] | None = None,
     ):
         # Check hyperparameters
         if lr < 0.0:
@@ -344,12 +351,14 @@ class Muon(Optimizer):
             nesterov=nesterov,
             flatten=flatten,
             adjust_lr=adjust_lr,
+            extra_scale_factor=extra_scale_factor,
             num_experts=1,  # Default: no MoE expert handling
         )
         super().__init__(params, defaults)
         self._enable_all2all = enable_all2all
         self._remainder_strategy = remainder_strategy
         self._muon_split_sizes = muon_split_sizes or {}
+        self._muon_qkv_split_shapes = muon_qkv_split_shapes or {}
         self.register_state_dict_post_hook(self._remove_clip_grad_policy)
         self.register_load_state_dict_pre_hook(self._restore_clip_grad_policy)
 
@@ -361,10 +370,14 @@ class Muon(Optimizer):
             if group["algorithm"] != "muon":
                 continue
             adj = group["adjust_lr"]
+            scale = group.get("extra_scale_factor", 0.2)
             ne = group.get("num_experts", 1)
             for p in group["params"]:
                 state = self.state[p]
                 split_sizes = self._muon_split_sizes.get(p)
+                qkv_split_shapes = self._muon_qkv_split_shapes.get(p)
+                if split_sizes is not None and qkv_split_shapes is not None:
+                    raise ValueError("A parameter cannot use both MuonSplit and QKV split.")
                 if split_sizes is not None:
                     if p.ndim != 2 or ne != 1:
                         raise ValueError("MuonSplit only supports regular 2D Muon parameters.")
@@ -374,8 +387,20 @@ class Muon(Optimizer):
                         raise ValueError(f"MuonSplit sizes {split_sizes} exceed parameter shape {tuple(p.shape)}")
                     # Each logical block applies its own ratio inside the orthogonalization callback.
                     state["lr_ratio"] = 1.0
+                elif qkv_split_shapes is not None:
+                    if p.ndim != 2 or ne != 1:
+                        raise ValueError("QKV Muon split only supports regular 2D Muon parameters.")
+                    if len(qkv_split_shapes) != 3 or any(size <= 0 for size in qkv_split_shapes):
+                        raise ValueError(f"Invalid QKV split shapes: {qkv_split_shapes}")
+                    group_rows = sum(qkv_split_shapes)
+                    if p.shape[-2] % group_rows != 0:
+                        raise ValueError(
+                            f"QKV split {qkv_split_shapes} does not tile parameter shape {tuple(p.shape)}"
+                        )
+                    # Gathered Q, K, and V apply their own ratio inside the orthogonalization callback.
+                    state["lr_ratio"] = 1.0
                 else:
-                    state["lr_ratio"] = _get_muon_lr_ratio(p.shape[-2] // ne, p.shape[-1], adj)
+                    state["lr_ratio"] = _get_muon_lr_ratio(p.shape[-2] // ne, p.shape[-1], adj, scale)
 
         # Newton-Schulz configuration
         if newton_schulz_func is not None:
@@ -422,6 +447,12 @@ class Muon(Optimizer):
         for loaded_group, current_group in zip(state_dict["param_groups"], optimizer.param_groups):
             loaded_group["clip_grad"] = current_group.get("clip_grad", True)
         return state_dict
+
+    def _muon_layout_key(self, param: Tensor) -> tuple[tuple[int, ...] | None, tuple[int, int, int] | None]:
+        return (self._muon_split_sizes.get(param), self._muon_qkv_split_shapes.get(param))
+
+    def _uses_internal_lr_ratio(self, param: Tensor) -> bool:
+        return param in self._muon_split_sizes or param in self._muon_qkv_split_shapes
 
     @overload
     def step(self, closure: None = None) -> None: ...
@@ -716,7 +747,7 @@ class Muon(Optimizer):
                 for params in create_param_batches(
                     mesh_params,
                     batch_size=group_world_size,
-                    extra_group_key=self._muon_split_sizes.get,
+                    extra_group_key=self._muon_layout_key,
                 ):
                     gradients: list[Tensor] = [g for p in params if (g := p.grad) is not None]
                     assert len(gradients) == len(params), "Some gradients became None after filtering"
@@ -724,11 +755,15 @@ class Muon(Optimizer):
                     states = [self._get_or_initialize_state(p, algo_name) for p in params]
 
                     momentums = [s["momentum"] for s in states]
-                    lr_ratios = [1.0 if p in self._muon_split_sizes else s["lr_ratio"] for p, s in zip(params, states)]
+                    lr_ratios = [
+                        1.0 if self._uses_internal_lr_ratio(p) else s["lr_ratio"] for p, s in zip(params, states)
+                    ]
                     assert len(set(lr_ratios)) == 1, f"Found different lr_ratios: {set(lr_ratios)}"
 
                     split_sizes = self._muon_split_sizes.get(params[0])
+                    qkv_split_shapes = self._muon_qkv_split_shapes.get(params[0])
                     assert all(self._muon_split_sizes.get(p) == split_sizes for p in params)
+                    assert all(self._muon_qkv_split_shapes.get(p) == qkv_split_shapes for p in params)
                     newton_schulz_func = self._newton_schulz_func
                     if split_sizes is not None:
                         newton_schulz_func = partial(
@@ -736,6 +771,15 @@ class Muon(Optimizer):
                             newton_schulz_func=self._newton_schulz_func,
                             split_sizes=split_sizes,
                             adjust_lr=group["adjust_lr"],
+                            extra_scale_factor=group.get("extra_scale_factor", 0.2),
+                        )
+                    elif qkv_split_shapes is not None:
+                        newton_schulz_func = partial(
+                            _muon_qkv_newton_schulz,
+                            newton_schulz_func=self._newton_schulz_func,
+                            qkv_split_shapes=qkv_split_shapes,
+                            adjust_lr=group["adjust_lr"],
+                            extra_scale_factor=group.get("extra_scale_factor", 0.2),
                         )
 
                     is_remainder = len(params) < group_world_size
@@ -1517,6 +1561,7 @@ def _muonsplit_newton_schulz(
     newton_schulz_func: Callable,
     split_sizes: tuple[int, ...],
     adjust_lr: Literal["rms_norm", "spectral_norm", "none"],
+    extra_scale_factor: float = 0.2,
 ) -> Tensor:
     """Orthogonalize and scale unequal logical row blocks independently."""
     if X.ndim != 2 or num_experts != 1:
@@ -1535,7 +1580,7 @@ def _muonsplit_newton_schulz(
     for size, indexed_chunks in chunks_by_size.items():
         batch = torch.cat([chunk for _, chunk in indexed_chunks], dim=-2)
         batch = newton_schulz_func(batch, epsilon=epsilon, num_experts=len(indexed_chunks))
-        lr_ratio = _get_muon_lr_ratio(size, X.size(-1), adjust_lr)
+        lr_ratio = _get_muon_lr_ratio(size, X.size(-1), adjust_lr, extra_scale_factor)
         if lr_ratio != 1.0:
             batch.mul_(lr_ratio)
         for (index, _), result in zip(indexed_chunks, batch.split(size, dim=-2)):
@@ -1546,6 +1591,46 @@ def _muonsplit_newton_schulz(
         padding = torch.zeros_like(X.narrow(-2, logical_rows, X.size(-2) - logical_rows))
         output = torch.cat([output, padding], dim=-2)
     return output
+
+
+def _muon_qkv_newton_schulz(
+    X: Tensor,
+    epsilon: float | Tensor,
+    num_experts: int,
+    *,
+    newton_schulz_func: Callable,
+    qkv_split_shapes: tuple[int, int, int],
+    adjust_lr: Literal["rms_norm", "spectral_norm", "none"],
+    extra_scale_factor: float = 0.2,
+) -> Tensor:
+    """Orthogonalize head-interleaved Q, K, and V the way Megatron Muon does.
+
+    The weight rows repeat ``(q_rows, k_rows, v_rows)`` once per query group.
+    All Q blocks are gathered into one matrix and orthogonalized together; K and V
+    are handled the same way. The spectral scale uses the gathered matrix shape.
+    """
+    if X.ndim != 2 or num_experts != 1:
+        raise ValueError(
+            f"QKV Muon split expects one 2D matrix, got shape={tuple(X.shape)}, num_experts={num_experts}"
+        )
+    if len(qkv_split_shapes) != 3 or any(size <= 0 for size in qkv_split_shapes):
+        raise ValueError(f"Invalid QKV split shapes: {qkv_split_shapes}")
+
+    rows, cols = X.shape
+    group_rows = sum(qkv_split_shapes)
+    if rows % group_rows != 0:
+        raise ValueError(f"QKV split {qkv_split_shapes} does not tile shape {tuple(X.shape)}")
+    num_groups = rows // group_rows
+    grouped = X.view(num_groups, group_rows, cols)
+    restored: list[Tensor] = []
+    for part in grouped.split(qkv_split_shapes, dim=1):
+        matrix = part.reshape(num_groups * part.shape[1], cols)
+        orth = newton_schulz_func(matrix, epsilon=epsilon, num_experts=1)
+        lr_ratio = _get_muon_lr_ratio(matrix.shape[-2], matrix.shape[-1], adjust_lr, extra_scale_factor)
+        if lr_ratio != 1.0:
+            orth = orth.mul(lr_ratio)
+        restored.append(orth.view(num_groups, part.shape[1], cols))
+    return torch.cat(restored, dim=1).reshape(rows, cols)
 
 
 def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7, num_experts: int = 1):

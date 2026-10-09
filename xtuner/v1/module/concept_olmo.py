@@ -13,12 +13,15 @@ from xtuner.v1.module.linear import build_linear
 
 
 class CheckpointRMSNorm(ConceptOlmoRMSNorm):
-    """RMSNorm carrying the empty extra-state tensor found in the
-    checkpoint."""
+    """RMSNorm carrying the empty extra-state tensor found in some checkpoints.
+
+    Megatron ``DUMP_INIT_HF`` exports parameters only, so this buffer is not
+    persistent and is not required by ``from_hf``.
+    """
 
     def __init__(self, hidden_size: int, eps: float):
         super().__init__(hidden_size, eps=eps)
-        self.register_buffer("_extra_state", torch.empty(0, dtype=torch.uint8), persistent=True)
+        self.register_buffer("_extra_state", torch.empty(0, dtype=torch.uint8), persistent=False)
 
     def get_extra_state(self) -> torch.Tensor:
         return self._extra_state
@@ -184,7 +187,11 @@ class EncoderStage(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raw = self.transformer(hidden_states, position_embeddings, seq_ctx)
         history = (*history_states, raw)
-        return self.depth_dd(raw, history), raw
+        hidden_states = self.depth_dd(raw, history)
+        from xtuner.v1.model.dense.concept_layer_dump import record
+
+        record(getattr(self, "dump_name", None), "hidden", hidden_states)
+        return hidden_states, raw
 
 
 class ConceptStage(nn.Module):
@@ -211,6 +218,9 @@ class ConceptStage(nn.Module):
         history = (*history_states, raw)
         hidden_states = self.depth_dd(raw, history)
         hidden_states = self.read_encoder_route(hidden_states, encoder_concept_states)
+        from xtuner.v1.model.dense.concept_layer_dump import record
+
+        record(getattr(self, "dump_name", None), "hidden", hidden_states)
         return hidden_states, raw
 
 
@@ -247,6 +257,9 @@ class DecoderStage(nn.Module):
         hidden_states = self.concept_route(hidden_states, repeated_concepts, gate[0])
         hidden_states = self.read_encoder_route(hidden_states, encoder_states)
         hidden_states = self.read_concept_route(hidden_states, concept_states, gate[1])
+        from xtuner.v1.model.dense.concept_layer_dump import record
+
+        record(getattr(self, "dump_name", None), "hidden", hidden_states)
         return hidden_states, raw
 
 

@@ -75,7 +75,7 @@ def get_model_config_from_hf(model_path: Path):
         return DeepSeekV3Config.from_hf(model_path)
     elif cfg.model_type == "glm_moe_dsa":
         return Glm52MoEConfig.from_hf(model_path)
-    elif cfg.model_type == "conceptlm_v22_vq":
+    elif cfg.model_type in {"conceptlm_v22_vq", "ncp_olmo3"}:
         return ConceptLMV22VQConfig.from_hf(model_path)
     else:
         raise ValueError(f"Unsupported model type: {cfg.model_type}")
