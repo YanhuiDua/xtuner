@@ -226,7 +226,7 @@ class KimiDeltaAttention(nn.Module):
             activation="silu",
         )
 
-        self.A_log = nn.Parameter(torch.log(torch.empty(num_heads, dtype=torch.float32).uniform_(1, 16)))
+        self.A_log = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
         self.f_a_proj = build_linear(hidden_size, head_dim, bias=False, float8_cfg=float8_cfg)
         self.f_b_proj = build_linear(head_dim, projection_size, bias=False, float8_cfg=float8_cfg)
         self.dt_bias = nn.Parameter(torch.empty(projection_size, dtype=torch.float32))
@@ -244,11 +244,14 @@ class KimiDeltaAttention(nn.Module):
     @torch.no_grad()
     def init_extra_weights(self) -> set[str]:
         def init_a_log(param: torch.Tensor) -> None:
-            nn.init.uniform_(param, a=1.0, b=16.0)
-            param.log_()
+            nn.init.zeros_(param)
 
         def init_dt_bias(param: torch.Tensor) -> None:
-            nn.init.zeros_(param)
+            # inverse_softplus(LogUniform[0.001, 0.1])
+            log_low = torch.log(torch.tensor(0.001, device=param.device, dtype=param.dtype))
+            log_high = torch.log(torch.tensor(0.1, device=param.device, dtype=param.dtype))
+            dt = torch.empty_like(param).uniform_(log_low, log_high).exp()
+            param.copy_(dt + torch.log(-torch.expm1(-dt)))
 
         init_params(self.A_log, init_a_log)
         init_params(self.dt_bias, init_dt_bias)
@@ -375,7 +378,7 @@ class KimiDeltaAttention(nn.Module):
             use_beta_sigmoid_in_kernel=True,
             safe_gate=self.gate_lower_bound is not None,
             lower_bound=self.gate_lower_bound,
-            transpose_state_layout=True,
+            state_v_first=True,
             cu_seqlens=cu_seqlens,
         )
 
@@ -453,7 +456,7 @@ class KimiDeltaAttention(nn.Module):
             use_beta_sigmoid_in_kernel=True,
             safe_gate=self.gate_lower_bound is not None,
             lower_bound=self.gate_lower_bound,
-            transpose_state_layout=True,
+            state_v_first=True,
             cu_seqlens=cu_seqlens,
         )
 
