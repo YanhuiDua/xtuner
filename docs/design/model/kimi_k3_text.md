@@ -12,6 +12,7 @@
 | Text tower HF `model_type` | `kimi_linear` |
 | Text architecture | `KimiLinearForCausalLM` |
 | Remote code (cached under `.cache/kimi_k3_hf/`) | `configuration_kimi_k3.py`, `modeling_kimi_linear.py`, tokenizer |
+| Audited Hub revision | `moonshotai/Kimi-K3@f831ab66814297da540d832a5235f8e904f29d06` |
 | Bucket | **MoE LLM**, hybrid attention, `trust_remote_code` |
 | Published scale | 2.8T total / ~104B act, 93 layers, 896 experts (top-16), shared 2 |
 | Hub weights | **MXFP4** (`compressed-tensors`) — not training-suitable |
@@ -54,7 +55,7 @@ Closest existing ports: hybrid MoE text in `moe/qwen3_5_text.py` (GatedDeltaNet 
 ### 3.1 Model / config — `xtuner/v1/model/moe/kimi_linear/`
 
 - `KimiLinear(MoE)` — override `to_hf_key_list` (and layout hooks if LatentMoE / KDA renames need them). HF sparse block is named `block_sparse_moe` (not always under `mlp.`); mapping must match Hub text-tower keys when saving a **standalone** `kimi_linear` dir. AttnRes output modules via `_configure_model_specific_layers`; stack hooks `_call_decoder_layer` / `_post_decoder_stack`.
-- `KimiLinearConfig(MoEConfig)` — `from_hf` via `AutoConfig(..., trust_remote_code=True)` asserting `model_type == "kimi_linear"` **or** accepting a `kimi_k3` dir and reading `text_config` only. `hf_config` builds a serializable `PretrainedConfig` for `save_hf` (remote-code `auto_map`). Hybrid `layers_type` uses the formula in §2 (not HF `kda_layers` lists).
+- `KimiLinearConfig(MoEConfig)` — `from_hf` via `AutoConfig(..., trust_remote_code=True)` asserting `model_type == "kimi_linear"` **or** accepting a `kimi_k3` dir and reading `text_config` only. `hf_config` reconstructs the standalone text config with the official dynamically loaded `KimiLinearConfig` class; a generic `PretrainedConfig` is invalid because it serializes an empty `model_type`. Saving a loaded model also carries tokenizer and remote-code files from the source directory. The exported `model_type`, `architectures`, MoE topology and KDA fields are covered by vLLM/SGLang field-contract tests. Hybrid `layers_type` uses the formula in §2 (not HF `kda_layers` lists).
 - Size configs:
   - `KimiLinearTinyConfig` — **phase-1 smoke** (see §4).
   - `KimiLinearK3TextConfig` — published dims (structure registration; full random weight dump optional / deferred — too large).
@@ -80,7 +81,12 @@ Ops: reuse fla / causal_conv1d paths where KDA calls the same kernels; add `XTUN
 
 ### 3.3 Chat template
 
-Out of scope for multimodal. For text smoke load, tokenizer copy from Hub remote files is enough; **full `CHAT_TEMPLATE_MAP` entry can wait** until SFT is requested (user: chat/多模态不做).
+The text SFT path is registered as `kimi-k3`. It delegates XTML rendering to
+Kimi-K3's tokenizer-native `apply_chat_template` implementation so structural
+tokens cannot be injected through user content. Labels are aligned at message
+boundaries: assistant generation targets (including their XTML terminators)
+are supervised, while global options, system, user, tool, and the tokenizer's
+assistant generation-prefix tokens are masked.
 
 ## 4. Synthetic bf16 checkpoint plan
 
@@ -111,7 +117,7 @@ Explicitly deferred:
 - Bitwise / numerical parity (`XTUNER_HF_IMPL`, decoder-layer matrix in skill §6–7).
 - Full-size random or Hub MXFP4 load.
 - Vision / projector / compose `kimi_k3`.
-- Chat template + SFT/RL recipes.
+- RL recipes.
 - EP/fp8/compile feature matrix (skill §8); KDA SP is implemented but not covered by dedicated tests.
 - Behavioral unit coverage beyond structure + FSDP smoke (AttnRes mixer on/off, LatentMoE dims, SiTU vs SiLU, KDA SP).
 

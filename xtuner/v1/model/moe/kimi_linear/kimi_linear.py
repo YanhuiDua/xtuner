@@ -3,16 +3,19 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 from pathlib import Path
+from shutil import copy
 from typing import Callable, Literal, cast
 
 import torch
 import torch.nn as nn
-from pydantic import Field, computed_field
+from pydantic import Field, PrivateAttr, computed_field
 from typing_extensions import Self, override
 
+from transformers.configuration_utils import PretrainedConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.model.moe.moe import BalancingLossConfig, MoE, MoEConfig
 from xtuner.v1.module import RMSNorm
@@ -279,7 +282,25 @@ class KimiLinearConfig(MoEConfig):
     routed_expert_hidden_size: int | None = None
     latent_moe_use_norm: bool = False
     attn_res_block_size: int | None = None
+    bos_token_id: int | None = None
+    initializer_range: float = 0.02
+    use_cache: bool = True
+    moe_layer_freq: int = 1
+    use_grouped_topk: bool = True
+    num_nextn_predict_layers: int = 0
+    hf_head_dim: int | None = None
+    hf_num_key_value_heads: int | None = None
+    hf_architectures: list[str] = Field(default_factory=lambda: ["KimiLinearForCausalLM"])
+    hf_auto_map: dict[str, str] = Field(
+        default_factory=lambda: {
+            "AutoConfig": "configuration_kimi_k3.KimiLinearConfig",
+            "AutoModel": "modeling_kimi_linear.KimiLinearModel",
+            "AutoModelForCausalLM": "modeling_kimi_linear.KimiLinearForCausalLM",
+        }
+    )
     moe_act_fn_cfg: MoEActFnConfig = MoEActFnConfig(act_type="situ", situ_beta=4.0, situ_linear_beta=25.0)
+    _hf_config_cls: type[PretrainedConfig] | None = PrivateAttr(default=None)
+    _hf_config_source_file: Path | None = PrivateAttr(default=None)
 
     def build(self) -> KimiLinear:
         return KimiLinear(self)
@@ -331,10 +352,11 @@ class KimiLinearConfig(MoEConfig):
         situ_beta = getattr(text, "activation_situ_beta", 4.0) or 4.0
         situ_linear_beta = getattr(text, "activation_situ_linear_beta", 25.0)
 
-        return cls(
+        config = cls(
             vocab_size=text.vocab_size,
             max_position_embeddings=getattr(text, "max_position_embeddings", 4096),
             pad_token_id=getattr(text, "pad_token_id", None),
+            bos_token_id=getattr(text, "bos_token_id", None),
             eos_token_id=text.eos_token_id,
             num_hidden_layers=text.num_hidden_layers,
             hidden_size=text.hidden_size,
@@ -354,6 +376,22 @@ class KimiLinearConfig(MoEConfig):
             attn_res_block_size=getattr(text, "attn_res_block_size", None),
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
+            initializer_range=getattr(text, "initializer_range", 0.02),
+            use_cache=bool(getattr(text, "use_cache", True)),
+            moe_layer_freq=getattr(text, "moe_layer_freq", 1),
+            use_grouped_topk=bool(getattr(text, "use_grouped_topk", True)),
+            num_nextn_predict_layers=getattr(text, "num_nextn_predict_layers", 0),
+            hf_head_dim=getattr(text, "head_dim", None),
+            hf_num_key_value_heads=getattr(text, "num_key_value_heads", None),
+            hf_architectures=list(getattr(text, "architectures", None) or ["KimiLinearForCausalLM"]),
+            hf_auto_map=dict(
+                getattr(text, "auto_map", None)
+                or {
+                    "AutoConfig": "configuration_kimi_k3.KimiLinearConfig",
+                    "AutoModel": "modeling_kimi_linear.KimiLinearModel",
+                    "AutoModelForCausalLM": "modeling_kimi_linear.KimiLinearForCausalLM",
+                }
+            ),
             router=NoAuxRouterConfig(
                 scoring_func="sigmoid" if text.moe_router_activation_func == "sigmoid" else "softmax",
                 router_scaling_factor=text.routed_scaling_factor,
@@ -370,27 +408,48 @@ class KimiLinearConfig(MoEConfig):
             z_loss_cfg=None,
             tie_word_embeddings=bool(getattr(text, "tie_word_embeddings", False)),
         )
+        # Kimi-K3 is a trust_remote_code model in the pinned Transformers
+        # version. Reuse its official config class instead of serializing a
+        # generic PretrainedConfig (which writes an empty model_type).
+        config._hf_config_cls = type(text)
+        source_file = inspect.getsourcefile(type(text))
+        config._hf_config_source_file = Path(source_file) if source_file is not None else None
+        return config
+
+    def save_hf(self, hf_path: str | Path):
+        """Save config JSON together with its trust-remote-code config module."""
+        super().save_hf(hf_path)
+        if self._hf_config_source_file is None or not self._hf_config_source_file.is_file():
+            return
+
+        auto_config = self.hf_auto_map.get("AutoConfig")
+        if auto_config is None:
+            return
+        module_name = auto_config.split(".", 1)[0]
+        target = Path(hf_path) / f"{module_name}.py"
+        if not target.exists():
+            copy(self._hf_config_source_file, target)
 
     @property
-    def hf_config(self):
-        """Build a serializable HF config for ``save_hf`` (trust_remote_code
-        model)."""
-        from transformers import PretrainedConfig
-
+    def hf_config(self) -> PretrainedConfig | None:
+        """Build the standalone text config with the official remote class."""
+        if self._hf_config_cls is None:
+            return None
         assert isinstance(self.router, NoAuxRouterConfig), "Only support saving NoAuxRouter to HF KimiLinear format."
         linear_attn = self.linear_attention
         kda_layers, full_attn_layers = _kimi_hybrid_layer_ids(self.num_hidden_layers)
         rope_theta = self.rope_parameters_cfg.rope_theta if self.rope_parameters_cfg is not None else 10000.0
-        return PretrainedConfig(
+        return self._hf_config_cls(
             model_type="kimi_linear",
-            architectures=["KimiLinearForCausalLM"],
+            architectures=self.hf_architectures,
             vocab_size=self.vocab_size,
             hidden_size=self.hidden_size,
+            head_dim=self.hf_head_dim,
             intermediate_size=self.intermediate_size,
             moe_intermediate_size=self.moe_intermediate_size,
             num_hidden_layers=self.num_hidden_layers,
             num_attention_heads=self.attention.num_attention_heads,
-            num_key_value_heads=self.attention.num_attention_heads,
+            num_key_value_heads=self.hf_num_key_value_heads or self.attention.num_attention_heads,
             num_experts=self.n_routed_experts,
             num_experts_per_token=self.num_experts_per_tok,
             num_shared_experts=self.n_shared_experts,
@@ -404,7 +463,10 @@ class KimiLinearConfig(MoEConfig):
             rms_norm_eps=self.rms_norm_eps,
             max_position_embeddings=self.max_position_embeddings,
             pad_token_id=self.pad_token_id,
+            bos_token_id=self.bos_token_id,
             eos_token_id=self.eos_token_id,
+            initializer_range=self.initializer_range,
+            use_cache=self.use_cache,
             tie_word_embeddings=self.tie_word_embeddings,
             rope_theta=rope_theta,
             q_lora_rank=self.attention.q_lora_rank,
@@ -417,10 +479,12 @@ class KimiLinearConfig(MoEConfig):
             moe_router_activation_func="sigmoid" if self.router.scoring_func == "sigmoid" else "softmax",
             moe_renormalize=self.router.norm_topk_prob,
             routed_scaling_factor=self.router.router_scaling_factor,
-            use_grouped_topk=False,
+            moe_layer_freq=self.moe_layer_freq,
+            use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.router.n_group,
             topk_group=self.router.topk_group,
             topk_method="noaux_tc",
+            num_nextn_predict_layers=self.num_nextn_predict_layers,
             linear_attn_config={
                 "kda_layers": kda_layers,
                 "full_attn_layers": full_attn_layers,
@@ -430,11 +494,8 @@ class KimiLinearConfig(MoEConfig):
                 "use_full_rank_gate": bool(linear_attn.use_full_rank_gate) if linear_attn else True,
                 "gate_lower_bound": linear_attn.gate_lower_bound if linear_attn else -5.0,
             },
-            auto_map={
-                "AutoConfig": "configuration_kimi_k3.KimiLinearConfig",
-                "AutoModelForCausalLM": "modeling_kimi_linear.KimiLinearForCausalLM",
-            },
-            torch_dtype="bfloat16",
+            auto_map=self.hf_auto_map,
+            dtype="bfloat16",
         )
 
 
@@ -454,6 +515,7 @@ class KimiLinearTinyConfig(KimiLinearConfig):
     hidden_act: str = "situ"
     activation_situ_beta: float | None = 4.0
     activation_situ_linear_beta: float | None = 25.0
+    use_grouped_topk: bool = False
     first_k_dense_replace: int = 1
     n_routed_experts: int = 8
     n_shared_experts: int = 1

@@ -7,7 +7,7 @@ Usage:
 
 from __future__ import annotations
 
-import json
+import importlib.util
 import shutil
 import sys
 from pathlib import Path
@@ -23,6 +23,15 @@ def main() -> None:
     from xtuner.v1.model.moe.kimi_linear import KimiLinearTinyConfig
 
     cfg = KimiLinearTinyConfig()
+    config_source = repo / ".cache" / "kimi_k3_hf" / "configuration_kimi_k3.py"
+    if not config_source.is_file():
+        raise FileNotFoundError(f"Missing official Kimi config implementation: {config_source}")
+    spec = importlib.util.spec_from_file_location("_xtuner_kimi_k3_config", config_source)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load official Kimi config implementation: {config_source}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    cfg._hf_config_cls = module.KimiLinearConfig
     # Prefer CPU meta-free init for tiny model
     model = cfg.build()
     model.to(dtype=torch.bfloat16)

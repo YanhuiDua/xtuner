@@ -10,6 +10,8 @@ checks backward. Reference: ``tests/model/test_qwen3_moe.py`` and add_hf_model s
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -22,8 +24,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from safetensors import safe_open
-from transformers import AutoModelForCausalLM
 
+from transformers import AutoModelForCausalLM
 from xtuner._testing import DeterministicDDPTestCase
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
@@ -88,9 +90,36 @@ def _copy_hf_remote_code(dst: Path) -> None:
         )
 
 
+def _bind_official_hf_config_class(config: KimiLinearTinyConfig) -> None:
+    source = next(
+        (
+            root / "configuration_kimi_k3.py"
+            for root in _remote_code_candidates()
+            if (root / "configuration_kimi_k3.py").is_file()
+        ),
+        None,
+    )
+    if source is None:
+        raise unittest.SkipTest("need configuration_kimi_k3.py to create a standalone KimiLinear checkpoint")
+    spec = importlib.util.spec_from_file_location("_xtuner_test_kimi_k3_config", source)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load official Kimi config implementation: {source}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config._hf_config_cls = module.KimiLinearConfig
+
+
 def _existing_tiny_ckpt() -> Path | None:
     for path in _tiny_ckpt_candidates():
-        if (path / "model.safetensors.index.json").exists() or any(path.glob("*.safetensors")):
+        index_path = path / "model.safetensors.index.json"
+        if index_path.is_file():
+            with open(index_path, encoding="utf-8") as file:
+                weight_files = set(json.load(file).get("weight_map", {}).values())
+            if weight_files and all(
+                (path / name).is_file() and os.access(path / name, os.R_OK) for name in weight_files
+            ):
+                return path
+        elif any(weight.is_file() and os.access(weight, os.R_OK) for weight in path.glob("*.safetensors")):
             return path
     return None
 
@@ -120,8 +149,10 @@ def _patch_hf_transformers_compat() -> None:
     """Hub modeling targets a slightly older transformers API than 5.14.
 
     * ``OutputRecorder`` moved from ``utils.generic`` to ``utils.output_capturing``.
-    * ``create_causal_mask`` now takes ``inputs_embeds`` (plural) and dropped
-      ``cache_position``. Hub still passes ``input_embeds`` + ``cache_position``.
+    * Some builds removed the deprecated ``check_model_inputs`` alias while
+      retaining its replacement, ``merge_with_config_defaults``.
+    * ``create_causal_mask`` changed ``input_embeds``/``inputs_embeds`` and
+      ``cache_position`` across releases, so adapt to the installed signature.
     """
     import transformers.masking_utils as masking_utils
     import transformers.utils.generic as generic
@@ -130,14 +161,20 @@ def _patch_hf_transformers_compat() -> None:
         from transformers.utils.output_capturing import OutputRecorder
 
         generic.OutputRecorder = OutputRecorder
+    if not hasattr(generic, "check_model_inputs"):
+        generic.check_model_inputs = generic.merge_with_config_defaults
 
     orig = masking_utils.create_causal_mask
     if not getattr(orig, "_kimi_k3_compat", False):
+        parameters = inspect.signature(orig).parameters
 
         def create_causal_mask(*args, **kwargs):
-            if "input_embeds" in kwargs and "inputs_embeds" not in kwargs:
+            if "inputs_embeds" in parameters and "input_embeds" in kwargs and "inputs_embeds" not in kwargs:
                 kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
-            kwargs.pop("cache_position", None)
+            elif "input_embeds" in parameters and "inputs_embeds" in kwargs and "input_embeds" not in kwargs:
+                kwargs["input_embeds"] = kwargs.pop("inputs_embeds")
+            if "cache_position" not in parameters:
+                kwargs.pop("cache_position", None)
             return orig(*args, **kwargs)
 
         create_causal_mask._kimi_k3_compat = True  # type: ignore[attr-defined]
@@ -198,6 +235,7 @@ class TestKimiLinearTinyHFParity(DeterministicDDPTestCase):
                     shutil.copy2(src, tmp / src.name)
         else:
             cfg = KimiLinearTinyConfig()
+            _bind_official_hf_config_class(cfg)
             cfg.compile_cfg = False
             model = cfg.build().to(device="cuda", dtype=torch.bfloat16)
             model.init_weights()
@@ -209,7 +247,10 @@ class TestKimiLinearTinyHFParity(DeterministicDDPTestCase):
 
     def _build_xtuner(self, ckpt: Path, *, dispatcher=None, ep_size: int = 1, fsdp: bool = False):
         with torch.device("meta"):
-            cfg = KimiLinearTinyConfig()
+            # Load through the official remote config class so save_hf can
+            # reconstruct a valid standalone kimi_linear config instead of
+            # copying legacy tiny configs that lack model_type.
+            cfg = KimiLinearTinyConfig.from_hf(ckpt)
             cfg.compile_cfg = False
             cfg.dispatcher = dispatcher
             cfg.ep_size = ep_size
@@ -463,6 +504,13 @@ class TestKimiLinearTinyHFParity(DeterministicDDPTestCase):
         saved_index_path = tmpdir_path / "model.safetensors.index.json"
 
         if dist.get_rank() == 0:
+            with open(tmpdir_path / "config.json") as f:
+                saved_config = json.load(f)
+            self.assertEqual(saved_config["model_type"], "kimi_linear")
+            self.assertEqual(saved_config["architectures"], ["KimiLinearForCausalLM"])
+            self.assertTrue((tmpdir_path / "configuration_kimi_k3.py").is_file())
+            self.assertTrue((tmpdir_path / "modeling_kimi_linear.py").is_file())
+
             with open(origin_index_path, "r") as f:
                 origin_index = json.load(f)
             with open(saved_index_path, "r") as f:
