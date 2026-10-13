@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import hashlib
 import inspect
-from typing import Annotated
+from typing import Annotated, Any, cast
 
 from cyclopts import Parameter
 from pydantic import BaseModel, ConfigDict
@@ -51,14 +51,16 @@ class OpenaiTokenizeFunction(CachableTokenizeFunction[DataItem]):
         if not item:
             return CacheItem(num_tokens=0)
 
+        raw_messages = cast(Any, item)
+        messages: Any
         if self.chat_template_name == "qwen3.5-vl":
-            messages = Qwen35ChatMessages(messages=item, tools=tools)
+            messages = Qwen35ChatMessages(messages=raw_messages, tools=tools)
         elif self.chat_template_name == "glm5.2":
-            messages = Glm52ChatMessages(messages=item, tools=tools)
+            messages = Glm52ChatMessages(messages=raw_messages, tools=tools)
         elif self.chat_template_name == "kimi-k3":
-            messages = KimiK3ChatMessages(messages=item, tools=tools)
+            messages = KimiK3ChatMessages(messages=raw_messages, tools=tools)
         else:
-            messages = ChatMessages(messages=item, tools=tools)
+            messages = ChatMessages(messages=raw_messages, tools=tools)
         tokenized = messages.tokenize(self.tokenizer, self.chat_template)
 
         input_ids = tokenized["input_ids"]

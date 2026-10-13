@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -19,7 +19,7 @@ def _input_ids(value: Any) -> list[int]:
     return list(value)
 
 
-def _message_for_tokenizer(message: Dict[str, Any]) -> Dict[str, Any]:
+def _message_for_tokenizer(message: dict[str, Any]) -> dict[str, Any]:
     rendered = {key: value for key, value in message.items() if key not in {"loss", "thinking"}}
     if rendered.get("reasoning_content") is None and message.get("thinking") is not None:
         rendered["reasoning_content"] = message["thinking"]
@@ -29,29 +29,27 @@ def _message_for_tokenizer(message: Dict[str, Any]) -> Dict[str, Any]:
 class KimiK3ChatMessages(BaseModel):
     """Tokenize Kimi-K3 XTML conversations and construct SFT labels.
 
-    The tokenizer's renderer is the source of truth. Assistant messages are
-    rendered independently and aligned back into the fully rendered token
-    stream. This avoids flattening XTML into a string, which is important
-    because Kimi encodes structural markers and user-provided text with
-    different special-token policies.
+    The tokenizer's renderer is the source of truth. Assistant messages are rendered independently and aligned back
+    into the fully rendered token stream. This avoids flattening XTML into a string, which is important because Kimi
+    encodes structural markers and user-provided text with different special-token policies.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    messages: List[Dict[str, Any]]
-    tools: Optional[List[Dict[str, Any]]] = None
+    messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]] | None = None
 
     def _apply_chat_template(
         self,
         tokenizer: PreTrainedTokenizer,
-        messages: List[Dict[str, Any]],
+        messages: list[dict[str, Any]],
         template: KimiK3ChatTemplate,
         *,
         add_generation_prompt: bool,
-        tools: Optional[List[Dict[str, Any]]],
+        tools: list[dict[str, Any]] | None,
         thinking_effort: str | None,
     ) -> list[int]:
-        kwargs: Dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "tools": tools,
             "tokenize": True,
             "add_generation_prompt": add_generation_prompt,
@@ -68,7 +66,7 @@ class KimiK3ChatMessages(BaseModel):
         chat_template: KimiK3ChatTemplate,
         add_generation_prompt: bool = False,
         **kwargs,
-    ) -> Dict:
+    ) -> dict:
         del kwargs
         raw_messages = self.messages
         messages = [_message_for_tokenizer(message) for message in raw_messages]

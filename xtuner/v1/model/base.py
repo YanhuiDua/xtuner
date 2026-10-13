@@ -1666,7 +1666,8 @@ class BaseModel(nn.Module):
             json.dump(index, f, indent=2, ensure_ascii=False)
 
     def _copy_missing_hf_auxiliary_files(self, hf_dir: Path) -> None:
-        """Keep tokenizer and remote-code files beside a reconstructed config."""
+        """Keep tokenizer and remote-code files beside a reconstructed
+        config."""
         if self._hf_path is None:
             return
 

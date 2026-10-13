@@ -164,15 +164,21 @@ class KimiLinear(MoE):
     @override
     def build_layers(self, config: MoEConfig) -> nn.ModuleDict:
         assert isinstance(config, KimiLinearConfig)
+        assert isinstance(config.attention, MLAConfig)
         layers = nn.ModuleDict()
+        layer_types = cast(
+            list[Literal["full_attention", "sliding_attention", "linear_attention"]],
+            config.layers_type,
+        )
+        attention_config: MLAConfig | KDAConfig
         for layer_idx in range(config.num_hidden_layers):
-            if config.layers_type[layer_idx] in ["full_attention", "sliding_attention"]:
+            if layer_types[layer_idx] in ["full_attention", "sliding_attention"]:
                 attention_config = config.attention
-            elif config.layers_type[layer_idx] == "linear_attention":
-                assert config.linear_attention is not None
+            elif layer_types[layer_idx] == "linear_attention":
+                assert isinstance(config.linear_attention, KDAConfig)
                 attention_config = config.linear_attention
             else:
-                raise ValueError(f"Unsupported layer type {config.layers_type[layer_idx]}")
+                raise ValueError(f"Unsupported layer type {layer_types[layer_idx]}")
 
             situ_beta = config.activation_situ_beta or 1.0
             situ_linear_beta = config.activation_situ_linear_beta
@@ -186,7 +192,7 @@ class KimiLinear(MoE):
                     rms_norm_eps=config.rms_norm_eps,
                     rms_norm_type=config.rms_norm_type,
                     attention_config=attention_config,
-                    layer_type=config.layers_type[layer_idx],
+                    layer_type=layer_types[layer_idx],
                     rope_scaling_cfg=config.rope_scaling_cfg,
                     generate_config=config.generate_config,
                     float8_cfg=config.float8_cfg,
@@ -211,7 +217,7 @@ class KimiLinear(MoE):
                     n_shared_experts=config.n_shared_experts,
                     with_shared_expert_gate=config.with_shared_expert_gate,
                     hidden_factor=config.hidden_factor,
-                    layer_type=config.layers_type[layer_idx],
+                    layer_type=layer_types[layer_idx],
                     attention_config=attention_config,
                     rope_scaling_cfg=config.rope_scaling_cfg,
                     generate_config=config.generate_config,
@@ -299,14 +305,14 @@ class KimiLinearConfig(MoEConfig):
         }
     )
     moe_act_fn_cfg: MoEActFnConfig = MoEActFnConfig(act_type="situ", situ_beta=4.0, situ_linear_beta=25.0)
-    _hf_config_cls: type[PretrainedConfig] | None = PrivateAttr(default=None)
+    _hf_config_cls: Callable[..., PretrainedConfig] | None = PrivateAttr(default=None)
     _hf_config_source_file: Path | None = PrivateAttr(default=None)
 
     def build(self) -> KimiLinear:
         return KimiLinear(self)
 
     @computed_field  # type: ignore[prop-decorator]
-    def layers_type(self) -> list[Literal["full_attention", "linear_attention"]]:
+    def layers_type(self) -> list[Literal["full_attention", "sliding_attention", "linear_attention"]]:
         # Hub Kimi-K3: full attn when 1-based index % 4 == 0, or the final layer.
         return [
             ("full_attention" if (i + 1) % 4 == 0 or (i + 1) == self.num_hidden_layers else "linear_attention")
@@ -417,7 +423,8 @@ class KimiLinearConfig(MoEConfig):
         return config
 
     def save_hf(self, hf_path: str | Path):
-        """Save config JSON together with its trust-remote-code config module."""
+        """Save config JSON together with its trust-remote-code config
+        module."""
         super().save_hf(hf_path)
         if self._hf_config_source_file is None or not self._hf_config_source_file.is_file():
             return
@@ -436,7 +443,10 @@ class KimiLinearConfig(MoEConfig):
         if self._hf_config_cls is None:
             return None
         assert isinstance(self.router, NoAuxRouterConfig), "Only support saving NoAuxRouter to HF KimiLinear format."
+        attention = self.attention
+        assert isinstance(attention, MLAConfig)
         linear_attn = self.linear_attention
+        assert linear_attn is None or isinstance(linear_attn, KDAConfig)
         kda_layers, full_attn_layers = _kimi_hybrid_layer_ids(self.num_hidden_layers)
         rope_theta = self.rope_parameters_cfg.rope_theta if self.rope_parameters_cfg is not None else 10000.0
         return self._hf_config_cls(
@@ -448,8 +458,8 @@ class KimiLinearConfig(MoEConfig):
             intermediate_size=self.intermediate_size,
             moe_intermediate_size=self.moe_intermediate_size,
             num_hidden_layers=self.num_hidden_layers,
-            num_attention_heads=self.attention.num_attention_heads,
-            num_key_value_heads=self.hf_num_key_value_heads or self.attention.num_attention_heads,
+            num_attention_heads=attention.num_attention_heads,
+            num_key_value_heads=self.hf_num_key_value_heads or attention.num_attention_heads,
             num_experts=self.n_routed_experts,
             num_experts_per_token=self.num_experts_per_tok,
             num_shared_experts=self.n_shared_experts,
@@ -469,13 +479,13 @@ class KimiLinearConfig(MoEConfig):
             use_cache=self.use_cache,
             tie_word_embeddings=self.tie_word_embeddings,
             rope_theta=rope_theta,
-            q_lora_rank=self.attention.q_lora_rank,
-            kv_lora_rank=self.attention.kv_lora_rank,
-            qk_nope_head_dim=self.attention.qk_nope_head_dim,
-            qk_rope_head_dim=self.attention.qk_rope_head_dim,
-            v_head_dim=self.attention.v_head_dim,
-            mla_use_nope=self.attention.use_nope,
-            mla_use_output_gate=self.attention.use_output_gate,
+            q_lora_rank=attention.q_lora_rank,
+            kv_lora_rank=attention.kv_lora_rank,
+            qk_nope_head_dim=attention.qk_nope_head_dim,
+            qk_rope_head_dim=attention.qk_rope_head_dim,
+            v_head_dim=attention.v_head_dim,
+            mla_use_nope=attention.use_nope,
+            mla_use_output_gate=attention.use_output_gate,
             moe_router_activation_func="sigmoid" if self.router.scoring_func == "sigmoid" else "softmax",
             moe_renormalize=self.router.norm_topk_prob,
             routed_scaling_factor=self.router.router_scaling_factor,
@@ -488,7 +498,7 @@ class KimiLinearConfig(MoEConfig):
             linear_attn_config={
                 "kda_layers": kda_layers,
                 "full_attn_layers": full_attn_layers,
-                "num_heads": linear_attn.num_heads if linear_attn else self.attention.num_attention_heads,
+                "num_heads": linear_attn.num_heads if linear_attn else attention.num_attention_heads,
                 "head_dim": linear_attn.head_dim if linear_attn else 128,
                 "short_conv_kernel_size": linear_attn.conv_kernel_size if linear_attn else 4,
                 "use_full_rank_gate": bool(linear_attn.use_full_rank_gate) if linear_attn else True,
