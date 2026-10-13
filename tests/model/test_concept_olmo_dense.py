@@ -738,12 +738,19 @@ class TestConceptOlmoFSDP(DeterministicDDPTestCase):
         )
         previous_offload = os.environ.get("XTUNER_ACTIVATION_OFFLOAD")
         os.environ["XTUNER_ACTIVATION_OFFLOAD"] = "1"
+        from xtuner.v1.utils.activation_offload import OffloadManager
+
+        OffloadManager().clear()
         try:
+            # Multi-stage DepthDD history must keep a seed that does not alias the
+            # offloaded stage input; otherwise block N+1's resize_(0) makes
+            # torch.stack(history) illegal during forward.
             output = model(SequenceContext.from_input_ids((input_ids,), device="cuda")).logits
             torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
             output.sum().backward()
             assert any(parameter.grad is not None for parameter in model.parameters())
         finally:
+            OffloadManager().clear()
             if previous_offload is None:
                 os.environ.pop("XTUNER_ACTIVATION_OFFLOAD", None)
             else:
