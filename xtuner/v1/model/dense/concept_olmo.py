@@ -560,6 +560,22 @@ class ConceptLMV22VQ(BaseModel):
         )
 
     @staticmethod
+    def _depth_history_seed(hidden_states: torch.Tensor) -> torch.Tensor:
+        """Seed DepthDD history without aliasing the stage input under offload.
+
+        ``async_save_on_cpu`` D2H-then-``resize_(0)`` the stage input when the
+        next block starts. DepthDD keeps the seed in ``history`` across later
+        stages and ``torch.stack``s it in forward, so aliasing that storage
+        causes an illegal memory access. Clone only when offload is enabled so
+        the history seed has independent storage while the offloaded input can
+        still be reclaimed. The clone keeps ``grad_fn`` so later DepthDD routes
+        still train the seed activations.
+        """
+        if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) != 1:
+            return hidden_states
+        return hidden_states.clone()
+
+    @staticmethod
     def _cat_if_multiple(tensors: list[torch.Tensor], dim: int) -> torch.Tensor:
         """Concatenate tensors without copying an already-contiguous
         singleton."""
@@ -812,7 +828,7 @@ class ConceptLMV22VQ(BaseModel):
         token_lengths = self._lengths(seq_ctx)
         token_position_embeddings = self.rotary_emb(hidden_states, seq_ctx.position_ids)
 
-        encoder_history: tuple[torch.Tensor, ...] = (hidden_states,)
+        encoder_history: tuple[torch.Tensor, ...] = (self._depth_history_seed(hidden_states),)
         encoder_raw_states: list[torch.Tensor] = []
         if self.config.stage_group_size == 1:
             for stage_idx, stage in enumerate(self.encoder_stages):
@@ -849,7 +865,13 @@ class ConceptLMV22VQ(BaseModel):
         # LayerNorm is per token, so doing it before the SP split matches the
         # full-sequence norm used by those losses.
         concept_hidden = self.concept_vq_input_norm(concept_hidden)
+        # Keep an independent copy for HLM/VQ targets. With SP=1,
+        # ``_pad_and_split_sequence`` returns the same tensor, so the slice
+        # below would share storage with the concept-stage input that
+        # ``async_save_on_cpu`` later ``resize_(0)``s under offload.
         concept_vq_hidden = concept_hidden[:, :valid_concept_length]
+        if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1:
+            concept_vq_hidden = concept_vq_hidden.clone()
         concept_hidden, concept_padding = self._pad_and_split_sequence(concept_hidden, sp_mesh)
         merged_encoder_state_list = [
             self._merge_chunks(state, token_lengths)[0] for state in full_encoder_raw_states[:-1]
@@ -877,7 +899,7 @@ class ConceptLMV22VQ(BaseModel):
             assert concept_ctx.position_ids is not None
             concept_position_embeddings = self.rotary_emb(concept_hidden, concept_ctx.position_ids)
 
-            concept_history: tuple[torch.Tensor, ...] = (concept_hidden,)
+            concept_history: tuple[torch.Tensor, ...] = (self._depth_history_seed(concept_hidden),)
             if self.config.stage_group_size == 1:
                 for stage_idx, stage in enumerate(self.concept_stages):
                     with self._activation_offload_context(concept_hidden, stage_idx, "concept"):
@@ -963,7 +985,7 @@ class ConceptLMV22VQ(BaseModel):
         decoder_concept_states = self._pad_sequence_tail(decoder_concept_states, full_encoder_hidden.shape[1])
         decoder_concept_states = self._local_token_shard(decoder_concept_states, seq_ctx, hidden_states.shape[1])
 
-        decoder_history: tuple[torch.Tensor, ...] = (hidden_states,)
+        decoder_history: tuple[torch.Tensor, ...] = (self._depth_history_seed(hidden_states),)
         if self.config.stage_group_size == 1:
             for layer_idx, stage in enumerate(self.decoder_stages):
                 with self._activation_offload_context(hidden_states, layer_idx, "decoder"):
