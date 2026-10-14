@@ -46,12 +46,60 @@ def native_silu(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x)
 
 
+def situ_glu(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    beta: float = 1.0,
+    linear_beta: float | None = None,
+) -> torch.Tensor:
+    """SiTU-GLU on separate gate/up tensors (no cat/chunk)."""
+    dtype = gate.dtype
+    gate_f = gate.float()
+    up_f = up.float()
+    situ_a = beta * torch.tanh(gate_f / beta) * torch.sigmoid(gate_f)
+    if linear_beta is not None:
+        up_f = linear_beta * torch.tanh(up_f / linear_beta)
+    return (situ_a * up_f).to(dtype)
+
+
+def silu_glu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """SwiGLU-style combine with unary SiLU on gate."""
+    return F.silu(gate) * up
+
+
+def native_situ(
+    fused_x: torch.Tensor,
+    split_dim: int = -1,
+    beta: float = 1.0,
+    linear_beta: float | None = None,
+) -> torch.Tensor:
+    """SiTU-GLU for fused ``[gate, up]`` (MoE grouped-gemm path)."""
+    gate, up = torch.chunk(fused_x, 2, dim=split_dim)
+    return situ_glu(gate, up, beta=beta, linear_beta=linear_beta)
+
+
+def get_mlp_act_fn(
+    hidden_act: str,
+    *,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float | None = None,
+):
+    """Return ``(gate, up) -> Tensor`` for dense / shared-expert MLPs."""
+    if hidden_act == "situ":
+        return partial(situ_glu, beta=situ_beta, linear_beta=situ_linear_beta)
+    if hidden_act == "silu":
+        return silu_glu
+    unary = get_act_fn(hidden_act)
+    return lambda gate, up, _unary=unary: _unary(gate) * up
+
+
 act_fn_type_map_cuda = {
     "swiglu": native_swiglu,
     "clipped_swiglu": native_clipped_swiglu,
     "gelu": native_gelu,
     "gelu_pytorch_tanh": partial(native_gelu, approximate="tanh"),
     "silu": native_silu,
+    "situ": native_situ,
 }
 act_fn_type_map_npu = {
     "swiglu": npu_swiglu,
@@ -59,6 +107,7 @@ act_fn_type_map_npu = {
     "gelu": npu_gelu,
     "gelu_pytorch_tanh": partial(npu_gelu, approximate="tanh"),
     "silu": native_silu,
+    "situ": native_situ,
 }
 
 

@@ -15,6 +15,11 @@ switch between fast / fused paths and HF-exact paths. Under `XTUNER_HF_IMPL=true
 
 These switches are only meant for the bitwise-parity tests. Production / training stays on the
 XTuner path (compile-friendly custom_op wraps + seq_idx-aware kernel dispatch).
+
+Shared FSDP helpers used by both ``GatedDeltaNet`` and ``KDA``:
+
+* ``fused_rms_norm_gated.FusedRMSNormGated`` — DTensor-aware gated RMSNorm
+* ``dtensor`` — ``to_local`` / ``full_tensor`` / depthwise-conv weight materialization
 """
 
 import os

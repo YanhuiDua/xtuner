@@ -17,6 +17,12 @@ from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
 from xtuner.v1.utils import get_logger, init_params
 
 from ...ops.gated_deltanet import get_causal_conv1d_fn, get_chunk_gated_delta_rule_fn
+from ...ops.gated_deltanet.dtensor import dtensor_to_local
+from ...ops.gated_deltanet.fused_rms_norm_gated import (
+    FusedRMSNormGated,
+    _fused_rms_norm_gated_import_error,
+    has_fused_rms_norm_gated,
+)
 from ...ops.gated_deltanet.gen_seq_idx import gen_seq_idx
 from ..linear import build_linear
 from .attn_outputs import AttnOutputs
@@ -38,46 +44,6 @@ def _all_to_all_gb(x, scatter_dim, gather_dim, mesh):
 def _all_to_all_out(x, scatter_dim, gather_dim, mesh):
     return ulysses_all_to_all(x, scatter_dim=scatter_dim, gather_dim=gather_dim, mesh=mesh)
 
-
-_fused_rms_norm_gated_import_error: ImportError | None = None
-
-try:
-    from fla.modules import FusedRMSNormGated as FLA_FusedRMSNormGated
-
-    class FusedRMSNormGated(FLA_FusedRMSNormGated):
-        def forward(
-            self,
-            x: torch.Tensor,
-            g: torch.Tensor,
-            residual: torch.Tensor | None = None,
-            prenorm: bool = False,
-            residual_in_fp32: bool = False,
-        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-            from ...ops.gated_deltanet.rms_norm_gated import rms_norm_gated
-
-            weight = self.weight
-            if isinstance(weight, DTensor):
-                weight = weight.to_local()
-
-            return rms_norm_gated(
-                x,
-                g,
-                weight,
-                self.bias,
-                self.activation,
-                residual=residual,
-                eps=self.eps,
-                prenorm=prenorm,
-                residual_in_fp32=residual_in_fp32,
-            )
-
-except (ImportError, ModuleNotFoundError) as e:
-    has_fused_rms_norm_gated = False
-    FusedRMSNormGated = None  # type: ignore
-    _fused_rms_norm_gated_import_error = e
-else:
-    has_fused_rms_norm_gated = True
-    _fused_rms_norm_gated_import_error = None
 
 logger = get_logger()
 
@@ -277,12 +243,10 @@ class GatedDeltaNet(nn.Module):
         b = self.in_proj_b(query_input)
         a = self.in_proj_a(query_input)
 
-        weight = self.conv1d.weight.squeeze(1)
+        weight = dtensor_to_local(self.conv1d.weight.squeeze(1))
         bias = self.conv1d.bias
-        if isinstance(weight, DTensor):
-            weight = weight.to_local()
-        if bias and isinstance(bias, DTensor):
-            bias = bias.to_local()
+        if bias:
+            bias = dtensor_to_local(bias)
 
         assert seq_ctx.sequence_parallel_mesh is not None, "sequence_parallel_mesh is required for forward_for_sp"
         sp_rank = seq_ctx.sp_rank
@@ -362,12 +326,8 @@ class GatedDeltaNet(nn.Module):
 
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
-        A_log = self.A_log
-        dt_bias = self.dt_bias
-        if isinstance(A_log, DTensor):
-            A_log = A_log.to_local()
-        if isinstance(dt_bias, DTensor):
-            dt_bias = dt_bias.to_local()
+        A_log = dtensor_to_local(self.A_log)
+        dt_bias = dtensor_to_local(self.dt_bias)
 
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 
@@ -455,12 +415,10 @@ class GatedDeltaNet(nn.Module):
         b = self.in_proj_b(query_input)
         a = self.in_proj_a(query_input)
 
-        weight = self.conv1d.weight.squeeze(1)
+        weight = dtensor_to_local(self.conv1d.weight.squeeze(1))
         bias = self.conv1d.bias
-        if isinstance(weight, DTensor):
-            weight = weight.to_local()
-        if bias and isinstance(bias, DTensor):
-            bias = bias.to_local()
+        if bias:
+            bias = dtensor_to_local(bias)
 
         if seq_ctx.seq_idx is None:
             # Keep seq_idx generation in a custom op so full-graph compile avoids Python tensor construction.
@@ -506,12 +464,8 @@ class GatedDeltaNet(nn.Module):
 
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
-        A_log = self.A_log
-        dt_bias = self.dt_bias
-        if isinstance(A_log, DTensor):
-            A_log = A_log.to_local()
-        if isinstance(dt_bias, DTensor):
-            dt_bias = dt_bias.to_local()
+        A_log = dtensor_to_local(self.A_log)
+        dt_bias = dtensor_to_local(self.dt_bias)
 
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 

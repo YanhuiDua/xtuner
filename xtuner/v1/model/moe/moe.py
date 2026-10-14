@@ -53,6 +53,7 @@ from xtuner.v1.model.utils import (
 from xtuner.v1.module import (
     GatedDeltaNetConfig,
     GreedyRouterConfig,
+    KDAConfig,
     LMHead,
     MHAConfig,
     MLAConfig,
@@ -871,7 +872,7 @@ class MoE(BaseModel):
                 world_size=z_world_size,
             )
 
-        return hidden_states_list
+        return cast(list[torch.Tensor], self._post_decoder_stack(hidden_states_list, previous_layer_results))
 
     def _forward(
         self,
@@ -1088,6 +1089,22 @@ class MoE(BaseModel):
             if self.config.return_hidden_states:
                 output["hidden_states"].append(hidden_states)
 
+        return cast(torch.Tensor, self._post_decoder_stack(hidden_states, previous_layer_results))
+
+    def _post_decoder_stack(
+        self,
+        hidden_states: torch.Tensor | list[torch.Tensor],
+        previous_layer_results: (
+            DenseDecoderLayerOutput
+            | DenseDecoderLayerMicroBatchOutput
+            | MoEDecoderLayerOutput
+            | MoEDecoderLayerMicroBatchOutput
+            | None
+        ),
+    ) -> torch.Tensor | list[torch.Tensor]:
+        """Null hook after the decoder loop (subclasses may mix cross-layer
+        state)."""
+        del previous_layer_results
         return hidden_states
 
     def _call_decoder_layer(
@@ -1156,7 +1173,7 @@ class MoE(BaseModel):
         # 让 layers 是一个 nn.ModuleDict 方便做 pipeline parallel 的参数切分，
         # 这样可以保证部分 layer 被切掉后，idx 保持不变
         layers = nn.ModuleDict()
-        attention_config: GatedDeltaNetConfig | MLAConfig | MHAConfig | None = None
+        attention_config: GatedDeltaNetConfig | KDAConfig | MLAConfig | MHAConfig | None = None
         for layer_idx in range(config.num_hidden_layers):
             if config.layers_type[layer_idx] in ["full_attention", "sliding_attention"]:
                 attention_config = config.attention
@@ -1241,7 +1258,7 @@ class MoE(BaseModel):
         # Get attention config for MTP layers (use last layer's config)
         last_layer_idx = config.num_hidden_layers - 1
         layers_type_list = config.layers_type
-        attention_config: MLAConfig | MHAConfig | GatedDeltaNetConfig
+        attention_config: MLAConfig | MHAConfig | GatedDeltaNetConfig | KDAConfig
         if layers_type_list[last_layer_idx] in ["full_attention", "sliding_attention"]:
             attention_config = config.attention
         elif layers_type_list[last_layer_idx] == "linear_attention":

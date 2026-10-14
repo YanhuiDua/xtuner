@@ -31,6 +31,7 @@ from .dense.qwen3_5_text import Qwen3_5_VLTextDense2BConfig, Qwen3_5_VLTextDense
 from .moe.deepseek_v3 import DeepSeekV3Config
 from .moe.glm52 import Glm52MoEConfig
 from .moe.gpt_oss import GptOss21BA3P6Config, GptOss117BA5P8Config, GptOssConfig
+from .moe.kimi_linear import KimiLinearConfig, KimiLinearK3TextConfig, KimiLinearTinyConfig
 from .moe.moe import BalancingLossConfig, MoE, MoEConfig, MoEModelOutputs, ZLossConfig
 from .moe.qwen3 import Qwen3MoE30BA3Config, Qwen3MoEConfig, Qwen3MoEFoPEConfig
 
@@ -49,6 +50,8 @@ model_mapping = {
     "qwen3.5-vl-4b": Qwen3_5_VLDense4BConfig(),
     "glm-5.2": Glm52MoEConfig(),
     "concept-olmo-stage2-v1": ConceptOlmoStage2V1Config(),
+    "kimi-linear-tiny": KimiLinearTinyConfig(),
+    "kimi-k3-text": KimiLinearK3TextConfig(),
 }
 
 
@@ -77,6 +80,8 @@ def get_model_config_from_hf(model_path: Path):
         return Glm52MoEConfig.from_hf(model_path)
     elif cfg.model_type in {"conceptlm_v22_vq", "ncp_olmo3"}:
         return ConceptLMV22VQConfig.from_hf(model_path)
+    elif cfg.model_type in ("kimi_linear", "kimi_k3"):
+        return KimiLinearConfig.from_hf(model_path)
     else:
         raise ValueError(f"Unsupported model type: {cfg.model_type}")
 
@@ -125,4 +130,7 @@ __all__ = [
     "ConceptLMQwen35Config",
     "Qwen3_5_VLTextDense2BConfig",
     "Qwen3_5_VLTextDense9BConfig",
+    "KimiLinearConfig",
+    "KimiLinearTinyConfig",
+    "KimiLinearK3TextConfig",
 ]

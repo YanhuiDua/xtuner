@@ -44,7 +44,7 @@ from xtuner.v1.float8.fsdp_utils import (
     WeightWithDynamicTilewiseFloat8CastTensor,
 )
 from xtuner.v1.loss import BaseLossConfig, BaseLossContext, CELossConfig
-from xtuner.v1.module.attention import GatedDeltaNetConfig, MHAConfig, MLAConfig
+from xtuner.v1.module.attention import GatedDeltaNetConfig, KDAConfig, MHAConfig, MLAConfig
 from xtuner.v1.module.mtp import MTPConfig
 from xtuner.v1.module.rope import RopeParametersConfig, RopeScalingConfig
 from xtuner.v1.utils import get_device, get_logger, get_torch_device_module, log_rank0, profile_time_and_memory
@@ -221,7 +221,7 @@ class TransformerConfig(XTunerBaseModelConfig):
     rms_norm_type: Annotated[Literal["default", "zero_centered"], Parameter(group="model")] = "default"
     hidden_act: Annotated[str, Parameter(group="model")]  # key defined in `transformers.activations.ACT2CLS`
     attention: MLAConfig | MHAConfig
-    linear_attention: Annotated[GatedDeltaNetConfig | None, Parameter(group="model")] = None
+    linear_attention: Annotated[GatedDeltaNetConfig | KDAConfig | None, Parameter(group="model")] = None
     mtp_config: MTPConfig | None = None
     mlp_bias: Annotated[bool, Parameter(group="model")] = False
     tie_word_embeddings: Annotated[bool, Parameter(group="model")] = False
@@ -1651,6 +1651,7 @@ class BaseModel(nn.Module):
 
         if self.config.hf_config is not None:
             self.config.save_hf(hf_dir)
+            self._copy_missing_hf_auxiliary_files(hf_dir)
         elif self._hf_path is not None:
             for file in cast(Path, self._hf_path).iterdir():
                 if file.suffix != ".safetensors":
@@ -1665,6 +1666,22 @@ class BaseModel(nn.Module):
         with open(hf_dir / "model.safetensors.index.json", "w") as f:
             index = {"weight_map": dict(weight_map), "metadata": {}}
             json.dump(index, f, indent=2, ensure_ascii=False)
+
+    def _copy_missing_hf_auxiliary_files(self, hf_dir: Path) -> None:
+        """Keep tokenizer and remote-code files beside a reconstructed
+        config."""
+        if self._hf_path is None:
+            return
+
+        weight_suffixes = {".bin", ".pt", ".pth", ".safetensors"}
+        for file in self._hf_path.iterdir():
+            target_path = hf_dir / file.name
+            if target_path.exists() or file.suffix in weight_suffixes or file.name == "model.safetensors.index.json":
+                continue
+            if file.is_file():
+                copy(file, target_path)
+            else:
+                copytree(file, target_path, ignore_dangling_symlinks=True, dirs_exist_ok=True)
 
     def _save_hf(
         self, hf_dir: Path | str, save_dtype: torch.dtype = torch.bfloat16, safetensors_prefix: str = "model"
@@ -1756,6 +1773,7 @@ class BaseModel(nn.Module):
 
             if self.config.hf_config is not None:
                 self.config.save_hf(hf_dir)
+                self._copy_missing_hf_auxiliary_files(hf_dir)
             else:  # if self._hf_path is not None:
                 for file in cast(Path, self._hf_path).iterdir():
                     if file.suffix != ".safetensors":

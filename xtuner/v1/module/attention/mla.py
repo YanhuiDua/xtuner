@@ -58,6 +58,8 @@ class MLAConfig(BaseModel):
     qk_rope_head_dim: int
     qk_nope_head_dim: int
     v_head_dim: int
+    use_output_gate: bool = False
+    use_nope: bool = False
 
     def build(
         self,
@@ -190,6 +192,8 @@ class MultiLatentAttention(nn.Module):
         qkv_bias: bool = False,
         qk_norm: bool = False,
         o_bias: bool = False,
+        use_output_gate: bool = False,
+        use_nope: bool = False,
         rope_scaling_cfg: RopeScalingConfig | None = None,
         float8_cfg: Float8Config | None = None,
         generate_config: GenerateConfig | None = None,
@@ -212,6 +216,8 @@ class MultiLatentAttention(nn.Module):
         self.qkv_bias = qkv_bias
         self.o_bias = o_bias
         self.qk_norm = qk_norm
+        self.use_output_gate = use_output_gate
+        self.use_nope = use_nope
         self.float8_cfg = float8_cfg
         self.generate_config = generate_config
         self.q_head_dim = qk_nope_head_dim + qk_rope_head_dim
@@ -260,6 +266,13 @@ class MultiLatentAttention(nn.Module):
             bias=self.o_bias,
             float8_cfg=self.float8_cfg,
         )
+        if self.use_output_gate:
+            self.g_proj = build_linear(
+                self.hidden_size,
+                self.num_attention_heads * self.v_head_dim,
+                bias=False,
+                float8_cfg=self.float8_cfg,
+            )
 
         self.softmax_scale = self.q_head_dim ** (-0.5)
 
@@ -273,6 +286,23 @@ class MultiLatentAttention(nn.Module):
         self.window_size = (-1, -1)
         if layer_type == "sliding_attention":
             self.window_size = (sliding_window, sliding_window)
+
+    def _apply_output_gate(self, attn_output: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_output_gate:
+            attn_output = attn_output * self.g_proj(hidden_states).sigmoid()
+        return attn_output
+
+    def _apply_rotary(
+        self,
+        q_pe: torch.Tensor,
+        k_pe: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # HF Kimi MLA sets rotary_emb=None and skips RoPE when mla_use_nope=True.
+        if self.use_nope:
+            return q_pe, k_pe
+        cos, sin = position_embeddings
+        return mla_apply_rotary_pos_emb(q_pe, k_pe, cos, sin)
 
     def forward_training(
         self,
@@ -303,8 +333,7 @@ class MultiLatentAttention(nn.Module):
 
         k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        cos, sin = position_embeddings
-        q_pe, k_pe = mla_apply_rotary_pos_emb(q_pe, k_pe, cos, sin)
+        q_pe, k_pe = self._apply_rotary(q_pe, k_pe, position_embeddings)
 
         query_states = k_pe.new_empty(bsz, self.num_attention_heads, q_len, self.q_head_dim)
         query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
@@ -340,6 +369,7 @@ class MultiLatentAttention(nn.Module):
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_attention_heads * self.v_head_dim).contiguous()
 
+        attn_output = self._apply_output_gate(attn_output, hidden_states)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -380,10 +410,9 @@ class MultiLatentAttention(nn.Module):
 
         k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        cos, sin = position_embeddings
         q_pe = q_pe.transpose(1, 2)
         k_pe = k_pe.transpose(1, 2)
-        q_pe, k_pe = mla_apply_rotary_pos_emb(q_pe, k_pe, cos, sin)
+        q_pe, k_pe = self._apply_rotary(q_pe, k_pe, position_embeddings)
         q_pe = q_pe.transpose(1, 2)
         k_pe = k_pe.transpose(1, 2)
 
@@ -442,6 +471,7 @@ class MultiLatentAttention(nn.Module):
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_attention_heads * self.v_head_dim).contiguous()
 
+        attn_output = self._apply_output_gate(attn_output, hidden_states)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -495,14 +525,10 @@ class MultiLatentAttention(nn.Module):
         #     kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         # )
 
-        cos, sin = position_embeddings
-
-        # cos = torch.load('cos.pth').cuda()
-        # sin = torch.load('sin.pth').cuda()
         q_pe = q_pe.transpose(1, 2)
         k_pe = k_pe.transpose(1, 2)
 
-        q_pe, k_pe = mla_apply_rotary_pos_emb(q_pe, k_pe, cos, sin)
+        q_pe, k_pe = self._apply_rotary(q_pe, k_pe, position_embeddings)
         q_pe = q_pe.transpose(1, 2)
         k_pe = k_pe.transpose(1, 2)
 
@@ -550,6 +576,7 @@ class MultiLatentAttention(nn.Module):
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
 
+        attn_output = self._apply_output_gate(attn_output, hidden_states)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -583,10 +610,7 @@ class MultiLatentAttention(nn.Module):
 
         k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        cos, sin = position_embeddings
-        # cos = torch.load('cos.pth').cuda()
-        # sin = torch.load('sin.pth').cuda()
-        q_pe, k_pe = mla_apply_rotary_pos_emb(q_pe, k_pe, cos, sin)
+        q_pe, k_pe = self._apply_rotary(q_pe, k_pe, position_embeddings)
 
         query_states = k_pe.new_empty(bsz, self.num_attention_heads, q_len, self.q_head_dim)
         query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
@@ -631,6 +655,7 @@ class MultiLatentAttention(nn.Module):
             raw_output = raw_output[:, :, : self.v_head_dim]
 
         raw_output = raw_output.reshape(bsz, q_len, self.num_attention_heads * self.v_head_dim).contiguous()
+        raw_output = self._apply_output_gate(raw_output, hidden_states)
         projected_output = self.o_proj(raw_output)
 
         attn_outputs: AttnOutputs = {

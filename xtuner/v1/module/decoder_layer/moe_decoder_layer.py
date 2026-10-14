@@ -17,6 +17,8 @@ from xtuner.v1.module import (
     GatedDeltaNet,
     GatedDeltaNetConfig,
     GreedyRouterConfig,
+    KDAConfig,
+    KimiDeltaAttention,
     MHAConfig,
     MLAConfig,
     MultiHeadAttention,
@@ -36,7 +38,7 @@ from xtuner.v1.module.dispatcher import (
 from xtuner.v1.module.grouped_linear.moe_group_linear import build_grouped_linear
 from xtuner.v1.module.moe_backend import SonicMoEBackendConfig
 from xtuner.v1.module.rope import RopeScalingConfig
-from xtuner.v1.ops.act_fn import get_act_fn
+from xtuner.v1.ops.act_fn import get_act_fn, get_mlp_act_fn
 from xtuner.v1.utils import ForwardState
 
 from ..linear import build_linear
@@ -76,16 +78,20 @@ class MoEActFnProtocol(Protocol):
 
 class MoEActFnConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    act_type: Literal["clipped_swiglu", "swiglu"] = "swiglu"
+    act_type: Literal["clipped_swiglu", "swiglu", "situ"] = "swiglu"
 
     clip_alpha: float | None = None
     clip_limit: float | None = None
+    situ_beta: float = 1.0
+    situ_linear_beta: float | None = None
 
     def build(self) -> MoEActFnProtocol:
         act_fn = get_act_fn(self.act_type)
 
         if self.act_type == "clipped_swiglu":
             act_fn = partial(act_fn, alpha=self.clip_alpha, limit=self.clip_limit)
+        elif self.act_type == "situ":
+            act_fn = partial(act_fn, beta=self.situ_beta, linear_beta=self.situ_linear_beta)
         return act_fn
 
 
@@ -99,6 +105,8 @@ class MoEMLP(nn.Module):
         hidden_act: str,
         mlp_bias: bool = False,
         float8_cfg: Float8Config | None = None,
+        situ_beta: float = 1.0,
+        situ_linear_beta: float | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -106,11 +114,10 @@ class MoEMLP(nn.Module):
         self.gate_proj = build_linear(self.hidden_size, self.intermediate_size, bias=mlp_bias, float8_cfg=float8_cfg)
         self.up_proj = build_linear(self.hidden_size, self.intermediate_size, bias=mlp_bias, float8_cfg=float8_cfg)
         self.down_proj = build_linear(self.intermediate_size, self.hidden_size, bias=mlp_bias, float8_cfg=float8_cfg)
-        self.act_fn = get_act_fn(hidden_act)
+        self.act_fn = get_mlp_act_fn(hidden_act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        return self.down_proj(self.act_fn(self.gate_proj(x), self.up_proj(x)))
 
 
 class MoEGate(nn.Module):
@@ -317,7 +324,7 @@ class MoEDecoderLayer(nn.Module):
         n_shared_experts: int,
         with_shared_expert_gate: bool = False,
         hidden_factor: float = 1.0,
-        attention_config: MHAConfig | MLAConfig | GatedDeltaNetConfig,
+        attention_config: MHAConfig | MLAConfig | GatedDeltaNetConfig | KDAConfig,
         rope_scaling_cfg: RopeScalingConfig | None = None,
         layer_type: Literal["full_attention", "sliding_attention"] | None = None,
         generate_config: GenerateConfig | None = None,
@@ -332,24 +339,34 @@ class MoEDecoderLayer(nn.Module):
         ep_mesh: DeviceMesh | None = None,
         expert_tp_mesh: DeviceMesh | None = None,
         ep_tp_mesh: DeviceMesh | None = None,
+        situ_beta: float = 1.0,
+        situ_linear_beta: float | None = None,
+        routed_expert_hidden_size: int | None = None,
+        latent_moe_use_norm: bool = False,
     ):
         super().__init__()
         if expert_backend == "sonicmoe" and dispatcher is not None:
             raise ValueError("SonicMoE owns local token dispatch, so dispatcher must be None in the initial version.")
+        if routed_expert_hidden_size is not None and expert_backend == "sonicmoe":
+            raise NotImplementedError("LatentMoE does not support sonicmoe yet")
         self.ep_mesh = ep_mesh
         self.ep_tp_mesh = ep_tp_mesh
         self.hidden_size = hidden_size
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.hidden_factor = hidden_factor
+        self.routed_expert_hidden_size = routed_expert_hidden_size
+        self.latent_moe_use_norm = latent_moe_use_norm
 
-        self.self_attn: MultiHeadAttention | MultiLatentAttention | GatedDeltaNet = attention_config.build(
-            hidden_size=hidden_size,
-            layer_idx=layer_idx,
-            generate_config=generate_config,
-            rope_scaling_cfg=rope_scaling_cfg,
-            layer_type=layer_type,
-            float8_cfg=float8_cfg,
+        self.self_attn: MultiHeadAttention | MultiLatentAttention | GatedDeltaNet | KimiDeltaAttention = (
+            attention_config.build(
+                hidden_size=hidden_size,
+                layer_idx=layer_idx,
+                generate_config=generate_config,
+                rope_scaling_cfg=rope_scaling_cfg,
+                layer_type=layer_type,
+                float8_cfg=float8_cfg,
+            )
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, type=rms_norm_type)
         self.layer_idx = layer_idx
@@ -359,16 +376,20 @@ class MoEDecoderLayer(nn.Module):
         self.shared_experts: MoEMLP | None
 
         if n_shared_experts > 0:
-            self.shared_experts = MoEMLP(
+            self.shared_experts = self.build_shared_experts(
                 hidden_size=hidden_size,
                 n_shared_experts=n_shared_experts,
                 moe_intermediate_size=moe_intermediate_size,
                 hidden_act=hidden_act,
                 mlp_bias=mlp_bias,
                 float8_cfg=float8_cfg,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
             if with_shared_expert_gate:
                 self.shared_expert_gate = build_linear(hidden_size, 1, bias=False)
+            else:
+                self.shared_expert_gate = None
         else:
             self.shared_experts = None
             self.shared_expert_gate = None
@@ -383,8 +404,20 @@ class MoEDecoderLayer(nn.Module):
             gate_bias=gate_bias,
             router_compute_dtype=router_compute_dtype,
         )
-        self.experts = MoEBlock(
-            hidden_size=hidden_size,
+
+        expert_hidden_size = routed_expert_hidden_size if routed_expert_hidden_size is not None else hidden_size
+        if routed_expert_hidden_size is not None:
+            self.routed_expert_down_proj = build_linear(
+                hidden_size, routed_expert_hidden_size, bias=False, float8_cfg=float8_cfg
+            )
+            self.routed_expert_up_proj = build_linear(
+                routed_expert_hidden_size, hidden_size, bias=False, float8_cfg=float8_cfg
+            )
+            if latent_moe_use_norm:
+                self.routed_expert_norm = RMSNorm(routed_expert_hidden_size, eps=rms_norm_eps)
+
+        self.experts = self.build_experts(
+            hidden_size=expert_hidden_size,
             moe_intermediate_size=moe_intermediate_size,
             n_routed_experts=n_routed_experts,
             moe_bias=moe_bias,
@@ -411,6 +444,60 @@ class MoEDecoderLayer(nn.Module):
                 training_dtype="fp8" if float8_cfg is not None else "bf16",
                 generate_dtype=generate_config.dtype if generate_config is not None else "bf16",
             )
+
+    def build_shared_experts(
+        self,
+        *,
+        hidden_size: int,
+        n_shared_experts: int,
+        moe_intermediate_size: int,
+        hidden_act: str,
+        mlp_bias: bool,
+        float8_cfg: Float8Config | None,
+        situ_beta: float = 1.0,
+        situ_linear_beta: float | None = None,
+    ) -> MoEMLP:
+        """Construct shared-expert MLP; subclasses may override."""
+        return MoEMLP(
+            hidden_size=hidden_size,
+            n_shared_experts=n_shared_experts,
+            moe_intermediate_size=moe_intermediate_size,
+            hidden_act=hidden_act,
+            mlp_bias=mlp_bias,
+            float8_cfg=float8_cfg,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+
+    def build_experts(
+        self,
+        *,
+        hidden_size: int,
+        moe_intermediate_size: int,
+        n_routed_experts: int,
+        moe_bias: bool,
+        ep_mesh: DeviceMesh | None,
+        expert_tp_mesh: DeviceMesh | None,
+        float8_cfg: Float8Config | None,
+        moe_act_fn_cfg: MoEActFnConfig,
+        ep_tp_mesh: DeviceMesh | None,
+        expert_backend: Literal["grouped_gemm", "sonicmoe"],
+        sonicmoe_cfg: SonicMoEBackendConfig | None,
+    ) -> MoEBlock:
+        """Construct routed ``MoEBlock``; subclasses may override."""
+        return MoEBlock(
+            hidden_size=hidden_size,
+            moe_intermediate_size=moe_intermediate_size,
+            n_routed_experts=n_routed_experts,
+            moe_bias=moe_bias,
+            ep_mesh=ep_mesh,
+            expert_tp_mesh=expert_tp_mesh,
+            float8_cfg=float8_cfg,
+            moe_act_fn_cfg=moe_act_fn_cfg,
+            ep_tp_mesh=ep_tp_mesh,
+            expert_backend=expert_backend,
+            sonicmoe_cfg=sonicmoe_cfg,
+        )
 
     def forward(
         self,
@@ -502,6 +589,82 @@ class MoEDecoderLayer(nn.Module):
         combined_hidden_states = combined_hidden_states.view(*origin_shape)
         return combined_hidden_states
 
+    def _project_to_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Optional LatentMoE down-proj before routed-expert dispatch."""
+        if self.routed_expert_hidden_size is None:
+            return hidden_states
+        return self.routed_expert_down_proj(hidden_states)
+
+    def _project_from_experts(self, combined_hidden_states: torch.Tensor) -> torch.Tensor:
+        """Optional LatentMoE norm + up-proj after routed-expert combine."""
+        if self.routed_expert_hidden_size is None:
+            return combined_hidden_states
+        if self.latent_moe_use_norm:
+            combined_hidden_states = self.routed_expert_norm(combined_hidden_states)
+        return self.routed_expert_up_proj(combined_hidden_states)
+
+    def _dispatch_experts_combine(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        router_results: RouterResults,
+    ) -> torch.Tensor:
+        """Routed path: project → dispatch → experts → combine → project back.
+
+        Preserves ``(batch, seq, *)`` layout; last dim may change across the
+        LatentMoE projections.
+        """
+        assert self.dispatcher is not None
+        origin_b, origin_s = hidden_states.shape[:2]
+        expert_in = self._project_to_experts(hidden_states)
+        pre_dispatched = self.dispatcher.dispatch_preprocess(
+            hidden_states=expert_in.view(-1, expert_in.shape[-1]),
+            topk_ids=router_results["topk_ids"],
+            topk_weights=router_results["topk_weights"],
+        )
+        dispatched = self.dispatcher.dispatch(
+            pre_dispatched=pre_dispatched,
+            topk_weights=router_results["topk_weights"],
+            decoding=False,
+        )  # type: ignore[call-overload]
+        post_dispatched = self.dispatcher.dispatch_postprocess(
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+        )
+        if self.ep_mesh is not None:
+            # MoEBlock is fullgraph-compiled and shared by all decoder layers. Only the routed-token
+            # dimension varies, so make it dynamic before entering the compile boundary to keep one
+            # AOT Autograd save plan across the original forward and checkpoint replay.
+            torch._dynamo.mark_dynamic(post_dispatched["hidden_states"], 0)
+        experts_out = self.experts(
+            post_dispatched["hidden_states"],
+            post_dispatched["tokens_per_expert"],
+            decoding=False,
+        )
+        pre_combined = self.dispatcher.combine_preprocess(
+            hidden_states=experts_out,
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+            post_dispatched=post_dispatched,
+            decoding=False,
+        )
+        combined = self.dispatcher.combine(
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+            post_dispatched=post_dispatched,
+            pre_combined=pre_combined,
+            decoding=False,
+        )
+        post_combined = self.dispatcher.combine_postprocess(
+            pre_dispatched=pre_dispatched,
+            dispatched=dispatched,
+            post_dispatched=post_dispatched,
+            pre_combined=pre_combined,
+            combined=combined,
+        )
+        combined_hidden_states = post_combined["hidden_states"].view(origin_b, origin_s, -1)
+        return self._project_from_experts(combined_hidden_states)
+
     def _forward(
         self,
         hidden_states: torch.Tensor,
@@ -517,8 +680,6 @@ class MoEDecoderLayer(nn.Module):
             attention_kwargs=attention_kwargs,
         )
 
-        origin_shape = hidden_states.shape
-
         if self.experts.uses_sonicmoe:
             hidden_states = self._sonicmoe_forward(
                 hidden_states=hidden_states,
@@ -531,78 +692,13 @@ class MoEDecoderLayer(nn.Module):
                 attn_outputs=attn_outputs,
             )
 
-        assert self.dispatcher is not None
-
-        # reshape hidden_states to (batch_size * seq_len, hidden_size)
-        # ProberList.before_dispatch(
-        #     self.layer_idx, hidden_states, router_results["topk_ids"], router_results["topk_weights"]
-        # )
-        pre_dispatched = self.dispatcher.dispatch_preprocess(
-            hidden_states=hidden_states.view(-1, hidden_states.shape[-1]),
-            topk_ids=router_results["topk_ids"],
-            topk_weights=router_results["topk_weights"],
+        combined_hidden_states = self._dispatch_experts_combine(
+            hidden_states=hidden_states,
+            router_results=router_results,
         )
-        dispatched = self.dispatcher.dispatch(
-            pre_dispatched=pre_dispatched,
-            topk_weights=router_results["topk_weights"],
-            decoding=False,
-        )  # type: ignore[call-overload]
-        post_dispatched = self.dispatcher.dispatch_postprocess(
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-        )
-        # ProberList.after_dispatch(
-        #     self.layer_idx,
-        #     post_dispatched["hidden_states"],
-        #     post_dispatched["tokens_per_expert"],
-        #     post_dispatched.get("row_ids_map"),  # type: ignore[arg-type]
-        #     dispatched["topk_weights"],
-        # )
-        if self.ep_mesh is not None:
-            # MoEBlock is fullgraph-compiled and shared by all decoder layers. Only the routed-token
-            # dimension varies, so make it dynamic before entering the compile boundary to keep one
-            # AOT Autograd save plan across the original forward and checkpoint replay.
-            torch._dynamo.mark_dynamic(post_dispatched["hidden_states"], 0)
-        experts_out = self.experts(
-            post_dispatched["hidden_states"],
-            post_dispatched["tokens_per_expert"],
-            decoding=False,
-        )
-        # ProberList.before_combine(
-        #     self.layer_idx,
-        #     experts_out,
-        #     post_dispatched.get("row_ids_map"),  # type: ignore[arg-type]
-        #     dispatched["topk_weights"],
-        # )
-        pre_combined = self.dispatcher.combine_preprocess(
-            hidden_states=experts_out,
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-            post_dispatched=post_dispatched,
-            decoding=False,
-        )
-
-        combined = self.dispatcher.combine(
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-            post_dispatched=post_dispatched,
-            pre_combined=pre_combined,
-            decoding=False,
-        )
-        post_combined = self.dispatcher.combine_postprocess(
-            pre_dispatched=pre_dispatched,
-            dispatched=dispatched,
-            post_dispatched=post_dispatched,
-            pre_combined=pre_combined,
-            combined=combined,
-        )
-        combined_hidden_states = post_combined["hidden_states"]
-        combined_hidden_states = combined_hidden_states.view(*origin_shape)
 
         # debug for aligning with hf implementation.
         # combined_hidden_states = self._hf_expert_forward_for_debug(hidden_states, router_results, origin_shape)
-
-        # ProberList.after_combine(self.layer_idx, combined_hidden_states)
 
         if self.n_shared_experts > 0:
             shared_experts_out = self._shared_experts_forward(hidden_states=hidden_states)
@@ -687,9 +783,10 @@ class MoEDecoderLayer(nn.Module):
                 attention_kwargs=attention_kwargs,
             )
             pre_moe_forward_out_list.append(hidden_states)
-            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+            expert_in = self._project_to_experts(hidden_states)
+            expert_in = expert_in.view(-1, expert_in.shape[-1])
             pre_dispatched = self.dispatcher.dispatch_preprocess(
-                hidden_states=hidden_states,
+                hidden_states=expert_in,
                 topk_ids=router_results["topk_ids"],
                 topk_weights=router_results["topk_weights"],
                 async_op=True,
@@ -779,9 +876,11 @@ class MoEDecoderLayer(nn.Module):
                 combined=combined_list[i],
                 async_op=True,
             )
+            pre_shape = pre_moe_forward_out_list[i].shape
+            combined_hidden_states = post_combined["hidden_states"].view(pre_shape[0], pre_shape[1], -1)
+            combined_hidden_states = self._project_from_experts(combined_hidden_states)
             hidden_states = self._post_moe_forward(
-                # hidden_states=pre_moe_forward_out_list[i],
-                combined_hidden_states=post_combined["hidden_states"].view(*pre_moe_forward_out_list[i].shape),
+                combined_hidden_states=combined_hidden_states,
                 residual=residual_list[i],
                 shared_experts_out=shared_experts_out_list[i],
             )

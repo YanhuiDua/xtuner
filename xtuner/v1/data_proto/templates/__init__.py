@@ -1,13 +1,16 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from datetime import datetime
+from typing import Any
 
 from .chat import ChatTemplate
 from .hybrid import HybridChatTemplate
+from .kimi_k3 import KimiK3ChatTemplate
 
 
 current_date = datetime.now().strftime("%Y-%m-%d")
 
-CHAT_TEMPLATE_MAP = {
+CHAT_TEMPLATE_MAP: dict[str, Any] = {
+    "kimi-k3": KimiK3ChatTemplate(),
     "glm5.2": HybridChatTemplate(stop_words=["<|endoftext|>", "<|observation|>"], sep=""),
     "qwen3.5-vl": HybridChatTemplate(
         image_start_token="<|vision_start|>",
@@ -118,4 +121,4 @@ CHAT_TEMPLATE_MAP = {
     ),
 }
 
-__all__ = ["ChatTemplate", "HybridChatTemplate"]
+__all__ = ["ChatTemplate", "HybridChatTemplate", "KimiK3ChatTemplate"]
