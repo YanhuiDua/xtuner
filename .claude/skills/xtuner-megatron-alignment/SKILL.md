@@ -23,7 +23,7 @@ description: 对齐 xTuner 与 Megatron 仓库中不同模型的训练精度，�
 3. 发现两框架实现差异时，保留原实现并报告差异，在已授权环境中直接启动对比，不先询问是否修改。取得双方可比结果后，再结合实测差异解释影响，询问用户是否修改；得到确认后，正式适配按仓库架构放入config、model/module、loss、optim及checkpoint/data转换层。默认保持其他模型行为；测试或启动脚本不重写forward、backward或优化器数学。
 4. xTuner优先使用该任务现有的高层Trainer CLI，通过配置启动Trainer.fit；回放适配接入正式扩展点，不默认自行组装TrainEngine或编写外层更新循环。只有现有Trainer确实无法满足任务、且已说明具体缺口与采用底层入口的理由时，才直接使用TrainEngine。Megatron使用实际生产入口。具体接入方式见 [workflow.md](references/workflow.md)。
 5. 严格回放必须同初始状态、同完整输入和同每步调度。相同数据集、tokenizer、seed或.bin/.idx不保证相同batch；独立训练实验与逐步精度对齐分开。
-6. 并行拓扑、硬件数量、优化器、loss、dtype和采样方法从当前模型发现，不固定为八卡、SP8、Muon、BF16或某组辅助loss。
+6. 并行拓扑、硬件数量、优化器、loss、dtype和采样方法从当前模型发现，不固定为八卡、SP8、Muon、BF16或某组辅助loss。用户 prompt 未指定 SP 时，默认 SP=1，并在启动脚本、有效配置和结果报告中显式注明；用户明确指定时按其要求配置。此默认不推导或改写 TP、CP、DP 等其他并行维度，也不改变模型原生 group 语义。
 7. 遵守执行环境及授权。CPU主机或用户要求自行运行GPU时，只做CPU检查并交付GPU指令；不自动执行CUDA/RJob或队列操作。
 
 ## 实现差异处理顺序
