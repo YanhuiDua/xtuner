@@ -8,6 +8,7 @@ from cyclopts.group import Group
 from xtuner.v1.train.arguments import TrainingArguments
 from xtuner.v1.train.trainer import Trainer
 from xtuner.v1.utils import Config
+from xtuner.v1.utils.memory_watch import watch_rank_from_env
 from xtuner.v1.utils.misc import monkey_patch_hf_modules_cache
 
 
@@ -35,11 +36,12 @@ def main(
             raise ValueError("Must specify either `config` or `arguments`.")
         trainer_cfg = Config.fromfile(config)["trainer"]
 
-    trainer = Trainer.from_config(trainer_cfg)
-    trainer.fit()
+    with watch_rank_from_env(trainer_cfg.work_dir):
+        trainer = Trainer.from_config(trainer_cfg)
+        trainer.fit()
 
-    if dist.is_initialized():
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
