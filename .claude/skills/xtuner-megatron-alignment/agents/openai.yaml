@@ -1,0 +1,4 @@
+interface:
+  display_name: "xTuner 与 Megatron 模型精度对齐"
+  short_description: "面向两仓库不同模型，建立可复现训练回放并分析数学、并行、精度与性能差异"
+  default_prompt: "使用 $xtuner-megatron-alignment 从当前分支最新 commit 开始，发现指定模型在两仓库的实际入口，核对状态、输入、目标函数和并行精度契约，通过原生训练引擎建立精度对比。"
