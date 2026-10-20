@@ -27,9 +27,8 @@ import triton.language as tl
 def fused_swiglu_enabled() -> bool:
     """Whether the fused swiglu path is enabled.
 
-    Read live (not at import) so env injected after xtuner import -- phase-file style
-    overrides, tests -- still applies. Opt-in: default OFF; the cluster flips it via
-    XTUNER_NPU_FUSED_SWIGLU=1 in the launch script.
+    Read live (not at import) so env injected after xtuner import -- phase-file style overrides, tests -- still
+    applies. Opt-in: default OFF; the cluster flips it via XTUNER_NPU_FUSED_SWIGLU=1 in the launch script.
     """
     return os.environ.get("XTUNER_NPU_FUSED_SWIGLU", "0") == "1"
 
@@ -92,7 +91,8 @@ def _swiglu_bwd_kernel_gs(gate_ptr, up_ptr, dout_ptr, dgate_ptr, dup_ptr, n_elem
 
 
 def _grid(n: int, block: int, cap: int = 65535) -> tuple[int, int, int, bool]:
-    """(BLOCK, n_blocks, grid, single): single=True -> one-shot kernel, else grid-stride."""
+    """(BLOCK, n_blocks, grid, single): single=True -> one-shot kernel, else
+    grid-stride."""
     n_blocks = triton.cdiv(n, block)
     return block, n_blocks, min(n_blocks, cap), n_blocks <= cap
 
@@ -134,7 +134,7 @@ class SwiGLUFn(torch.autograd.Function):
 
 
 def fused_swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    """out = silu(gate) * up for arbitrary leading dims.
+    """Out = silu(gate) * up for arbitrary leading dims.
 
     Both inputs must be contiguous: the kernels index flat data_ptr offsets with no
     stride handling, so a non-contiguous view would silently read the wrong values.
