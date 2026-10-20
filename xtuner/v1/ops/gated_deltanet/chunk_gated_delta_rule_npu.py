@@ -32,7 +32,8 @@ _l2norm_checked = False
 
 
 def _fused_l2norm():
-    """Resolve the fla_npu triton l2norm once; None keeps the inline fallback."""
+    """Resolve the fla_npu triton l2norm once; None keeps the inline
+    fallback."""
     global _l2norm_fused, _l2norm_checked
     if not _l2norm_checked:
         _l2norm_checked = True
@@ -49,10 +50,8 @@ def _fused_l2norm():
 def warm_l2norm():
     """Resolve the l2norm path at wiring time and log which one is live.
 
-    The lazy resolver caches its first result forever, so a transient
-    fla_npu import failure would silently pin the inline fallback for
-    every later step. Calling this once from the GDN getter surfaces that
-    at startup instead.
+    The lazy resolver caches its first result forever, so a transient fla_npu import failure would silently pin the
+    inline fallback for every later step. Calling this once from the GDN getter surfaces that at startup instead.
     """
     fused = _fused_l2norm()
     print(
@@ -724,11 +723,9 @@ def chunk_gated_delta_rule(
 def ascendc_chunk_gated_delta_rule_fn():
     """Resolve the AscendC GDN callable, or None to keep the Triton fallback.
 
-    Loading is the import itself -- fla_npu's wheel __init__ prepares the
-    embedded OPP, pins the torch_npu libraries into the global symbol scope
-    and torch.ops.load_library()es its AscendC extension. Any load failure
-    (wheel absent, schema missing) returns None so the dispatcher keeps
-    XTuner's Triton pipeline.
+    Loading is the import itself -- fla_npu's wheel __init__ prepares the embedded OPP, pins the torch_npu libraries
+    into the global symbol scope and torch.ops.load_library()es its AscendC extension. Any load failure (wheel absent,
+    schema missing) returns None so the dispatcher keeps XTuner's Triton pipeline.
     """
     try:
         load_ascendc_ops()

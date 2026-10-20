@@ -33,14 +33,11 @@ def local(t):
 class _ConvCorrections:
     """Per-pack document-boundary correction indices for the unmasked conv.
 
-    Keyed by the CALLER's original seq_idx tensor (identity + width): in the
-    real pipeline SequenceContext.to() pins cu_seq_lens_q on CPU, so
-    gen_seq_idx builds a CPU tensor once per SequenceContext and every GDN
-    layer hands that same object to causal_conv1d (no device copy -- the
-    cache derives everything from the host tensor).  Keying by a per-call
-    device copy would miss on every layer; keying by the stable source hits
-    once per pack.  The entry pins the source tensor, so a data_ptr match is
-    the same values.
+    Keyed by the CALLER's original seq_idx tensor (identity + width): in the real pipeline SequenceContext.to() pins
+    cu_seq_lens_q on CPU, so gen_seq_idx builds a CPU tensor once per SequenceContext and every GDN layer hands that
+    same object to causal_conv1d (no device copy -- the cache derives everything from the host tensor).  Keying by a
+    per-call device copy would miss on every layer; keying by the stable source hits once per pack.  The entry pins the
+    source tensor, so a data_ptr match is the same values.
     """
 
     def __init__(self, max_entries=4):
@@ -146,10 +143,9 @@ _unmasked_logged = [False, False]
 class _CausalConv1dUnmasked(torch.autograd.Function):
     """Depthwise causal conv run unmasked, cross-document terms subtracted.
 
-    The masked four-tap costs a full-tensor mask multiply and a pad per tap;
-    convolving across document boundaries and subtracting exactly the
-    cross-document contributions at the affected rows reaches the same result
-    with fewer full-tensor passes and no pads.
+    The masked four-tap costs a full-tensor mask multiply and a pad per tap; convolving across document boundaries and
+    subtracting exactly the cross-document contributions at the affected rows reaches the same result with fewer full-
+    tensor passes and no pads.
     """
 
     @staticmethod
@@ -219,7 +215,8 @@ class _CausalConv1dUnmasked(torch.autograd.Function):
 
 
 class _ConvHostBounds:
-    """Per-pack document boundaries [0, s1, ..., T] for the AscendC varlen conv.
+    """Per-pack document boundaries [0, s1, ..., T] for the AscendC varlen
+    conv.
 
     Same keying discipline as _ConvCorrections: the CALLER's original seq_idx
     tensor (identity, pinned by the entry) is the stable key -- in the real
@@ -268,11 +265,9 @@ _OPS_ENSURED = [False]
 def _ensure_conv_ops():
     """Load the fla_npu torch extension exactly once (GDN's loader path).
 
-    Registration goes through `import fla_npu` (load_ascendc_ops): the
-    package's __init__ prepares the embedded OPP and torch.ops.load_library()es
-    its own custom_aclnn_extension_lib -- the same .so the AscendC GDN ops
-    use, so by the time a conv runs during training this is usually already
-    done (idempotent).
+    Registration goes through `import fla_npu` (load_ascendc_ops): the package's __init__ prepares the embedded OPP and
+    torch.ops.load_library()es its own custom_aclnn_extension_lib -- the same .so the AscendC GDN ops use, so by the
+    time a conv runs during training this is usually already done (idempotent).
     """
     if not _OPS_ENSURED[0]:
         from .chunk_gated_delta_rule_npu import load_ascendc_ops
@@ -285,7 +280,9 @@ def _ensure_conv_ops():
 
 
 def _conv_fwd_aclnn(x2d, weight_kc, cu, activation_mode=0):
-    """AscendC causal conv forward. x2d [T, C] bf16, weight_kc [K, C] bf16
+    """AscendC causal conv forward.
+
+    x2d [T, C] bf16, weight_kc [K, C] bf16
     (the transposed, conv-native layout), cu = host list of per-sequence
     token starts + total ([0, s1, s2, ..., T]). Returns pre-activation
     [T, C] bf16. Async launch on the current stream via the fla_npu torch
@@ -312,12 +309,11 @@ def _conv_fwd_aclnn(x2d, weight_kc, cu, activation_mode=0):
 
 
 def _conv_bwd_aclnn(x2d, y3d, weight_kc, dy3d, cu, activation=1):
-    """AscendC causal conv backward (NTD layout). x2d [T, C] bf16, y3d/dy3d
-    [1, T, C] bf16 (y = saved pre-activation when activation=1: the op
-    applies silu_backward internally; y3d may be None with activation=0),
-    weight_kc [K, C], cu as in _conv_fwd_aclnn. Returns (dx [T, C],
-    dw [K, C]) -- dw in the conv-native layout; transpose(0, 1) for the
-    [C, K] torch layout.
+    """AscendC causal conv backward (NTD layout).
+
+    x2d [T, C] bf16, y3d/dy3d [1, T, C] bf16 (y = saved pre-activation when activation=1: the op applies silu_backward
+    internally; y3d may be None with activation=0), weight_kc [K, C], cu as in _conv_fwd_aclnn. Returns (dx [T, C], dw
+    [K, C]) -- dw in the conv-native layout; transpose(0, 1) for the [C, K] torch layout.
     """
     _ensure_conv_ops()
     x2d = x2d.contiguous()
@@ -343,9 +339,8 @@ _fused_state = {"probed": False, "ok": False}
 def _fused_conv_available(device):
     """Lazy one-shot probe of the torch.ops fused conv path.
 
-    Loads the fla_npu extension on first use; any failure (extension
-    absent, tiling rejection) marks the fused path off for the process
-    lifetime and the dispatcher falls back to unmasked/four-tap.
+    Loads the fla_npu extension on first use; any failure (extension absent, tiling rejection) marks the fused path off
+    for the process lifetime and the dispatcher falls back to unmasked/four-tap.
     """
     if not _fused_state["probed"]:
         _fused_state["probed"] = True
