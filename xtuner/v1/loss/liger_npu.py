@@ -39,7 +39,7 @@ _CE_CHUNK_ROWS = int(os.environ.get("LOSS_CHUNK_SIZE", "1024"))
 
 @lru_cache(maxsize=1)
 def _ascend_ops() -> SimpleNamespace:
-    """liger-ascend kernels/helpers by direct import (no module patching)."""
+    """Liger-ascend kernels/helpers by direct import (no module patching)."""
     from liger_kernel.ops.backends._ascend.ops.cross_entropy import (
         _make_ce_stats_buffer,
         liger_cross_entropy_backward_kernel_no_weight,
