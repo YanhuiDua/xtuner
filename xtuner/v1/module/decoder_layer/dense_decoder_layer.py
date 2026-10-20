@@ -10,6 +10,19 @@ from xtuner.v1.module import AttnOutputs, GatedDeltaNetConfig, KDAConfig, MHACon
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_mlp_act_fn
 from xtuner.v1.utils import ForwardState
+from xtuner.v1.utils.env_check import get_env_not_available_func
+
+
+try:
+    # Guarded so hosts without triton can still import the model definition; the
+    # fused path simply stays off (mirrors ops/moe/cuda/triton_kernels).
+    from xtuner.v1.ops.fused_swiglu import fused_swiglu, fused_swiglu_enabled
+except ImportError:
+    fused_swiglu = get_env_not_available_func(["triton"])
+
+    def fused_swiglu_enabled() -> bool:
+        return False
+
 
 from ..linear import build_linear
 
@@ -43,8 +56,12 @@ class DenseMLP(nn.Module):
         self.up_proj = build_linear(hidden_size, intermediate_size, bias=bias, float8_cfg=float8_cfg)
         self.down_proj = build_linear(intermediate_size, hidden_size, bias=bias, float8_cfg=float8_cfg)
         self.act_fn = get_mlp_act_fn(hidden_act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta)
+        # Read the opt-in switch at build time; other activations keep their existing path.
+        self.use_fused_swiglu = fused_swiglu_enabled() and hidden_act == "silu"
 
     def forward(self, x):
+        if self.use_fused_swiglu:
+            return self.down_proj(fused_swiglu(self.gate_proj(x), self.up_proj(x)))
         return self.down_proj(self.act_fn(self.gate_proj(x), self.up_proj(x)))
 
 
