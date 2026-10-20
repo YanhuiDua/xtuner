@@ -14,7 +14,7 @@ from typing_extensions import overload
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
 from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
-from xtuner.v1.utils import get_logger, init_params
+from xtuner.v1.utils import get_device, get_logger, init_params
 
 from ...ops.gated_deltanet import get_causal_conv1d_fn, get_chunk_gated_delta_rule_fn
 from ...ops.gated_deltanet.dtensor import dtensor_to_local
@@ -44,6 +44,32 @@ def _all_to_all_gb(x, scatter_dim, gather_dim, mesh):
 def _all_to_all_out(x, scatter_dim, gather_dim, mesh):
     return ulysses_all_to_all(x, scatter_dim=scatter_dim, gather_dim=gather_dim, mesh=mesh)
 
+
+# NPU fused gated RMSNorm (npu_rms_norm + bf16 silu-mul). The npu class is
+# selected whenever the resolved device is npu (a CUDA-only install skips
+# this block silently and keeps the fla class
+# above), mirroring the runtime patch this replaces (the fla class is not
+# used on NPU runs); XTUNER_NPU_FUSED_GATED_NORM (default on) is read inside
+# forward, and the module's own npu_rms_norm self-test
+# (see xtuner.v1.ops.gated_deltanet.rms_norm_gated_npu) downgrades forward to
+# the fp32 python fallback for the process lifetime when the fused op fails.
+if get_device() == "npu":
+    try:
+        from ...ops.gated_deltanet.rms_norm_gated_npu import (
+            RMSNormGated as _NpuRMSNormGated,
+        )
+        from ...ops.gated_deltanet.rms_norm_gated_npu import (
+            gated_fused_ok,
+        )
+
+        FusedRMSNormGated = _NpuRMSNormGated  # type: ignore[misc,assignment]
+        has_fused_rms_norm_gated = True
+        gated_fused_ok()
+    except Exception as _npu_gated_norm_exc:  # pragma: no cover
+        print(
+            f"[rms_norm_gated] npu fused gated norm unavailable ({_npu_gated_norm_exc!r}); fla fallback",
+            flush=True,
+        )
 
 logger = get_logger()
 
