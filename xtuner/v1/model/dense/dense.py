@@ -206,7 +206,7 @@ class Dense(BaseModel):
         assert mtp_config is not None
 
         last_layer_idx = config.num_hidden_layers - 1
-        layer_type = config.layers_type[last_layer_idx]
+        layer_type = mtp_config.decoder_layer_type or config.layers_type[last_layer_idx]
         if layer_type in ["full_attention", "sliding_attention"]:
             attention_config = config.attention
         elif layer_type == "linear_attention":

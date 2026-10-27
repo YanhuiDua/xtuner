@@ -79,7 +79,7 @@ class DenseDecoderLayer(nn.Module):
         rope_scaling_cfg: RopeScalingConfig | None = None,
         generate_config: GenerateConfig | None = None,
         float8_cfg: Float8Config | None = None,
-        layer_type: Literal["full_attention", "sliding_attention"] | None = None,
+        layer_type: Literal["full_attention", "sliding_attention", "linear_attention"] | None = None,
         layer_idx: int = 0,
         situ_beta: float = 1.0,
         situ_linear_beta: float | None = None,
@@ -89,7 +89,7 @@ class DenseDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.self_attn = attention_config.build(
             hidden_size=hidden_size,
-            layer_type=layer_type,
+            layer_type=cast(Literal["full_attention", "sliding_attention"] | None, layer_type),
             layer_idx=layer_idx,
             rope_scaling_cfg=rope_scaling_cfg,
             generate_config=generate_config,
